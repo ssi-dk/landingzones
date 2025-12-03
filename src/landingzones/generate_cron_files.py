@@ -151,7 +151,9 @@ def generate_rsync_command(transfer):
     # Use frequency from transfer config, or fall back to default
     cron_schedule = frequency.strip() if frequency.strip() else config.default_cron_frequency
     
-    command = "{0} /usr/bin/flock -n {1} -c '{2}'".format(
+    # Use /bin/sh -c with the command to ensure glob expansion works
+    # The glob pattern (e.g., /path/*) needs shell interpretation
+    command = '{0} /usr/bin/flock -n {1} /bin/sh -c "{2}"'.format(
         cron_schedule, flock_path, full_cmd)
     
     return command
