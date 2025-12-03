@@ -54,6 +54,70 @@ def parse_transfers_file(filename):
     
     return df
 
+
+def normalize_source_path(source):
+    """Normalize a source path for comparison.
+    
+    Strips trailing wildcards and slashes to get the base directory.
+    """
+    path = source.strip()
+    # Remove trailing wildcard patterns
+    if path.endswith('/*'):
+        path = path[:-2]
+    elif path.endswith('*'):
+        path = path[:-1]
+    # Remove trailing slash
+    path = path.rstrip('/')
+    return path
+
+
+def check_overlapping_sources(df):
+    """Check for overlapping source paths that could cause conflicts.
+    
+    Detects when one source path is a parent or child of another,
+    which can cause files to be transferred multiple times or race conditions.
+    
+    Args:
+        df: DataFrame with transfer configurations
+        
+    Returns:
+        list: List of warning messages for overlapping paths
+    """
+    warnings = []
+    
+    # Group by system (overlaps only matter on the same system)
+    for system in df['system'].unique():
+        system_df = df[df['system'] == system]
+        sources = system_df['source'].tolist()
+        
+        # Normalize all source paths
+        normalized = [(src, normalize_source_path(src)) for src in sources]
+        
+        # Check each pair for overlaps
+        for i, (src1, norm1) in enumerate(normalized):
+            for j, (src2, norm2) in enumerate(normalized):
+                if i >= j:  # Skip self-comparison and duplicate pairs
+                    continue
+                
+                # Check if one path is a prefix of the other
+                if norm1.startswith(norm2 + '/') or norm2.startswith(norm1 + '/'):
+                    # Determine which is parent/child
+                    if len(norm1) < len(norm2):
+                        parent, child = src1, src2
+                    else:
+                        parent, child = src2, src1
+                    
+                    warnings.append(
+                        "System '{0}': Overlapping source paths detected!\n"
+                        "  Parent: {1}\n"
+                        "  Child:  {2}\n"
+                        "  Files in the child path may be transferred by both rules, "
+                        "causing conflicts.".format(system, parent, child)
+                    )
+    
+    return warnings
+
+
 def generate_cron_header(system, user):
     """Generate header comments for cron file"""
     header = """# Update from github landingzones DO NOT manually adjust
@@ -240,6 +304,17 @@ def main():
     if transfers_df.empty:
         print("No transfers found in the file")
         return 1
+    
+    # Check for overlapping source paths
+    overlap_warnings = check_overlapping_sources(transfers_df)
+    if overlap_warnings:
+        print("\n\033[93m⚠ WARNING: Overlapping source paths detected!\033[0m")
+        print("=" * 60)
+        for warning in overlap_warnings:
+            print("\n" + warning)
+        print("\n" + "=" * 60)
+        print("Consider adjusting your transfers.tsv to avoid conflicts.")
+        print("Continuing with generation...\n")
     
     # Apply default log file path for entries without one
     default_log_file = os.path.join(log_dir, 'transfers.log')
