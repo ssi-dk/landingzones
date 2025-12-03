@@ -1,0 +1,38 @@
+# Landing Zone Configuration
+# 
+# Copy this file to config.yaml in your working directory and customize.
+# All paths are relative to the current working directory unless absolute.
+#
+# Configuration priority (highest to lowest):
+#   1. Command-line arguments (e.g., --transfers, --output-dir)
+#   2. Environment variables (LZ_*)
+#   3. config.yaml file
+#   4. Default values
+
+# Path to the transfers.tsv file
+transfers_file: config/transfers.tsv
+
+# Directory for log files
+log_dir: log
+
+# Directory for output files
+output_dir: output
+
+# Directory for generated cron files (default: output_dir/crontab.d)
+crontab_dir: output/crontab.d
+
+# Directory for input files
+input_dir: input
+
+# Default lock file path for flock
+default_lock_file: /tmp/landingzones.lock
+
+# Default cron frequency schedule
+# Format: standard cron expression (minute hour day month weekday)
+# Examples:
+#   */15 * * * *  - every 15 minutes
+#   */5 * * * *   - every 5 minutes  
+#   0 * * * *     - every hour
+#   0 0 * * *     - daily at midnight
+#   0 */6 * * *   - every 6 hours
+default_cron_frequency: "*/15 * * * *"

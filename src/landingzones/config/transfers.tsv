@@ -1,0 +1,7 @@
+system	users	source	destination	destination_port	rsync_options	log_file	flock_file	frequency
+# Example transfer configuration - uncomment and modify the line below
+# Paths can be relative to the package root or absolute
+# log_file can be omitted to use the default log directory
+# frequency: cron schedule expression (default: */15 * * * * = every 15 minutes)
+#   Examples: */5 * * * * (every 5 min), 0 * * * * (hourly), 0 0 * * * (daily at midnight)
+#localhost	testuser	input/*	output/				/tmp/landingzones.lock	*/15 * * * *

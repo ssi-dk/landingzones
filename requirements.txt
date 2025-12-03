@@ -1,0 +1,12 @@
+# Requirements for Landing Zone
+
+# Core
+pandas>=1.0.0
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# Development
+flake8
+black

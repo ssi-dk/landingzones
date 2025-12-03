@@ -1,0 +1,10 @@
+# Update from github landingzones DO NOT manually adjust
+# Generated cron file for localhost system, user testuser
+# put me in $HOME/crontab.d/Landing_Zone.cron
+# Activate cron with:
+# `cat $HOME/crontab.d/*.cron | crontab -`
+# All .cron files should be found or linked at `$HOME/crontab.d`
+SHELL=/bin/sh
+PATH=/usr/bin:/bin
+# Transfer from input/* to output/
+*/15 * * * * /usr/bin/flock -n /tmp/landingzones.lock -c 'rsync -av --remove-source-files input/* output/ >> log/transfers.log 2>&1 && find input -mindepth 1 -type d -empty -delete >> log/transfers.log 2>&1'
