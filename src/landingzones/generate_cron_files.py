@@ -102,7 +102,7 @@ def generate_rsync_command(transfer):
     
     # Add SSH port option if destination_port is specified
     if destination_port and destination_port.strip().isdigit():
-        port_option = '-e "ssh -p {0}"'.format(destination_port.strip())
+        port_option = "-e 'ssh -p {0}'".format(destination_port.strip())
         base_options = "{0} {1}".format(base_options, port_option)
     
     # Combine with additional options if provided
