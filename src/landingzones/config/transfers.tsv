@@ -1,7 +1,27 @@
 system	users	source	destination	destination_port	rsync_options	log_file	flock_file	frequency
-# Example transfer configuration - uncomment and modify the line below
-# Paths can be relative to the package root or absolute
-# log_file can be omitted to use the default log directory
-# frequency: cron schedule expression (default: */15 * * * * = every 15 minutes)
-#   Examples: */5 * * * * (every 5 min), 0 * * * * (hourly), 0 0 * * * (daily at midnight)
-#localhost	testuser	input/*	output/				/tmp/landingzones.lock	*/15 * * * *
+# Example transfer configurations
+# Uncomment and modify the lines below, or add your own
+#
+# Column descriptions:
+#   system           - Hostname or identifier for the system running this transfer
+#   users            - Username running the cron job
+#   source           - Source path (supports wildcards like input/*)
+#   destination      - Destination path (local or remote user@host:/path/)
+#   destination_port - SSH port for remote destinations (leave empty for default 22)
+#   rsync_options    - Additional rsync options (e.g., --chown=:group --chmod=Du=rwx)
+#   log_file         - Path to log file (leave empty for default log/transfers.log)
+#   flock_file       - Path to lock file (required, prevents concurrent runs)
+#   frequency        - Cron schedule (default: */15 * * * * = every 15 minutes)
+#
+# Frequency examples:
+#   */5 * * * *   - every 5 minutes
+#   */15 * * * *  - every 15 minutes
+#   0 * * * *     - every hour
+#   0 0 * * *     - daily at midnight
+#   0 */6 * * *   - every 6 hours
+#
+# Local transfer example (uncomment to use):
+localhost	testuser	input/*	output/			log/transfers.log	/tmp/landingzones.lock	*/15 * * * *
+#
+# Remote transfer example (uncomment and modify):
+#myserver	datauser	/srv/data/outgoing/*	remoteuser@remote.host:/srv/data/incoming/	22		log/remote_transfer.log	/tmp/remote_transfer.lock	*/15 * * * *
