@@ -17,6 +17,7 @@ import socket
 import shutil
 import glob
 import errno
+import argparse
 from io import StringIO
 
 import pandas as pd
@@ -268,6 +269,60 @@ def check_lock_file_directory(lock_file=None):
     return True
 
 
+def get_current_user():
+    """Get current user and allow selection if multiple users exist in transfers"""
+    current_user = os.environ.get('USER', os.environ.get('USERNAME', ''))
+    transfers_file = config.transfers_file
+    
+    try:
+        df = pd.read_csv(transfers_file, sep='\t')
+        df = df[~df['system'].astype(str).str.startswith('#')]
+        users = df['users'].unique()
+        
+        # If current user is in the list, use it
+        if current_user in users:
+            return current_user
+        
+        # If only one user, use that
+        if len(users) == 1:
+            return users[0]
+            
+    except Exception:
+        pass
+    
+    # Ask user if we can't determine
+    print("\n{0}Current user: {1}{2}".format(Colors.YELLOW, current_user, Colors.END))
+    print("Available users in {0}:".format(transfers_file))
+    
+    try:
+        df = pd.read_csv(transfers_file, sep='\t')
+        df = df[~df['system'].astype(str).str.startswith('#')]
+        users = df['users'].unique()
+        for i, user in enumerate(users, 1):
+            marker = " (current)" if user == current_user else ""
+            print("  {0}. {1}{2}".format(i, user, marker))
+        
+        while True:
+            try:
+                choice = input("\nSelect user (1-{0}) or enter username: ".format(len(users))).strip()
+                if choice.isdigit():
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(users):
+                        return users[idx]
+                elif choice in users:
+                    return choice
+                elif not choice and current_user in users:
+                    return current_user
+                print("Invalid choice. Please try again.")
+            except KeyboardInterrupt:
+                print("\nOperation cancelled.")
+                sys.exit(1)
+    
+    except Exception as e:
+        print("Could not read {0}: {1}".format(transfers_file, e))
+        return current_user if current_user else input("Please enter your username: ").strip()
+
+
 def get_current_system():
     """Determine current system based on hostname or user input"""
     hostname = socket.gethostname().lower()
@@ -369,9 +424,18 @@ def setup_crontab_directory():
             return False, "Cannot create directory {0}: {1}".format(crontab_dir, str(e))
 
 
-def deploy_cron_files(current_system):
-    """Deploy cron files for the current system"""
+def deploy_cron_files(current_system, current_user=None):
+    """Deploy cron files for the current system and user
+    
+    Args:
+        current_system: The system name to deploy for
+        current_user: The user to deploy for (defaults to current OS user)
+    """
+    if current_user is None:
+        current_user = os.environ.get('USER', os.environ.get('USERNAME', ''))
+    
     print_header("Automatic Cron Deployment")
+    print_status("Deploying for", "INFO", "{0}@{1}".format(current_user, current_system))
 
     # Step 1: Ensure local crontab.d exists before generation
     dir_ok, dir_msg = setup_crontab_directory()
@@ -391,14 +455,15 @@ def deploy_cron_files(current_system):
     # Step 3: Find and copy relevant cron files
     cron_files = []
     try:
-        # Look for cron files that match the current system in crontab.d/
-        pattern = "crontab.d/{0}.*.Landing_Zone.cron".format(current_system)
+        # Look for cron files that match the current system and user in crontab.d/
+        # File format: system.user.Landing_Zone.cron
+        pattern = "crontab.d/{0}.{1}.Landing_Zone.cron".format(current_system, current_user)
         matches = glob.glob(pattern)
         
         if not matches:
             msg = (
-                "No new files for '{0}'. Using existing crontab.d/"
-            ).format(current_system)
+                "No new files for '{0}@{1}'. Using existing crontab.d/"
+            ).format(current_user, current_system)
             print_status("Cron file discovery", "WARN", msg)
             return True  # Not an error, just no files to deploy
 
@@ -483,6 +548,28 @@ def ask_user_permission():
 
 def main():
     """Main verification function"""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='Check deployment readiness for Landing Zone cron jobs'
+    )
+    parser.add_argument(
+        '--config', '-c',
+        default=None,
+        help='Path to config.yaml file (default: auto-detect in current directory)'
+    )
+    parser.add_argument(
+        '--transfers', '-t',
+        default=None,
+        help='Path to transfers.tsv file (overrides config file)'
+    )
+    args = parser.parse_args()
+    
+    # Load configuration from file and/or command line arguments
+    config.load_config(
+        config_file=args.config,
+        transfers_file=args.transfers
+    )
+    
     print("{0}{1}".format(Colors.BOLD, Colors.BLUE))
     print("╔══════════════════════════════════════════════════════════════╗")
     print("║            Landing Zone Pre-Deployment Check                 ║")
@@ -527,17 +614,30 @@ def main():
         print_status("Configuration file", "ERROR", "Cannot read transfers.tsv: {0}".format(e))
         return False
     
-    # Determine current system
+    # Determine current system and user
     current_system = get_current_system()
-    print("\n{0}Checking transfers for system: {1}{2}".format(Colors.BOLD, current_system, Colors.END))
+    current_user = get_current_user()
+    print("\n{0}Checking transfers for system: {1}, user: {2}{3}".format(
+        Colors.BOLD, current_system, current_user, Colors.END))
     
-    # Filter transfers for current system
-    system_transfers = df[df['system'] == current_system]
+    # Filter transfers for current system and user
+    system_transfers = df[(df['system'] == current_system) & (df['users'] == current_user)]
     if len(system_transfers) == 0:
-        print_status("System transfers", "WARN", "No transfers found for system '{0}'".format(current_system))
+        # Check if there are transfers for the system but different user
+        system_only = df[df['system'] == current_system]
+        if len(system_only) > 0:
+            other_users = system_only['users'].unique()
+            print_status("User transfers", "WARN", 
+                        "No transfers for user '{0}' on system '{1}'. Available users: {2}".format(
+                            current_user, current_system, ', '.join(other_users)))
+        else:
+            print_status("System transfers", "WARN", 
+                        "No transfers found for system '{0}'".format(current_system))
         return True
     
-    print_status("System transfers", "OK", "Found {0} transfers for this system".format(len(system_transfers)))
+    print_status("User transfers", "OK", 
+                "Found {0} transfers for {1}@{2}".format(
+                    len(system_transfers), current_user, current_system))
     
     # Check system prerequisites
     print_header("System Prerequisites")
@@ -621,7 +721,7 @@ def main():
         # Ask user if they want automatic deployment
         if ask_user_permission():
             print_header("Automatic Deployment")
-            deploy_ok = deploy_cron_files(current_system)
+            deploy_ok = deploy_cron_files(current_system, current_user)
             
             if deploy_ok:
                 success_msg = ("\n{0}🚀 Deployment completed "

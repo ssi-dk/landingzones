@@ -323,5 +323,67 @@ class TestEdgeCases:
         assert 'nan' not in cmd.lower()
 
 
+class TestOverlappingSourceDetection:
+    """Test detection of overlapping source paths"""
+    
+    def test_detects_parent_child_overlap(self):
+        """Test that overlapping parent/child paths are detected"""
+        import pandas as pd
+        
+        data = {
+            'system': ['server1', 'server1'],
+            'users': ['user1', 'user1'],
+            'source': ['/data/landing/*', '/data/landing/subdir/*'],
+            'destination': ['/dest1/', '/dest2/'],
+        }
+        df = pd.DataFrame(data)
+        
+        warnings = gcf.check_overlapping_sources(df)
+        
+        assert len(warnings) == 1
+        assert 'Overlapping' in warnings[0]
+        assert '/data/landing/*' in warnings[0]
+        assert '/data/landing/subdir/*' in warnings[0]
+    
+    def test_no_warning_for_different_systems(self):
+        """Test that overlapping paths on different systems don't warn"""
+        import pandas as pd
+        
+        data = {
+            'system': ['server1', 'server2'],
+            'users': ['user1', 'user1'],
+            'source': ['/data/landing/*', '/data/landing/subdir/*'],
+            'destination': ['/dest1/', '/dest2/'],
+        }
+        df = pd.DataFrame(data)
+        
+        warnings = gcf.check_overlapping_sources(df)
+        
+        assert len(warnings) == 0
+    
+    def test_no_warning_for_non_overlapping_paths(self):
+        """Test that non-overlapping paths don't trigger warnings"""
+        import pandas as pd
+        
+        data = {
+            'system': ['server1', 'server1'],
+            'users': ['user1', 'user1'],
+            'source': ['/data/dir1/*', '/data/dir2/*'],
+            'destination': ['/dest1/', '/dest2/'],
+        }
+        df = pd.DataFrame(data)
+        
+        warnings = gcf.check_overlapping_sources(df)
+        
+        assert len(warnings) == 0
+    
+    def test_normalize_source_path(self):
+        """Test path normalization for comparison"""
+        assert gcf.normalize_source_path('/path/to/dir/*') == '/path/to/dir'
+        assert gcf.normalize_source_path('/path/to/dir/') == '/path/to/dir'
+        assert gcf.normalize_source_path('/path/to/dir') == '/path/to/dir'
+        assert gcf.normalize_source_path('/path/to/dir* ') == '/path/to/dir'
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
