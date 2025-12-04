@@ -1,0 +1,48 @@
+{% set name = "landingzones" %}
+{% set version = "1.0.0" %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  path: ..
+
+build:
+  number: 0
+  noarch: python
+  script: python -m pip install . -vv --no-deps --no-build-isolation
+  entry_points:
+    - generate-cron-files = landingzones.generate_cron_files:main
+    - check-deployment-readiness = landingzones.check_deployment_readiness:main
+
+requirements:
+  host:
+    - python >=3.8
+    - pip
+    - setuptools
+  run:
+    - python >=3.8
+    - pandas >=1.0.0
+    - pyyaml >=5.0.0
+
+test:
+  imports:
+    - landingzones
+  commands:
+    - generate-cron-files --help
+    - check-deployment-readiness --help
+
+about:
+  home: https://github.com/ssi-dk/landingzones
+  license: MIT
+  license_family: MIT
+  summary: Automated data transfer system using rsync and cron
+  description: |
+    Landing Zone provides tools for managing automated data transfers
+    using a centralized configuration approach with rsync and cron.
+  dev_url: https://github.com/ssi-dk/landingzones
+
+extra:
+  recipe-maintainers:
+    - kimleeng

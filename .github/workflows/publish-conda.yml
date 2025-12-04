@@ -1,0 +1,71 @@
+name: Publish to Anaconda
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 1.0.0)'
+        required: false
+        default: ''
+
+jobs:
+  build-and-publish:
+    name: Build and Publish to Anaconda
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Needed for version detection from tags
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-update-conda: true
+          python-version: '3.11'
+          channels: conda-forge,defaults
+          channel-priority: strict
+
+      - name: Install conda-build
+        shell: bash -el {0}
+        run: |
+          conda install -y conda-build anaconda-client
+
+      - name: Verify version consistency
+        id: version
+        run: |
+          # Get version from __init__.py
+          INIT_VERSION=$(grep -oP "__version__\s*=\s*['\"]\\K[^'\"]+(?=['\"])" app/src/landingzones/__init__.py)
+          # Get version from conda/meta.yaml
+          CONDA_VERSION=$(grep -oP "^{% set version = \"\\K[^\"]+(?=\")" app/conda/meta.yaml)
+          
+          echo "Version in __init__.py: $INIT_VERSION"
+          echo "Version in conda/meta.yaml: $CONDA_VERSION"
+          
+          if [ "$INIT_VERSION" != "$CONDA_VERSION" ]; then
+            echo "ERROR: Version mismatch! Update both __init__.py and conda/meta.yaml"
+            exit 1
+          fi
+          
+          echo "version=$INIT_VERSION" >> $GITHUB_OUTPUT
+          echo "✓ Building version: $INIT_VERSION"
+
+      - name: Build conda package
+        shell: bash -el {0}
+        run: |
+          cd app
+          conda build conda --output-folder ./conda-bld
+
+      - name: Upload to Anaconda
+        shell: bash -el {0}
+        env:
+          ANACONDA_API_TOKEN: ${{ secrets.ANACONDA_API_TOKEN }}
+        run: |
+          cd app
+          anaconda upload --user kimleeng --force ./conda-bld/noarch/landingzones-*.tar.bz2
