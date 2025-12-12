@@ -37,24 +37,13 @@ jobs:
         run: |
           conda install -y conda-build anaconda-client
 
-      - name: Verify version consistency
+      - name: Verify version
         id: version
         run: |
-          # Get version from __init__.py
-          INIT_VERSION=$(grep -oP "__version__\s*=\s*['\"]\\K[^'\"]+(?=['\"])" app/src/landingzones/__init__.py)
-          # Get version from conda/meta.yaml
-          CONDA_VERSION=$(grep -oP "^{% set version = \"\\K[^\"]+(?=\")" app/conda/meta.yaml)
-          
-          echo "Version in __init__.py: $INIT_VERSION"
-          echo "Version in conda/meta.yaml: $CONDA_VERSION"
-          
-          if [ "$INIT_VERSION" != "$CONDA_VERSION" ]; then
-            echo "ERROR: Version mismatch! Update both __init__.py and conda/meta.yaml"
-            exit 1
-          fi
-          
-          echo "version=$INIT_VERSION" >> $GITHUB_OUTPUT
-          echo "✓ Building version: $INIT_VERSION"
+          # Get version from __init__.py (single source of truth)
+          VERSION=$(grep -oP "__version__\s*=\s*['\"]\\K[^'\"]+(?=['\"])" app/src/landingzones/__init__.py)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "✓ Building version: $VERSION"
 
       - name: Build conda package
         shell: bash -el {0}

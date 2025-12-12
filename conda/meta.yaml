@@ -1,5 +1,6 @@
 {% set name = "landingzones" %}
-{% set version = "1.0.0" %}
+{% set data = load_file_regex(load_file="../src/landingzones/__init__.py", regex_pattern="__version__\\s*=\\s*['\"]([^'\"]+)['\"]") %}
+{% set version = data.group(1) %}
 
 package:
   name: {{ name }}
@@ -20,7 +21,7 @@ requirements:
   host:
     - python >=3.8
     - pip
-    - setuptools
+    - hatchling
   run:
     - python >=3.8
     - pandas >=1.0.0
