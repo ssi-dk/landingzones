@@ -48,7 +48,6 @@ jobs:
       - name: Build conda package
         shell: bash -el {0}
         run: |
-          cd app
           conda build conda --output-folder ./conda-bld
 
       - name: Upload to Anaconda
@@ -56,5 +55,4 @@ jobs:
         env:
           ANACONDA_API_TOKEN: ${{ secrets.ANACONDA_API_TOKEN }}
         run: |
-          cd app
           anaconda upload --user kimleeng --force ./conda-bld/noarch/landingzones-*.tar.bz2
