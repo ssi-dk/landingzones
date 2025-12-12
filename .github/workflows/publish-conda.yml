@@ -41,7 +41,7 @@ jobs:
         id: version
         run: |
           # Get version from __init__.py (single source of truth)
-          VERSION=$(grep -oP "__version__\s*=\s*['\"]\\K[^'\"]+(?=['\"])" app/src/landingzones/__init__.py)
+          VERSION=$(grep -oP "__version__\s*=\s*['\"]\\K[^'\"]+(?=['\"])" src/landingzones/__init__.py)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "✓ Building version: $VERSION"
 
