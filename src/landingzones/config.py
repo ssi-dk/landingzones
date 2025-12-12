@@ -32,6 +32,9 @@ except ImportError:
 # Default config file names to search for
 CONFIG_FILE_NAMES = ['config.yaml', 'config.yml', 'landingzones.yaml', 'landingzones.yml']
 
+# Subdirectories to search for config files
+CONFIG_SEARCH_DIRS = ['.', 'config']
+
 
 def _expand_path(path):
     """Expand environment variables and user home in path"""
@@ -60,13 +63,14 @@ def _load_yaml_config(config_file=None):
                 return yaml.safe_load(f) or {}
         return {}
     
-    # Search for default config file names in CWD
+    # Search for default config file names in CWD and config/ subdirectory
     cwd = os.getcwd()
-    for name in CONFIG_FILE_NAMES:
-        config_path = os.path.join(cwd, name)
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                return yaml.safe_load(f) or {}
+    for search_dir in CONFIG_SEARCH_DIRS:
+        for name in CONFIG_FILE_NAMES:
+            config_path = os.path.join(cwd, search_dir, name)
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    return yaml.safe_load(f) or {}
     
     return {}
 

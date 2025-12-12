@@ -67,6 +67,9 @@ crontab.d/*.cron
 *.log
 *.lock
 
+# Conda build artifacts
+conda-bld/
+
 # Keep example directory structure
 !example/
 !example/.gitkeep

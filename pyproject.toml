@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "landingzones"
+dynamic = ["version"]
+description = "Automated data transfer system using rsync and cron"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+authors = [
+    { name = "SSI-DK" },
+]
+keywords = ["data-transfer", "rsync", "cron", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "Topic :: System :: Systems Administration",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "pandas>=1.0.0",
+    "pyyaml>=5.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "flake8",
+    "black",
+]
+
+[project.scripts]
+lz-generate-cron = "landingzones.generate_cron_files:main"
+lz-check-deployment = "landingzones.check_deployment_readiness:main"
+
+[project.urls]
+Homepage = "https://github.com/ssi-dk/landingzones"
+Repository = "https://github.com/ssi-dk/landingzones"
+
+[tool.hatch.version]
+path = "src/landingzones/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/landingzones"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/landingzones",
+    "tests",
+    "README.md",
+    "pytest.ini",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v"
