@@ -67,10 +67,7 @@ def _load_yaml_config(config_file=None):
     cwd = os.getcwd()
     for search_dir in CONFIG_SEARCH_DIRS:
         for name in CONFIG_FILE_NAMES:
-            if search_dir == '.':
-                config_path = os.path.join(cwd, name)
-            else:
-                config_path = os.path.join(cwd, search_dir, name)
+            config_path = os.path.join(cwd, search_dir, name)
             if os.path.exists(config_path):
                 with open(config_path, 'r') as f:
                     return yaml.safe_load(f) or {}
