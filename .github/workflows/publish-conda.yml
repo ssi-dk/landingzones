@@ -55,4 +55,12 @@ jobs:
         env:
           ANACONDA_API_TOKEN: ${{ secrets.ANACONDA_API_TOKEN }}
         run: |
-          anaconda upload --user kimleeng --force ./conda-bld/noarch/landingzones-*.tar.bz2
+          # Find and upload the package (handles both .tar.bz2 and .conda formats)
+          PACKAGE=$(find ./conda-bld -type f \( -name "landingzones-*.tar.bz2" -o -name "landingzones-*.conda" \) | head -1)
+          if [ -z "$PACKAGE" ]; then
+            echo "ERROR: No package found in conda-bld"
+            find ./conda-bld -type f
+            exit 1
+          fi
+          echo "Uploading: $PACKAGE"
+          anaconda upload --user kimleeng --force "$PACKAGE"
