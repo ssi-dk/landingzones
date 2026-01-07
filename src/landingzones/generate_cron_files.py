@@ -21,6 +21,11 @@ def parse_transfers_file(filename):
     # Filter out commented lines (rows where system starts with #)
     df = df[~df['system'].astype(str).str.startswith('#')]
     
+    # Filter by enabled column if present - only process rows where enabled is TRUE
+    if 'enabled' in df.columns:
+        df['enabled'] = df['enabled'].astype(str).str.strip().str.upper()
+        df = df[df['enabled'] == 'TRUE']
+    
     # Clean up any extra whitespace in string columns
     for col in df.select_dtypes(include=['object']).columns:
         df[col] = df[col].astype(str).str.strip()

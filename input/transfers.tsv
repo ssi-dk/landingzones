@@ -1,9 +1,11 @@
-system	users	source	destination	destination_port	rsync_options	log_file	flock_file	frequency
+enabled	system	notes	users	source	destination	destination_port	rsync_options	log_file	flock_file	frequency
 # Example transfer configurations
 # Uncomment and modify the lines below, or add your own
 #
 # Column descriptions:
+#   enabled          - TRUE to enable this transfer, FALSE to disable
 #   system           - Hostname or identifier for the system running this transfer
+#   notes            - Optional notes/comments about this transfer
 #   users            - Username running the cron job
 #   source           - Source path (supports wildcards like input/*)
 #   destination      - Destination path (local or remote user@host:/path/)
@@ -21,7 +23,7 @@ system	users	source	destination	destination_port	rsync_options	log_file	flock_fi
 #   0 */6 * * *   - every 6 hours
 #
 # Local transfer example (uncomment to use):
-localhost	testuser	input/*	output/			log/transfers.log	/tmp/landingzones.lock	*/15 * * * *
+TRUE	localhost	''	testuser	input/*	output/			log/transfers.log	/tmp/landingzones.lock	*/15 * * * *
 #
-# Remote transfer example (uncomment and modify):
-#myserver	datauser	/srv/data/outgoing/*	remoteuser@remote.host:/srv/data/incoming/	22		log/remote_transfer.log	/tmp/remote_transfer.lock	*/15 * * * *
+# Remote transfer example (enable and modify):
+FALSE	myserver	''	datauser	/srv/data/outgoing/*	remoteuser@remote.host:/srv/data/incoming/	22		log/remote_transfer.log	/tmp/remote_transfer.lock	*/15 * * * *

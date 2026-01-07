@@ -43,6 +43,56 @@ localhost\ttest\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
         
         assert len(df) == 2
         assert 'commented' not in df['system'].values
+    
+    def test_parse_filters_disabled_rows(self, tmp_path):
+        """Test that rows with enabled != TRUE are filtered out"""
+        tsv_content = """enabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tlog_file\tflock_file
+TRUE\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t/tmp/log.txt\t/tmp/lock.txt
+FALSE\tserver2\tuser2\t/srv/data/src2/\tuser@host:/dest2/\t\t\t/tmp/log2.txt\t/tmp/lock2.txt
+TRUE\tlocalhost\ttest\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+        
+        df = gcf.parse_transfers_file(str(test_file))
+        
+        assert len(df) == 2
+        assert 'server2' not in df['system'].values
+        assert 'server1' in df['system'].values
+        assert 'localhost' in df['system'].values
+    
+    def test_parse_enabled_case_insensitive(self, tmp_path):
+        """Test that enabled column is case insensitive"""
+        tsv_content = """enabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tlog_file\tflock_file
+true\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t/tmp/log.txt\t/tmp/lock.txt
+True\tserver2\tuser2\t/srv/data/src2/\tuser@host:/dest2/\t\t\t/tmp/log2.txt\t/tmp/lock2.txt
+FALSE\tserver3\tuser3\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+        
+        df = gcf.parse_transfers_file(str(test_file))
+        
+        assert len(df) == 2
+        assert 'server1' in df['system'].values
+        assert 'server2' in df['system'].values
+        assert 'server3' not in df['system'].values
+    
+    def test_parse_without_enabled_column(self, tmp_path):
+        """Test that parsing works when enabled column is absent (backward compatibility)"""
+        tsv_content = """system\tusers\tsource\tdestination\tdestination_port\trsync_options\tlog_file\tflock_file
+server1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t/tmp/log.txt\t/tmp/lock.txt
+localhost\ttest\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+        
+        df = gcf.parse_transfers_file(str(test_file))
+        
+        # All rows should be included when enabled column is not present
+        assert len(df) == 2
+        assert 'server1' in df['system'].values
+        assert 'localhost' in df['system'].values
 
 
 class TestGenerateRsyncCommand:
