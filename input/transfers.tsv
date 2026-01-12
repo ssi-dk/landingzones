@@ -1,4 +1,4 @@
-enabled	system	notes	users	source	destination	destination_port	rsync_options	log_file	flock_file	frequency
+enabled	system	notes	users	source	source_port	destination	destination_port	rsync_options	log_file	flock_file	frequency
 # Example transfer configurations
 # Uncomment and modify the lines below, or add your own
 #

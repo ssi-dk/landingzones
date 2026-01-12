@@ -102,6 +102,7 @@ class TestGenerateRsyncCommand:
         """Test basic rsync command generation"""
         transfer = {
             'source': '/source/path/',
+            'source_port': '',
             'destination': '/dest/path/',
             'destination_port': '',
             'rsync_options': '',
@@ -127,6 +128,7 @@ class TestGenerateRsyncCommand:
         """Test rsync command with SSH port"""
         transfer = {
             'source': '/source/',
+            'source_port': '',
             'destination': 'user@host:/dest/',
             'destination_port': '2222',
             'rsync_options': '',
@@ -142,10 +144,31 @@ class TestGenerateRsyncCommand:
         # Custom frequency should be used
         assert '*/5 * * * *' in cmd
     
+    def test_rsync_with_source_ssh_port(self):
+        """Test rsync command with SSH port on source"""
+        transfer = {
+            'source': 'user@remote:/source/',
+            'source_port': '2222',
+            'destination': '/local/dest/',
+            'destination_port': '',
+            'rsync_options': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': '*/5 * * * *'
+        }
+        
+        cmd = gcf.generate_rsync_command(transfer)
+        
+        # Should use source port when pulling from remote
+        assert '-e "ssh -p 2222"' in cmd or "-e 'ssh -p 2222'" in cmd
+        assert 'user@remote:/source/' in cmd
+        assert '/local/dest/' in cmd
+    
     def test_rsync_with_custom_options(self):
         """Test rsync command with custom options"""
         transfer = {
             'source': '/source/',
+            'source_port': '',
             'destination': '/dest/',
             'destination_port': '',
             'rsync_options': '--chown=:group --chmod=Du=rwx',
@@ -165,6 +188,7 @@ class TestGenerateRsyncCommand:
         """Test that rsync command requires flock_file"""
         transfer = {
             'source': '/source/',
+            'source_port': '',
             'destination': '/dest/',
             'destination_port': '',
             'rsync_options': '',
@@ -182,6 +206,7 @@ class TestGenerateRsyncCommand:
         """Test rsync command with custom cron frequency"""
         transfer = {
             'source': '/source/',
+            'source_port': '',
             'destination': '/dest/',
             'destination_port': '',
             'rsync_options': '',
@@ -200,6 +225,7 @@ class TestGenerateRsyncCommand:
         """Test that default frequency is used when frequency is empty"""
         transfer = {
             'source': '/source/',
+            'source_port': '',
             'destination': '/dest/',
             'destination_port': '',
             'rsync_options': '',
@@ -217,6 +243,7 @@ class TestGenerateRsyncCommand:
         """Test that default frequency is used when frequency is 'nan'"""
         transfer = {
             'source': '/source/',
+            'source_port': '',
             'destination': '/dest/',
             'destination_port': '',
             'rsync_options': '',
@@ -263,6 +290,7 @@ class TestGroupTransfersBySystemUser:
             'system': ['server1', 'server1', 'server2'],
             'users': ['user1', 'user1', 'user2'],
             'source': ['/src1/', '/src2/', '/src3/'],
+            'source_port': ['', '', ''],
             'destination': ['/dst1/', '/dst2/', '/dst3/'],
             'destination_port': ['', '', ''],
             'rsync_options': ['', '', ''],
@@ -286,8 +314,8 @@ class TestCronFileGeneration:
     def test_generates_cron_file(self, tmp_path):
         """Test that cron files are generated correctly"""
         # Create test TSV
-        tsv_content = """system\tusers\tsource\tdestination\tdestination_port\trsync_options\tlog_file\tflock_file
-localhost\ttestuser\t/tmp/src/\t/tmp/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
+        tsv_content = """system\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tlog_file\tflock_file
+localhost\ttestuser\t/tmp/src/\t\t/tmp/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -323,11 +351,13 @@ class TestEnvironmentVariableExpansion:
         """Test that $HOME is preserved in the cron output"""
         transfer = {
             'source': '$HOME/source/',
+            'source_port': '',
             'destination': '/dest/',
             'destination_port': '',
             'rsync_options': '',
             'log_file': '$HOME/test.log',
-            'flock_file': '$HOME/test.lock'
+            'flock_file': '$HOME/test.lock',
+            'frequency': ''
         }
         
         cmd = gcf.generate_rsync_command(transfer)
@@ -343,11 +373,13 @@ class TestEdgeCases:
         """Test that empty port is handled correctly"""
         transfer = {
             'source': '/source/',
+            'source_port': '',
             'destination': 'user@host:/dest/',
             'destination_port': '',
             'rsync_options': '',
             'log_file': '/tmp/test.log',
-            'flock_file': '/tmp/test.lock'
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
         }
         
         cmd = gcf.generate_rsync_command(transfer)
@@ -359,11 +391,13 @@ class TestEdgeCases:
         """Test that NaN port values are handled"""
         transfer = {
             'source': '/source/',
+            'source_port': '',
             'destination': '/dest/',
             'destination_port': 'nan',
             'rsync_options': '',
             'log_file': '/tmp/test.log',
-            'flock_file': '/tmp/test.lock'
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
         }
         
         cmd = gcf.generate_rsync_command(transfer)

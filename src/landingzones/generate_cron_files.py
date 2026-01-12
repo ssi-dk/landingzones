@@ -43,13 +43,19 @@ def parse_transfers_file(filename):
         df['frequency'] = ''
     df['frequency'] = df['frequency'].fillna('').astype(str)
     
-    # Handle destination_port specially (may be numeric)
+    # Handle destination_port and source_port specially (may be numeric)
     df['destination_port'] = df['destination_port'].fillna('').astype(str)
+    
+    # Handle source_port if it exists, otherwise create empty column
+    if 'source_port' not in df.columns:
+        df['source_port'] = ''
+    df['source_port'] = df['source_port'].fillna('').astype(str)
     
     # Remove rows where columns contain 'nan' (from NaN values)
     df['rsync_options'] = df['rsync_options'].replace('nan', '')
     df['log_file'] = df['log_file'].replace('nan', '')
     df['destination_port'] = df['destination_port'].replace('nan', '')
+    df['source_port'] = df['source_port'].replace('nan', '')
     df['flock_file'] = df['flock_file'].replace('nan', '')
     df['frequency'] = df['frequency'].replace('nan', '')
     
@@ -143,6 +149,7 @@ def generate_rsync_command(transfer):
     rsync_options = transfer.get('rsync_options', '')
     log_file = transfer.get('log_file', '')
     destination_port = transfer.get('destination_port', '')
+    source_port = transfer.get('source_port', '')
     flock_file = transfer.get('flock_file', '')
     frequency = transfer.get('frequency', '')
     
@@ -151,6 +158,8 @@ def generate_rsync_command(transfer):
     log_file = str(log_file) if log_file is not None else ''
     destination_port = (str(destination_port)
                         if destination_port is not None else '')
+    source_port = (str(source_port)
+                   if source_port is not None else '')
     flock_file = str(flock_file) if flock_file is not None else ''
     frequency = str(frequency) if frequency is not None else ''
     
@@ -161,6 +170,8 @@ def generate_rsync_command(transfer):
         log_file = ''
     if destination_port == 'nan':
         destination_port = ''
+    if source_port == 'nan':
+        source_port = ''
     if flock_file == 'nan':
         flock_file = ''
     if frequency == 'nan':
@@ -169,9 +180,17 @@ def generate_rsync_command(transfer):
     # Base rsync options
     base_options = "-av --remove-source-files"
     
-    # Add SSH port option if destination_port is specified
-    if destination_port and destination_port.strip().isdigit():
-        port_option = "-e 'ssh -p {0}'".format(destination_port.strip())
+    # Build SSH options for ports (both source and destination may need ports)
+    ssh_ports = []
+    if source_port and source_port.strip().isdigit():
+        ssh_ports.append("-e 'ssh -p {0}'".format(source_port.strip()))
+    elif destination_port and destination_port.strip().isdigit():
+        # If only destination port is specified, use it
+        ssh_ports.append("-e 'ssh -p {0}'".format(destination_port.strip()))
+    
+    # Add SSH port option if specified
+    if ssh_ports:
+        port_option = ssh_ports[0]
         base_options = "{0} {1}".format(base_options, port_option)
     
     # Combine with additional options if provided
