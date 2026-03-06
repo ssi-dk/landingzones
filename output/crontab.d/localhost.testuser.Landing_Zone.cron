@@ -7,4 +7,4 @@
 SHELL=/bin/sh
 PATH=/usr/bin:/bin
 # Transfer from input/* to output/
-*/15 * * * * /usr/bin/flock -n /tmp/landingzones.lock -c 'rsync -av --remove-source-files input/* output/ >> log/transfers.log 2>&1 && find input -mindepth 1 -type d -empty -delete >> log/transfers.log 2>&1'
+*/15 * * * * /usr/bin/flock -n /tmp/landingzones.lock /bin/sh -c "rsync -av --remove-source-files input/* output/ >> log/transfers.log 2>&1 && find input -mindepth 1 -type d -empty -delete >> log/transfers.log 2>&1"

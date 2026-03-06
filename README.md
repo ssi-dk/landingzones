@@ -42,17 +42,19 @@ The system is configured via a tab-separated `transfers.tsv` file:
 | `system` | Source system identifier | `server1`, `localhost` |
 | `users` | System user for transfer | `user1`, `local` |
 | `source` | Source directory path | `/srv/data/src/` |
+| `source_port` | SSH port for remote sources (optional) | `2222` |
 | `destination` | Destination (local or remote) | `user@host:/dest/` |
 | `destination_port` | SSH port (optional) | `225` |
 | `rsync_options` | Additional rsync flags | `--chown=:group` |
+| `io_nice` | Optional `ionice` settings for `rsync` | `-c2 -n7` |
 | `log_file` | Log file path (optional) | `log/transfers.log` |
 | `flock_file` | Lock file path | `/tmp/transfer.lock` |
 
 ### Example
 
 ```tsv
-system	users	source	destination	destination_port	rsync_options	log_file	flock_file
-localhost	testuser	input/*	output/			log/transfers.log	/tmp/landingzones.lock
+system	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file
+localhost	testuser	input/*		output/				log/transfers.log	/tmp/landingzones.lock
 ```
 
 ## CLI Commands

@@ -1,4 +1,4 @@
-enabled	system	notes	users	source	source_port	destination	destination_port	rsync_options	log_file	flock_file	frequency
+enabled	system	notes	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file	frequency
 # Example transfer configurations
 # Uncomment and modify the lines below, or add your own
 #
@@ -11,6 +11,7 @@ enabled	system	notes	users	source	source_port	destination	destination_port	rsync
 #   destination      - Destination path (local or remote user@host:/path/)
 #   destination_port - SSH port for remote destinations (leave empty for default 22)
 #   rsync_options    - Additional rsync options (e.g., --chown=:group --chmod=Du=rwx)
+#   io_nice          - Optional ionice args/command for rsync (e.g. -c2 -n7; empty skips ionice)
 #   log_file         - Path to log file (leave empty for default log/transfers.log)
 #   flock_file       - Path to lock file (required, prevents concurrent runs)
 #   frequency        - Cron schedule (default: */15 * * * * = every 15 minutes)
@@ -23,7 +24,7 @@ enabled	system	notes	users	source	source_port	destination	destination_port	rsync
 #   0 */6 * * *   - every 6 hours
 #
 # Local transfer example (uncomment to use):
-TRUE	localhost	''	testuser	input/*	output/			log/transfers.log	/tmp/landingzones.lock	*/15 * * * *
+TRUE	localhost	''	testuser	input/*		output/				log/transfers.log	/tmp/landingzones.lock	*/15 * * * *
 #
 # Remote transfer example (enable and modify):
-FALSE	myserver	''	datauser	/srv/data/outgoing/*	remoteuser@remote.host:/srv/data/incoming/	22		log/remote_transfer.log	/tmp/remote_transfer.lock	*/15 * * * *
+FALSE	myserver	''	datauser	/srv/data/outgoing/*		remoteuser@remote.host:/srv/data/incoming/	22			log/remote_transfer.log	/tmp/remote_transfer.lock	*/15 * * * *

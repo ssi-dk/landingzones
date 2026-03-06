@@ -37,6 +37,9 @@ def parse_transfers_file(filename):
     df['rsync_options'] = df['rsync_options'].fillna('').astype(str)
     df['log_file'] = df['log_file'].fillna('').astype(str)
     df['flock_file'] = df['flock_file'].fillna('').astype(str)
+    if 'io_nice' not in df.columns:
+        df['io_nice'] = ''
+    df['io_nice'] = df['io_nice'].fillna('').astype(str)
     
     # Handle frequency column - use default if not present or empty
     if 'frequency' not in df.columns:
@@ -58,6 +61,7 @@ def parse_transfers_file(filename):
     df['source_port'] = df['source_port'].replace('nan', '')
     df['flock_file'] = df['flock_file'].replace('nan', '')
     df['frequency'] = df['frequency'].replace('nan', '')
+    df['io_nice'] = df['io_nice'].replace('nan', '')
     
     # Clean up destination_port - remove .0 if it's a whole number
     df['destination_port'] = df['destination_port'].str.replace(
@@ -80,6 +84,16 @@ def normalize_source_path(source):
     # Remove trailing slash
     path = path.rstrip('/')
     return path
+
+
+def normalize_io_nice(io_nice):
+    """Normalize io_nice input to a shell command prefix or empty string."""
+    value = str(io_nice).strip() if io_nice is not None else ''
+    if not value or value == 'nan':
+        return ''
+    if value.startswith('ionice'):
+        return value
+    return "ionice {0}".format(value)
 
 
 def check_overlapping_sources(df):
@@ -152,6 +166,7 @@ def generate_rsync_command(transfer):
     source_port = transfer.get('source_port', '')
     flock_file = transfer.get('flock_file', '')
     frequency = transfer.get('frequency', '')
+    io_nice = transfer.get('io_nice', '')
     
     # Ensure all values are strings and handle potential NaN values
     rsync_options = str(rsync_options) if rsync_options is not None else ''
@@ -162,6 +177,7 @@ def generate_rsync_command(transfer):
                    if source_port is not None else '')
     flock_file = str(flock_file) if flock_file is not None else ''
     frequency = str(frequency) if frequency is not None else ''
+    io_nice = str(io_nice) if io_nice is not None else ''
     
     # Clean up any 'nan' strings that might have come from NaN values
     if rsync_options == 'nan':
@@ -176,6 +192,8 @@ def generate_rsync_command(transfer):
         flock_file = ''
     if frequency == 'nan':
         frequency = ''
+    if io_nice == 'nan':
+        io_nice = ''
     
     # Base rsync options
     base_options = "-av --remove-source-files"
@@ -210,7 +228,12 @@ def generate_rsync_command(transfer):
     
     # Generate the rsync command with cleanup and logging as a single line
     # Create the complete command as a single line
-    rsync_cmd = "rsync {0} {1} {2}".format(options, source, destination)
+    io_nice_cmd = normalize_io_nice(io_nice)
+    if io_nice_cmd:
+        rsync_cmd = "{0} rsync {1} {2} {3}".format(
+            io_nice_cmd, options, source, destination)
+    else:
+        rsync_cmd = "rsync {0} {1} {2}".format(options, source, destination)
 
     # For find, strip a trailing wildcard so 'find' targets the parent dir
     # This avoids passing a literal '*' to find (which won't expand inside -c quotes)

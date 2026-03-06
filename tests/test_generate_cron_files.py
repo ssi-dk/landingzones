@@ -15,9 +15,9 @@ class TestParseTransfersFile:
     
     def test_parse_valid_tsv(self, tmp_path):
         """Test parsing a valid TSV file"""
-        tsv_content = """system\tusers\tsource\tdestination\tdestination_port\trsync_options\tlog_file\tflock_file
-server1\tuser1\t/srv/data/src/\tuser@host:/dest/\t22\t-av\t/tmp/log.txt\t/tmp/lock.txt
-localhost\ttest\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
+        tsv_content = """system\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1\tuser1\t/srv/data/src/\tuser@host:/dest/\t22\t-av\t\t/tmp/log.txt\t/tmp/lock.txt
+localhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -31,10 +31,10 @@ localhost\ttest\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
     
     def test_parse_filters_comments(self, tmp_path):
         """Test that lines starting with # are filtered out"""
-        tsv_content = """system\tusers\tsource\tdestination\tdestination_port\trsync_options\tlog_file\tflock_file
-server1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t/tmp/log.txt\t/tmp/lock.txt
-#commented\tuser\t/src/\t/dest/\t\t\t/tmp/log.txt\t/tmp/log.txt
-localhost\ttest\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
+        tsv_content = """system\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+#commented\tuser\t/src/\t/dest/\t\t\t\t/tmp/log.txt\t/tmp/log.txt
+localhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -46,10 +46,10 @@ localhost\ttest\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
     
     def test_parse_filters_disabled_rows(self, tmp_path):
         """Test that rows with enabled != TRUE are filtered out"""
-        tsv_content = """enabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tlog_file\tflock_file
-TRUE\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t/tmp/log.txt\t/tmp/lock.txt
-FALSE\tserver2\tuser2\t/srv/data/src2/\tuser@host:/dest2/\t\t\t/tmp/log2.txt\t/tmp/lock2.txt
-TRUE\tlocalhost\ttest\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
+        tsv_content = """enabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+TRUE\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+FALSE\tserver2\tuser2\t/srv/data/src2/\tuser@host:/dest2/\t\t\t\t/tmp/log2.txt\t/tmp/lock2.txt
+TRUE\tlocalhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -63,10 +63,10 @@ TRUE\tlocalhost\ttest\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
     
     def test_parse_enabled_case_insensitive(self, tmp_path):
         """Test that enabled column is case insensitive"""
-        tsv_content = """enabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tlog_file\tflock_file
-true\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t/tmp/log.txt\t/tmp/lock.txt
-True\tserver2\tuser2\t/srv/data/src2/\tuser@host:/dest2/\t\t\t/tmp/log2.txt\t/tmp/lock2.txt
-FALSE\tserver3\tuser3\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
+        tsv_content = """enabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+true\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+True\tserver2\tuser2\t/srv/data/src2/\tuser@host:/dest2/\t\t\t\t/tmp/log2.txt\t/tmp/lock2.txt
+FALSE\tserver3\tuser3\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -80,9 +80,9 @@ FALSE\tserver3\tuser3\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
     
     def test_parse_without_enabled_column(self, tmp_path):
         """Test that parsing works when enabled column is absent (backward compatibility)"""
-        tsv_content = """system\tusers\tsource\tdestination\tdestination_port\trsync_options\tlog_file\tflock_file
-server1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t/tmp/log.txt\t/tmp/lock.txt
-localhost\ttest\t/src/\t/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
+        tsv_content = """system\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+localhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -106,6 +106,7 @@ class TestGenerateRsyncCommand:
             'destination': '/dest/path/',
             'destination_port': '',
             'rsync_options': '',
+            'io_nice': '',
             'log_file': '/tmp/test.log',
             'flock_file': '/tmp/test.lock',
             'frequency': ''
@@ -116,6 +117,7 @@ class TestGenerateRsyncCommand:
         assert '/usr/bin/flock' in cmd
         assert '/tmp/test.lock' in cmd
         assert 'rsync' in cmd
+        assert 'ionice' not in cmd
         assert '-av' in cmd
         assert '--remove-source-files' in cmd
         assert '/source/path/' in cmd
@@ -132,6 +134,7 @@ class TestGenerateRsyncCommand:
             'destination': 'user@host:/dest/',
             'destination_port': '2222',
             'rsync_options': '',
+            'io_nice': '',
             'log_file': '/tmp/test.log',
             'flock_file': '/tmp/test.lock',
             'frequency': '*/5 * * * *'
@@ -152,6 +155,7 @@ class TestGenerateRsyncCommand:
             'destination': '/local/dest/',
             'destination_port': '',
             'rsync_options': '',
+            'io_nice': '',
             'log_file': '/tmp/test.log',
             'flock_file': '/tmp/test.lock',
             'frequency': '*/5 * * * *'
@@ -172,6 +176,7 @@ class TestGenerateRsyncCommand:
             'destination': '/dest/',
             'destination_port': '',
             'rsync_options': '--chown=:group --chmod=Du=rwx',
+            'io_nice': 'ionice -c2 -n4',
             'log_file': '/tmp/test.log',
             'flock_file': '/tmp/test.lock',
             'frequency': '0 * * * *'
@@ -181,8 +186,46 @@ class TestGenerateRsyncCommand:
         
         assert '--chown=:group' in cmd
         assert '--chmod=Du=rwx' in cmd
+        assert 'ionice -c2 -n4 rsync' in cmd
         # Hourly frequency should be used
         assert '0 * * * *' in cmd
+
+    def test_rsync_with_io_nice_arguments_only(self):
+        """Test that bare io_nice arguments are prefixed with ionice."""
+        transfer = {
+            'source': '/source/',
+            'source_port': '',
+            'destination': '/dest/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '-c2 -n7',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
+        }
+
+        cmd = gcf.generate_rsync_command(transfer)
+
+        assert 'ionice -c2 -n7 rsync' in cmd
+
+    def test_rsync_without_io_nice_when_blank(self):
+        """Test that blank io_nice does not prefix rsync"""
+        transfer = {
+            'source': '/source/',
+            'source_port': '',
+            'destination': '/dest/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '   ',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
+        }
+
+        cmd = gcf.generate_rsync_command(transfer)
+
+        assert 'ionice' not in cmd
+        assert 'rsync -av --remove-source-files /source/ /dest/' in cmd
     
     def test_rsync_validates_flock_file(self):
         """Test that rsync command requires flock_file"""
@@ -192,6 +235,7 @@ class TestGenerateRsyncCommand:
             'destination': '/dest/',
             'destination_port': '',
             'rsync_options': '',
+            'io_nice': '',
             'log_file': '/tmp/test.log',
             'flock_file': '',
             'frequency': ''
@@ -210,6 +254,7 @@ class TestGenerateRsyncCommand:
             'destination': '/dest/',
             'destination_port': '',
             'rsync_options': '',
+            'io_nice': '',
             'log_file': '/tmp/test.log',
             'flock_file': '/tmp/test.lock',
             'frequency': '0 0 * * *'  # Daily at midnight
@@ -229,6 +274,7 @@ class TestGenerateRsyncCommand:
             'destination': '/dest/',
             'destination_port': '',
             'rsync_options': '',
+            'io_nice': '',
             'log_file': '/tmp/test.log',
             'flock_file': '/tmp/test.lock',
             'frequency': ''  # Empty, should use default
@@ -247,6 +293,7 @@ class TestGenerateRsyncCommand:
             'destination': '/dest/',
             'destination_port': '',
             'rsync_options': '',
+            'io_nice': '',
             'log_file': '/tmp/test.log',
             'flock_file': '/tmp/test.lock',
             'frequency': 'nan'  # NaN string, should use default
@@ -294,6 +341,7 @@ class TestGroupTransfersBySystemUser:
             'destination': ['/dst1/', '/dst2/', '/dst3/'],
             'destination_port': ['', '', ''],
             'rsync_options': ['', '', ''],
+            'io_nice': ['', '', ''],
             'log_file': ['/tmp/1.log', '/tmp/2.log', '/tmp/3.log'],
             'flock_file': ['/tmp/1.lock', '/tmp/2.lock', '/tmp/3.lock'],
             'frequency': ['*/15 * * * *', '*/5 * * * *', '0 * * * *']
@@ -314,8 +362,8 @@ class TestCronFileGeneration:
     def test_generates_cron_file(self, tmp_path):
         """Test that cron files are generated correctly"""
         # Create test TSV
-        tsv_content = """system\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tlog_file\tflock_file
-localhost\ttestuser\t/tmp/src/\t\t/tmp/dest/\t\t\t/tmp/test.log\t/tmp/test.lock
+        tsv_content = """system\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+localhost\ttestuser\t/tmp/src/\t\t/tmp/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -355,6 +403,7 @@ class TestEnvironmentVariableExpansion:
             'destination': '/dest/',
             'destination_port': '',
             'rsync_options': '',
+            'io_nice': '',
             'log_file': '$HOME/test.log',
             'flock_file': '$HOME/test.lock',
             'frequency': ''
@@ -377,6 +426,7 @@ class TestEdgeCases:
             'destination': 'user@host:/dest/',
             'destination_port': '',
             'rsync_options': '',
+            'io_nice': '',
             'log_file': '/tmp/test.log',
             'flock_file': '/tmp/test.lock',
             'frequency': ''
@@ -395,6 +445,7 @@ class TestEdgeCases:
             'destination': '/dest/',
             'destination_port': 'nan',
             'rsync_options': '',
+            'io_nice': '',
             'log_file': '/tmp/test.log',
             'flock_file': '/tmp/test.lock',
             'frequency': ''
