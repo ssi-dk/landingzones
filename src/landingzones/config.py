@@ -16,6 +16,15 @@ Example config.yaml:
     log_dir: log
     output_dir: output
     crontab_dir: output/crontab.d
+    rit_managed_locations:
+      localhost: /srv/rit_managed/
+    flock_paths:
+      localhost: /usr/bin/flock
+    rit_managed_folder_structure:
+      sh_output: scripts/landingzones/deploy/prod/output/scripts/
+      crontabs: scripts/landingzones/deploy/prod/output/crontab.d/
+      log: log/
+      flock: flock/
     input_dir: input
     default_lock_file: /tmp/landingzones.lock
     default_cron_frequency: "*/15 * * * *"
@@ -34,6 +43,12 @@ CONFIG_FILE_NAMES = ['config.yaml', 'config.yml', 'landingzones.yaml', 'landingz
 
 # Subdirectories to search for config files
 CONFIG_SEARCH_DIRS = ['.', 'config']
+DEFAULT_RIT_MANAGED_FOLDER_STRUCTURE = {
+    'sh_output': 'scripts',
+    'crontabs': 'crontab.d',
+    'log': 'log',
+    'flock': 'flock',
+}
 
 
 def _expand_path(path):
@@ -123,6 +138,9 @@ class Config:
                 - log_dir
                 - output_dir
                 - crontab_dir
+                - rit_managed_locations
+                - flock_paths
+                - rit_managed_folder_structure
                 - input_dir
                 - default_lock_file
                 - default_cron_frequency
@@ -196,6 +214,77 @@ class Config:
         # Special case: crontab_dir defaults to output_dir/crontab.d
         default = os.path.join(self.output_dir, 'crontab.d')
         return self._get_value('crontab_dir', 'LZ_CRONTAB_DIR', default)
+
+    @property
+    def rit_managed_locations(self):
+        """Configured rit_managed base locations for each system."""
+        runtime_value = self._runtime_config.get('rit_managed_locations')
+        if runtime_value is not None:
+            return dict(runtime_value)
+
+        yaml_value = self._yaml_config.get('rit_managed_locations')
+        if yaml_value is not None:
+            return dict(yaml_value)
+
+        return {}
+
+    @property
+    def rit_managed_folder_structure(self):
+        """Configured folder suffixes under each rit_managed base location."""
+        runtime_value = self._runtime_config.get('rit_managed_folder_structure')
+        if runtime_value is not None:
+            return dict(runtime_value)
+
+        yaml_value = self._yaml_config.get('rit_managed_folder_structure')
+        if yaml_value is not None:
+            return dict(yaml_value)
+
+        return dict(DEFAULT_RIT_MANAGED_FOLDER_STRUCTURE)
+
+    @property
+    def flock_paths(self):
+        """Configured flock binary paths by system."""
+        runtime_value = self._runtime_config.get('flock_paths')
+        if runtime_value is not None:
+            return dict(runtime_value)
+
+        yaml_value = self._yaml_config.get('flock_paths')
+        if yaml_value is not None:
+            return dict(yaml_value)
+
+        return {}
+
+    def get_rit_managed_location(self, system):
+        """Return the rit_managed base location for a system."""
+        if system in self.rit_managed_locations:
+            return self.rit_managed_locations[system]
+        return self.output_dir
+
+    def get_flock_path(self, system):
+        """Return the flock binary path for a system."""
+        return self.flock_paths.get(system, '/usr/bin/flock')
+
+    def get_rit_managed_path(self, system, structure_key):
+        """Return a system-specific path from base location + configured suffix."""
+        base_path = self.get_rit_managed_location(system)
+        suffix = self.rit_managed_folder_structure.get(structure_key)
+        if suffix is None:
+            raise KeyError(
+                "rit_managed_folder_structure missing key: {0}".format(
+                    structure_key
+                )
+            )
+        return os.path.join(base_path, suffix)
+
+    def resolve_managed_file_path(self, system, filename, structure_key):
+        """Resolve a managed file name to a system-specific full path."""
+        value = str(filename).strip() if filename is not None else ''
+        if not value or value == 'nan':
+            return ''
+        if '/' in value:
+            return value
+        directory = self.get_rit_managed_path(system, structure_key)
+        return os.path.join(directory, value)
     
     @property
     def default_cron_frequency(self):
@@ -220,6 +309,9 @@ class Config:
             'output_dir': self.output_dir,
             'input_dir': self.input_dir,
             'crontab_dir': self.crontab_dir,
+            'rit_managed_locations': self.rit_managed_locations,
+            'flock_paths': self.flock_paths,
+            'rit_managed_folder_structure': self.rit_managed_folder_structure,
             'default_cron_frequency': self.default_cron_frequency,
         }
     

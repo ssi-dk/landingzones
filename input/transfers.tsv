@@ -1,8 +1,9 @@
-enabled	system	notes	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file	frequency
+identifiers	enabled	system	notes	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file	frequency
 # Example transfer configurations
 # Uncomment and modify the lines below, or add your own
 #
 # Column descriptions:
+#   identifiers      - Unique transfer ID used to name the generated .sh script
 #   enabled          - TRUE to enable this transfer, FALSE to disable
 #   system           - Hostname or identifier for the system running this transfer
 #   notes            - Optional notes/comments about this transfer
@@ -12,8 +13,8 @@ enabled	system	notes	users	source	source_port	destination	destination_port	rsync
 #   destination_port - SSH port for remote destinations (leave empty for default 22)
 #   rsync_options    - Additional rsync options (e.g., --chown=:group --chmod=Du=rwx)
 #   io_nice          - Optional ionice args/command for rsync (e.g. -c2 -n7; empty skips ionice)
-#   log_file         - Path to log file (leave empty for default log/transfers.log)
-#   flock_file       - Path to lock file (required, prevents concurrent runs)
+#   log_file         - Log file name under the system log folder (e.g. transfers.log)
+#   flock_file       - Lock file name under the system flock folder (required)
 #   frequency        - Cron schedule (default: */15 * * * * = every 15 minutes)
 #
 # Frequency examples:
@@ -24,7 +25,7 @@ enabled	system	notes	users	source	source_port	destination	destination_port	rsync
 #   0 */6 * * *   - every 6 hours
 #
 # Local transfer example (uncomment to use):
-TRUE	localhost	''	testuser	input/*		output/				log/transfers.log	/tmp/landingzones.lock	*/15 * * * *
+transfer_001	TRUE	localhost	''	testuser	input/*		output/				transfers.log	landingzones.lock	*/15 * * * *
 #
 # Remote transfer example (enable and modify):
-FALSE	myserver	''	datauser	/srv/data/outgoing/*		remoteuser@remote.host:/srv/data/incoming/	22			log/remote_transfer.log	/tmp/remote_transfer.lock	*/15 * * * *
+transfer_002	FALSE	myserver	''	datauser	/srv/data/outgoing/*		remoteuser@remote.host:/srv/data/incoming/	22			remote_transfer.log	remote_transfer.lock	*/15 * * * *

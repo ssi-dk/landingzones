@@ -167,13 +167,24 @@ class TestConfigClass:
     def test_config_from_yaml(self, tmp_path, monkeypatch):
         """Test that Config loads values from config.yaml"""
         config_file = tmp_path / "config.yaml"
-        config_file.write_text("log_dir: custom_log\noutput_dir: custom_output\n")
+        config_file.write_text(
+            "log_dir: custom_log\n"
+            "output_dir: custom_output\n"
+            "rit_managed_locations:\n"
+            "  calc: /srv/rit_managed\n"
+            "rit_managed_folder_structure:\n"
+            "  sh_output: scripts/out\n"
+        )
         
         monkeypatch.chdir(tmp_path)
         cfg = config.Config()
         
         assert cfg.log_dir == 'custom_log'
         assert cfg.output_dir == 'custom_output'
+        assert cfg.get_rit_managed_location('calc') == '/srv/rit_managed'
+        assert cfg.get_rit_managed_location('unknown') == 'custom_output'
+        assert cfg.get_rit_managed_path('calc', 'sh_output') == '/srv/rit_managed/scripts/out'
+        assert cfg.get_flock_path('calc') == '/usr/bin/flock'
     
     def test_config_from_config_subdir(self, tmp_path, monkeypatch):
         """Test that Config loads values from config/config.yaml"""
@@ -198,6 +209,62 @@ class TestConfigClass:
         cfg = config.Config()
         
         assert cfg.log_dir == 'from_env'
+
+    def test_rit_managed_paths_preserve_configured_paths(self, tmp_path, monkeypatch):
+        """Test that rit_managed config values are preserved verbatim."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "rit_managed_locations:\n"
+            "  calc: ~/calc/output\n"
+            "  Promethion_1: $TEST_ROOT/prom/output\n"
+            "rit_managed_folder_structure:\n"
+            "  sh_output: scripts/out/\n"
+        )
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("TEST_ROOT", "/tmp/test-root")
+
+        cfg = config.Config()
+
+        assert cfg.get_rit_managed_location('calc') == "~/calc/output"
+        assert cfg.get_rit_managed_location('Promethion_1') == "$TEST_ROOT/prom/output"
+        assert cfg.get_rit_managed_path('calc', 'sh_output') == "~/calc/output/scripts/out/"
+
+    def test_resolve_managed_file_path_from_filename(self, tmp_path, monkeypatch):
+        """Test resolving a filename against a system-specific managed directory."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "rit_managed_locations:\n"
+            "  calc: /srv/rit\n"
+            "rit_managed_folder_structure:\n"
+            "  log: log/\n"
+        )
+
+        monkeypatch.chdir(tmp_path)
+        cfg = config.Config()
+
+        assert cfg.resolve_managed_file_path('calc', 'test.log', 'log') == '/srv/rit/log/test.log'
+
+    def test_resolve_managed_file_path_preserves_explicit_path(self, tmp_path, monkeypatch):
+        """Test resolving leaves explicit paths unchanged."""
+        monkeypatch.chdir(tmp_path)
+        cfg = config.Config()
+
+        assert cfg.resolve_managed_file_path('calc', '$HOME/test.log', 'log') == '$HOME/test.log'
+
+    def test_get_flock_path_default_and_override(self, tmp_path, monkeypatch):
+        """Test per-system flock path override with default fallback."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "flock_paths:\n"
+            "  calc: /opt/bin/flock\n"
+        )
+
+        monkeypatch.chdir(tmp_path)
+        cfg = config.Config()
+
+        assert cfg.get_flock_path('calc') == '/opt/bin/flock'
+        assert cfg.get_flock_path('other') == '/usr/bin/flock'
 
 
 class TestLoadConfig:

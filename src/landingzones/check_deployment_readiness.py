@@ -23,6 +23,7 @@ from io import StringIO
 import pandas as pd
 
 from landingzones.config import config
+from landingzones.generate_cron_files import parse_transfers_file
 
 
 class Colors:
@@ -66,10 +67,6 @@ def check_required_tools():
     
     tools = ['rsync', 'ssh', 'find']
     
-    # Check for flock (Linux) or shlock (some Unix systems)
-    flock_tools = ['flock', 'shlock']
-    flock_found = False
-    
     all_good = True
     
     for tool in tools:
@@ -89,27 +86,27 @@ def check_required_tools():
             print_status("{0} check failed".format(tool), "ERROR", str(e))
             all_good = False
     
-    # Check for file locking tools
-    for flock_tool in flock_tools:
-        try:
-            proc = subprocess.Popen(['which', flock_tool], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = proc.communicate()
-            result_returncode = proc.returncode
-            result_stdout = stdout.decode('utf-8')
-            if result_returncode == 0:
-                location = result_stdout.strip()
-                print_status("{0} available".format(flock_tool), "OK", 
-                           "Location: {0}".format(location))
-                flock_found = True
-                break
-        except Exception:
-            continue
-    
-    if not flock_found:
-        print_status("File locking tool", "WARN", 
-                    "No flock/shlock found - cron may need manual locking")
-    
     return all_good
+
+
+def check_flock_command(system):
+    """Check whether the configured flock binary exists and is executable."""
+    flock_path = config.get_flock_path(system)
+    expanded_path = os.path.expandvars(os.path.expanduser(flock_path))
+
+    if not os.path.exists(expanded_path):
+        print_status("Flock binary", "ERROR",
+                     "Configured path does not exist: {0}".format(flock_path))
+        return False
+
+    if not os.access(expanded_path, os.X_OK):
+        print_status("Flock binary", "ERROR",
+                     "Configured path is not executable: {0}".format(flock_path))
+        return False
+
+    print_status("Flock binary", "OK",
+                 "Using: {0}".format(flock_path))
+    return True
 
 
 def check_local_directory(path, description, check_writable=True):
@@ -275,8 +272,7 @@ def get_current_user():
     transfers_file = config.transfers_file
     
     try:
-        df = pd.read_csv(transfers_file, sep='\t')
-        df = df[~df['system'].astype(str).str.startswith('#')]
+        df = parse_transfers_file(transfers_file)
         users = df['users'].unique()
         
         # If current user is in the list, use it
@@ -295,8 +291,7 @@ def get_current_user():
     print("Available users in {0}:".format(transfers_file))
     
     try:
-        df = pd.read_csv(transfers_file, sep='\t')
-        df = df[~df['system'].astype(str).str.startswith('#')]
+        df = parse_transfers_file(transfers_file)
         users = df['users'].unique()
         for i, user in enumerate(users, 1):
             marker = " (current)" if user == current_user else ""
@@ -330,8 +325,7 @@ def get_current_system():
     
     # Try to match hostname against systems defined in transfers.tsv
     try:
-        df = pd.read_csv(transfers_file, sep='\t')
-        df = df[~df['system'].astype(str).str.startswith('#')]
+        df = parse_transfers_file(transfers_file)
         systems = df['system'].unique()
         
         # Check if hostname contains any known system name
@@ -346,8 +340,7 @@ def get_current_system():
     print("Available systems in {0}:".format(transfers_file))
     
     try:
-        df = pd.read_csv(transfers_file, sep='\t')
-        df = df[~df['system'].astype(str).str.startswith('#')]
+        df = parse_transfers_file(transfers_file)
         systems = df['system'].unique()
         for i, system in enumerate(systems, 1):
             print("  {0}. {1}".format(i, system))
@@ -588,26 +581,7 @@ def main():
     
     # Load and filter transfers
     try:
-        df = pd.read_csv(transfers_file, sep='\t')
-        df = df[~df['system'].astype(str).str.startswith('#')]
-        
-        # Clean up any extra whitespace in string columns
-        for col in df.select_dtypes(include=['object']).columns:
-            df[col] = df[col].astype(str).str.strip()
-        
-        # Handle empty columns and convert destination_port to string
-        df['rsync_options'] = df['rsync_options'].fillna('').astype(str)
-        df['log_file'] = df['log_file'].fillna('').astype(str)
-        df['destination_port'] = df['destination_port'].fillna('').astype(str)
-        
-        # Remove rows where columns contain 'nan' (from NaN values)
-        df['rsync_options'] = df['rsync_options'].replace('nan', '')
-        df['log_file'] = df['log_file'].replace('nan', '')
-        df['destination_port'] = df['destination_port'].replace('nan', '')
-        
-        # Clean up destination_port - remove .0 if it's a whole number
-        df['destination_port'] = df['destination_port'].str.replace(
-            r'\.0$', '', regex=True)
+        df = parse_transfers_file(transfers_file)
         
         print_status("Configuration file", "OK", "Loaded {0} active transfers".format(len(df)))
     except Exception as e:
@@ -641,7 +615,7 @@ def main():
     
     # Check system prerequisites
     print_header("System Prerequisites")
-    lock_ok = check_lock_file_directory()
+    flock_ok = check_flock_command(current_system)
     
     # Check each transfer
     all_transfers_ok = True
@@ -711,7 +685,7 @@ def main():
     # Final summary
     print_header("Deployment Readiness Summary")
     
-    overall_ok = tools_ok and lock_ok and all_transfers_ok
+    overall_ok = tools_ok and flock_ok and all_transfers_ok
     
     if overall_ok:
         print_status("System ready for cron deployment", "OK", 

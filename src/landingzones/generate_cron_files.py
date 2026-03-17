@@ -9,6 +9,7 @@ Creates a .cron file for each system-user combination with rsync commands.
 import os
 import sys
 import argparse
+import re
 import pandas as pd
 
 from landingzones.config import config
@@ -25,6 +26,11 @@ def parse_transfers_file(filename):
     if 'enabled' in df.columns:
         df['enabled'] = df['enabled'].astype(str).str.strip().str.upper()
         df = df[df['enabled'] == 'TRUE']
+
+    if 'identifiers' not in df.columns:
+        df.insert(0, 'identifiers', [
+            "transfer_{0:03d}".format(i) for i in range(1, len(df) + 1)
+        ])
     
     # Clean up any extra whitespace in string columns
     for col in df.select_dtypes(include=['object']).columns:
@@ -62,10 +68,29 @@ def parse_transfers_file(filename):
     df['flock_file'] = df['flock_file'].replace('nan', '')
     df['frequency'] = df['frequency'].replace('nan', '')
     df['io_nice'] = df['io_nice'].replace('nan', '')
+    df['identifiers'] = df['identifiers'].replace('nan', '')
     
     # Clean up destination_port - remove .0 if it's a whole number
     df['destination_port'] = df['destination_port'].str.replace(
         r'\.0$', '', regex=True)
+
+    if (df['identifiers'] == '').any():
+        raise ValueError("identifiers is required for all enabled transfers")
+    if (df['log_file'] == '').any():
+        raise ValueError("log_file is required for all enabled transfers")
+
+    sanitized_identifiers = df['identifiers'].apply(sanitize_identifier)
+    if (sanitized_identifiers == '').any():
+        raise ValueError("identifiers must contain at least one filename-safe character")
+    if sanitized_identifiers.duplicated().any():
+        duplicates = sorted(df.loc[sanitized_identifiers.duplicated(keep=False), 'identifiers'].unique())
+        raise ValueError(
+            "identifiers must be unique after filename sanitization: {0}".format(
+                ', '.join(duplicates)
+            )
+        )
+    df['script_name'] = sanitized_identifiers + '.sh'
+    df = resolve_transfer_file_paths(df)
     
     return df
 
@@ -94,6 +119,33 @@ def normalize_io_nice(io_nice):
     if value.startswith('ionice'):
         return value
     return "ionice {0}".format(value)
+
+
+def sanitize_identifier(identifier):
+    """Convert a transfer identifier into a safe shell script file name stem."""
+    value = str(identifier).strip() if identifier is not None else ''
+    if not value or value == 'nan':
+        return ''
+    value = re.sub(r'[^A-Za-z0-9._-]+', '_', value)
+    return value.strip('._-')
+
+
+def resolve_transfer_file_paths(df):
+    """Resolve per-system log and flock file names into full paths."""
+    df = df.copy()
+    df['log_file'] = df.apply(
+        lambda row: config.resolve_managed_file_path(
+            row['system'], row['log_file'], 'log'
+        ),
+        axis=1
+    )
+    df['flock_file'] = df.apply(
+        lambda row: config.resolve_managed_file_path(
+            row['system'], row['flock_file'], 'flock'
+        ),
+        axis=1
+    )
+    return df
 
 
 def check_overlapping_sources(df):
@@ -156,8 +208,8 @@ PATH=/usr/bin:/bin
 """.format(system, user)
     return header
 
-def generate_rsync_command(transfer):
-    """Generate rsync command for a transfer"""
+def build_transfer_commands(transfer):
+    """Build the shell commands and log paths for a transfer."""
     source = transfer['source']
     destination = transfer['destination']
     rsync_options = transfer.get('rsync_options', '')
@@ -221,13 +273,6 @@ def generate_rsync_command(transfer):
     else:
         options = base_options
     
-    # Add logging if log_file is specified
-    log_redirect = ""
-    if log_file:
-        log_redirect = " >> {0} 2>&1".format(log_file)
-    
-    # Generate the rsync command with cleanup and logging as a single line
-    # Create the complete command as a single line
     io_nice_cmd = normalize_io_nice(io_nice)
     if io_nice_cmd:
         rsync_cmd = "{0} rsync {1} {2} {3}".format(
@@ -244,33 +289,104 @@ def generate_rsync_command(transfer):
         # Generic fallback: remove trailing '*' and any trailing '/'
         find_target = source.rstrip('*').rstrip('/')
     find_cmd = "find {0} -mindepth 1 -type d -empty -delete".format(find_target)
-    
-    if log_redirect:
-        full_cmd = "{0}{1} && {2}{3}".format(
-            rsync_cmd, log_redirect, find_cmd, log_redirect)
-    else:
-        full_cmd = "{0} && {1}".format(rsync_cmd, find_cmd)
-    
-    # Flock is now required - validate that flock_file is specified
+
     if not flock_file or not flock_file.strip():
         raise ValueError("flock_file is required but not specified for "
                          "transfer: {0} -> {1}".format(source, destination))
-    
-    # Always use flock with the specified lock file
-    flock_path = flock_file.strip()
-    
-    # Use frequency from transfer config, or fall back to default
-    cron_schedule = frequency.strip() if frequency.strip() else config.default_cron_frequency
-    
-    # Use /bin/sh -c with the command to ensure glob expansion works
-    # The glob pattern (e.g., /path/*) needs shell interpretation
-    command = '{0} /usr/bin/flock -n {1} /bin/sh -c "{2}"'.format(
-        cron_schedule, flock_path, full_cmd)
-    
-    return command
+
+    latest_log_file = "{0}.latest".format(log_file) if log_file else ''
+    flock_command = config.get_flock_path(transfer['system'])
+
+    return {
+        'rsync_cmd': rsync_cmd,
+        'find_cmd': find_cmd,
+        'log_file': log_file,
+        'latest_log_file': latest_log_file,
+        'flock_file': flock_file,
+        'flock_command': flock_command,
+    }
 
 
-def generate_cron_file(system_user, transfers_df):
+def build_transfer_command(transfer):
+    """Build the shell command executed by a transfer script."""
+    commands = build_transfer_commands(transfer)
+    log_file = commands['log_file']
+    log_redirect = " >> {0} 2>&1".format(log_file) if log_file else ''
+    if log_redirect:
+        return "{0}{1} && {2}{3}".format(
+            commands['rsync_cmd'], log_redirect, commands['find_cmd'], log_redirect
+        )
+    return "{0} && {1}".format(commands['rsync_cmd'], commands['find_cmd'])
+
+
+def generate_script_content(transfer):
+    """Generate shell script content for a transfer."""
+    commands = build_transfer_commands(transfer)
+    return """#!/bin/sh
+set -eu
+
+log_file="{0}"
+latest_log_file="{1}"
+flock_file="{2}"
+run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{3}.rsync.XXXXXX")"
+cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{3}.cleanup.XXXXXX")"
+
+cleanup() {{
+    rm -f "$run_log" "$cleanup_log"
+}}
+trap cleanup EXIT HUP INT TERM
+
+exec 9>"$flock_file"
+if ! {4} -n 9; then
+    exit 0
+fi
+
+{5} >"$run_log" 2>&1
+cat "$run_log" >> "$log_file"
+
+{6} >"$cleanup_log" 2>&1
+if [ -s "$cleanup_log" ]; then
+    cat "$cleanup_log" >> "$log_file"
+fi
+
+if sed '/^sending incremental file list$/d; /^sent .* bytes .*$/d; /^total size is .*$/d; /^$/d' "$run_log" | grep -q .; then
+    cat "$run_log" > "$latest_log_file"
+    if [ -s "$cleanup_log" ]; then
+        cat "$cleanup_log" >> "$latest_log_file"
+    fi
+fi
+""".format(
+        commands['log_file'],
+        commands['latest_log_file'],
+        commands['flock_file'],
+        sanitize_identifier(transfer.get('identifiers', 'transfer')),
+        commands['flock_command'],
+        commands['rsync_cmd'],
+        commands['find_cmd'],
+    )
+
+
+def generate_rsync_command(transfer):
+    """Backward-compatible wrapper returning the underlying transfer command."""
+    return build_transfer_command(transfer)
+
+
+def generate_cron_entry(transfer, script_path):
+    """Generate cron entry that executes a transfer shell script."""
+    frequency = transfer.get('frequency', '')
+    cron_schedule = str(frequency).strip() if frequency is not None else ''
+    if not cron_schedule or cron_schedule == 'nan':
+        cron_schedule = config.default_cron_frequency
+    return "{0} /bin/sh {1}".format(cron_schedule, script_path)
+
+
+def get_deployed_script_path(system, script_name):
+    """Return the configured deployed script path for a system."""
+    script_dir = config.get_rit_managed_path(system, 'sh_output')
+    return os.path.join(script_dir, script_name)
+
+
+def generate_cron_file(system_user, transfers_df, scripts_dir):
     """Generate complete cron file content from DataFrame subset"""
     # Get the first row to extract system and user info
     first_transfer = transfers_df.iloc[0]
@@ -286,10 +402,11 @@ def generate_cron_file(system_user, transfers_df):
         # Add comment describing the transfer
         source = transfer['source']
         dest = transfer['destination']
-        content += "# Transfer from {0} to {1}\n".format(source, dest)
+        identifier = transfer['identifiers']
+        content += "# [{0}] Transfer from {1} to {2}\n".format(identifier, source, dest)
         
-        # Add the rsync command
-        content += generate_rsync_command(transfer) + "\n"
+        script_path = get_deployed_script_path(system, transfer['script_name'])
+        content += generate_cron_entry(transfer, script_path) + "\n"
     
     return content
 
@@ -319,6 +436,11 @@ def main():
         default=None,
         help='Default log directory for transfer logs (default: log/)'
     )
+    parser.add_argument(
+        '--scripts-dir', '-s',
+        default=None,
+        help='Output directory for generated shell scripts (default: output/scripts)'
+    )
     args = parser.parse_args()
     
     # Load configuration from file and/or command line arguments
@@ -332,6 +454,9 @@ def main():
     transfers_file = config.transfers_file
     output_dir = config.crontab_dir
     log_dir = config.log_dir
+    scripts_dir = args.scripts_dir or os.path.join(
+        os.path.dirname(output_dir), 'scripts'
+    )
     
     if not os.path.exists(transfers_file):
         print("Error: {0} not found".format(transfers_file))
@@ -344,6 +469,9 @@ def main():
     # Create log directory if it doesn't exist
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
+
+    if not os.path.exists(scripts_dir):
+        os.makedirs(scripts_dir)
     
     # Parse transfers into DataFrame using pandas
     transfers_df = parse_transfers_file(transfers_file)
@@ -363,18 +491,19 @@ def main():
         print("Consider adjusting your transfers.tsv to avoid conflicts.")
         print("Continuing with generation...\n")
     
-    # Apply default log file path for entries without one
-    default_log_file = os.path.join(log_dir, 'transfers.log')
-    transfers_df['log_file'] = transfers_df['log_file'].apply(
-        lambda x: x if x and x.strip() else default_log_file
-    )
-    
     # Group by system_user and generate cron files
     grouped = transfers_df.groupby('system_user')
-    
+
     for system_user, group_df in grouped:
+        for _, transfer in group_df.iterrows():
+            script_path = os.path.join(scripts_dir, transfer['script_name'])
+            script_content = generate_script_content(transfer)
+            with open(script_path, 'w') as file:
+                file.write(script_content)
+            os.chmod(script_path, 0o755)
+
         filename = "{0}.Landing_Zone.cron".format(system_user)
-        content = generate_cron_file(system_user, group_df)
+        content = generate_cron_file(system_user, group_df, scripts_dir)
         
         # Write the cron file
         output_path = os.path.join(output_dir, filename)

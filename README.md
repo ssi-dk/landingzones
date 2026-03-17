@@ -10,7 +10,7 @@ pip install -e .
 
 # Generate cron files
 lz-generate-cron --help
-lz-generate-cron --transfers config/transfers.tsv --output-dir output/crontab.d --log-dir log
+lz-generate-cron --transfers config/transfers.tsv --output-dir output/crontab.d --scripts-dir output/scripts --log-dir log
 
 # Check deployment readiness
 lz-check-deployment
@@ -39,6 +39,7 @@ The system is configured via a tab-separated `transfers.tsv` file:
 
 | Column | Description | Example |
 |--------|-------------|---------|
+| `identifiers` | Unique transfer ID used for generated shell script names | `transfer_001`, `gridion_to_calc` |
 | `system` | Source system identifier | `server1`, `localhost` |
 | `users` | System user for transfer | `user1`, `local` |
 | `source` | Source directory path | `/srv/data/src/` |
@@ -47,14 +48,14 @@ The system is configured via a tab-separated `transfers.tsv` file:
 | `destination_port` | SSH port (optional) | `225` |
 | `rsync_options` | Additional rsync flags | `--chown=:group` |
 | `io_nice` | Optional `ionice` settings for `rsync` | `-c2 -n7` |
-| `log_file` | Log file path (optional) | `log/transfers.log` |
-| `flock_file` | Lock file path | `/tmp/transfer.lock` |
+| `log_file` | Log file name resolved under the system log folder | `transfers.log` |
+| `flock_file` | Lock file name resolved under the system flock folder | `transfer.lock` |
 
 ### Example
 
 ```tsv
-system	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file
-localhost	testuser	input/*		output/				log/transfers.log	/tmp/landingzones.lock
+identifiers	system	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file
+local_copy	localhost	testuser	input/*		output/				transfers.log	landingzones.lock
 ```
 
 ## CLI Commands
@@ -64,7 +65,7 @@ localhost	testuser	input/*		output/				log/transfers.log	/tmp/landingzones.lock
 lz-generate-cron
 
 # Custom paths
-lz-generate-cron -t config/transfers.tsv -o output/crontab.d -l log
+lz-generate-cron -t config/transfers.tsv -o output/crontab.d -s output/scripts -l log
 
 # Check deployment
 lz-check-deployment
@@ -73,9 +74,7 @@ lz-check-deployment
 ### Generated Cron Format
 
 ```bash
-*/15 * * * * /usr/bin/flock -n /tmp/landingzones.lock -c '\
-    rsync -av --remove-source-files /source/ /dest/ >> log/transfers.log 2>&1 && \
-    find /source/ -mindepth 1 -type d -empty -delete >> log/transfers.log 2>&1'
+*/15 * * * * /bin/sh output/scripts/local_copy.sh
 ```
 
 ## Installation

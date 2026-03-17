@@ -185,15 +185,24 @@ class TestCheckLogDirectory:
         assert 'current directory' in msg
 
 
-class TestCheckLockFileDirectory:
-    """Test the check_lock_file_directory function"""
-    
-    def test_lock_directory_exists(self):
-        """Test that /tmp directory exists (should always pass)"""
-        result = cdr.check_lock_file_directory()
-        
-        # /tmp should always exist on Unix systems
+class TestCheckFlockCommand:
+    """Test the check_flock_command function"""
+
+    def test_flock_binary_exists(self, monkeypatch):
+        """Test that an existing flock binary path passes."""
+        monkeypatch.setattr(cdr.config, 'get_flock_path', lambda system: '/bin/sh')
+
+        result = cdr.check_flock_command('calc')
+
         assert result is True
+
+    def test_flock_binary_missing(self, monkeypatch):
+        """Test that a missing flock binary path fails."""
+        monkeypatch.setattr(cdr.config, 'get_flock_path', lambda system: '/no/such/flock')
+
+        result = cdr.check_flock_command('calc')
+
+        assert result is False
 
 
 class TestColors:

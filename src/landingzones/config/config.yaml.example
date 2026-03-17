@@ -21,6 +21,23 @@ output_dir: output
 # Directory for generated cron files (default: output_dir/crontab.d)
 crontab_dir: output/crontab.d
 
+# Base rit_managed locations by system.
+rit_managed_locations:
+  localhost: /srv/rit_managed/
+
+# Flock binary by system. Defaults to /usr/bin/flock if omitted.
+flock_paths:
+  localhost: /usr/bin/flock
+
+# Folder suffixes under each rit_managed location.
+# Cron entries will reference:
+#   <rit_managed_locations[system]>/<rit_managed_folder_structure.sh_output>/<identifier>.sh
+rit_managed_folder_structure:
+  sh_output: scripts/landingzones/deploy/prod/output/scripts/
+  crontabs: scripts/landingzones/deploy/prod/output/crontab.d/
+  log: log/
+  flock: flock/
+
 # Directory for input files
 input_dir: input
 

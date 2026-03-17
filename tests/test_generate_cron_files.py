@@ -15,9 +15,9 @@ class TestParseTransfersFile:
     
     def test_parse_valid_tsv(self, tmp_path):
         """Test parsing a valid TSV file"""
-        tsv_content = """system\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
-server1\tuser1\t/srv/data/src/\tuser@host:/dest/\t22\t-av\t\t/tmp/log.txt\t/tmp/lock.txt
-localhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t22\t-av\t\t/tmp/log.txt\t/tmp/lock.txt
+localhost_main\tlocalhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -27,14 +27,15 @@ localhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
         assert len(df) == 2
         assert df.iloc[0]['system'] == 'server1'
         assert df.iloc[0]['users'] == 'user1'
+        assert df.iloc[0]['identifiers'] == 'server1_main'
         assert df.iloc[1]['system'] == 'localhost'
     
     def test_parse_filters_comments(self, tmp_path):
         """Test that lines starting with # are filtered out"""
-        tsv_content = """system\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
-server1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
-#commented\tuser\t/src/\t/dest/\t\t\t\t/tmp/log.txt\t/tmp/log.txt
-localhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+commented\t#commented\tuser\t/src/\t/dest/\t\t\t\t/tmp/log.txt\t/tmp/log.txt
+localhost_main\tlocalhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -46,10 +47,10 @@ localhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
     
     def test_parse_filters_disabled_rows(self, tmp_path):
         """Test that rows with enabled != TRUE are filtered out"""
-        tsv_content = """enabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
-TRUE\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
-FALSE\tserver2\tuser2\t/srv/data/src2/\tuser@host:/dest2/\t\t\t\t/tmp/log2.txt\t/tmp/lock2.txt
-TRUE\tlocalhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
+        tsv_content = """identifiers\tenabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\tTRUE\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+server2_main\tFALSE\tserver2\tuser2\t/srv/data/src2/\tuser@host:/dest2/\t\t\t\t/tmp/log2.txt\t/tmp/lock2.txt
+localhost_main\tTRUE\tlocalhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -63,10 +64,10 @@ TRUE\tlocalhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
     
     def test_parse_enabled_case_insensitive(self, tmp_path):
         """Test that enabled column is case insensitive"""
-        tsv_content = """enabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
-true\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
-True\tserver2\tuser2\t/srv/data/src2/\tuser@host:/dest2/\t\t\t\t/tmp/log2.txt\t/tmp/lock2.txt
-FALSE\tserver3\tuser3\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
+        tsv_content = """identifiers\tenabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\ttrue\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+server2_main\tTrue\tserver2\tuser2\t/srv/data/src2/\tuser@host:/dest2/\t\t\t\t/tmp/log2.txt\t/tmp/lock2.txt
+server3_main\tFALSE\tserver3\tuser3\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -93,6 +94,65 @@ localhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
         assert len(df) == 2
         assert 'server1' in df['system'].values
         assert 'localhost' in df['system'].values
+        assert df.iloc[0]['identifiers'] == 'transfer_001'
+
+    def test_parse_requires_identifiers_for_enabled_rows(self, tmp_path):
+        """Test that enabled rows must define identifiers when column exists."""
+        tsv_content = """identifiers\tenabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+\tTRUE\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        with pytest.raises(ValueError):
+            gcf.parse_transfers_file(str(test_file))
+
+    def test_parse_requires_log_file_for_enabled_rows(self, tmp_path):
+        """Test that enabled rows must define log_file."""
+        tsv_content = """identifiers\tenabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\tTRUE\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t\t/tmp/lock.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        with pytest.raises(ValueError):
+            gcf.parse_transfers_file(str(test_file))
+
+    def test_parse_rejects_duplicate_sanitized_identifiers(self, tmp_path):
+        """Test that identifiers remain unique after script filename sanitization."""
+        tsv_content = """identifiers\tenabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+sample name\tTRUE\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+sample_name\tTRUE\tserver1\tuser1\t/srv/data/src2/\tuser@host:/dest2/\t\t\t\t/tmp/log2.txt\t/tmp/lock2.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        with pytest.raises(ValueError):
+            gcf.parse_transfers_file(str(test_file))
+
+    def test_parse_resolves_log_and_flock_filenames(self, tmp_path):
+        """Test that filename-only log and flock values resolve via config."""
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t22\t-av\t\ttransfer.log\ttransfer.lock
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        original_runtime_config = dict(gcf.config._runtime_config)
+        gcf.config._runtime_config['rit_managed_locations'] = {
+            'server1': '/srv/rit_managed'
+        }
+        gcf.config._runtime_config['rit_managed_folder_structure'] = {
+            'log': 'log',
+            'flock': 'flock',
+        }
+        try:
+            df = gcf.parse_transfers_file(str(test_file))
+        finally:
+            gcf.config._runtime_config = original_runtime_config
+
+        assert df.iloc[0]['log_file'] == '/srv/rit_managed/log/transfer.log'
+        assert df.iloc[0]['flock_file'] == '/srv/rit_managed/flock/transfer.lock'
 
 
 class TestGenerateRsyncCommand:
@@ -101,6 +161,7 @@ class TestGenerateRsyncCommand:
     def test_basic_rsync_command(self):
         """Test basic rsync command generation"""
         transfer = {
+            'system': 'server1',
             'source': '/source/path/',
             'source_port': '',
             'destination': '/dest/path/',
@@ -114,8 +175,6 @@ class TestGenerateRsyncCommand:
         
         cmd = gcf.generate_rsync_command(transfer)
         
-        assert '/usr/bin/flock' in cmd
-        assert '/tmp/test.lock' in cmd
         assert 'rsync' in cmd
         assert 'ionice' not in cmd
         assert '-av' in cmd
@@ -123,12 +182,11 @@ class TestGenerateRsyncCommand:
         assert '/source/path/' in cmd
         assert '/dest/path/' in cmd
         assert '/tmp/test.log' in cmd
-        # Default frequency should be used
-        assert '*/15 * * * *' in cmd
     
     def test_rsync_with_ssh_port(self):
         """Test rsync command with SSH port"""
         transfer = {
+            'system': 'server1',
             'source': '/source/',
             'source_port': '',
             'destination': 'user@host:/dest/',
@@ -144,12 +202,11 @@ class TestGenerateRsyncCommand:
         
         assert '-e "ssh -p 2222"' in cmd or "-e 'ssh -p 2222'" in cmd
         assert 'user@host:/dest/' in cmd
-        # Custom frequency should be used
-        assert '*/5 * * * *' in cmd
     
     def test_rsync_with_source_ssh_port(self):
         """Test rsync command with SSH port on source"""
         transfer = {
+            'system': 'server1',
             'source': 'user@remote:/source/',
             'source_port': '2222',
             'destination': '/local/dest/',
@@ -171,6 +228,7 @@ class TestGenerateRsyncCommand:
     def test_rsync_with_custom_options(self):
         """Test rsync command with custom options"""
         transfer = {
+            'system': 'server1',
             'source': '/source/',
             'source_port': '',
             'destination': '/dest/',
@@ -187,12 +245,11 @@ class TestGenerateRsyncCommand:
         assert '--chown=:group' in cmd
         assert '--chmod=Du=rwx' in cmd
         assert 'ionice -c2 -n4 rsync' in cmd
-        # Hourly frequency should be used
-        assert '0 * * * *' in cmd
 
     def test_rsync_with_io_nice_arguments_only(self):
         """Test that bare io_nice arguments are prefixed with ionice."""
         transfer = {
+            'system': 'server1',
             'source': '/source/',
             'source_port': '',
             'destination': '/dest/',
@@ -211,6 +268,7 @@ class TestGenerateRsyncCommand:
     def test_rsync_without_io_nice_when_blank(self):
         """Test that blank io_nice does not prefix rsync"""
         transfer = {
+            'system': 'server1',
             'source': '/source/',
             'source_port': '',
             'destination': '/dest/',
@@ -230,6 +288,7 @@ class TestGenerateRsyncCommand:
     def test_rsync_validates_flock_file(self):
         """Test that rsync command requires flock_file"""
         transfer = {
+            'system': 'server1',
             'source': '/source/',
             'source_port': '',
             'destination': '/dest/',
@@ -246,9 +305,11 @@ class TestGenerateRsyncCommand:
         
         assert 'flock_file' in str(exc_info.value).lower()
     
-    def test_rsync_with_custom_frequency(self):
-        """Test rsync command with custom cron frequency"""
+    def test_generate_cron_entry_with_custom_frequency(self):
+        """Test cron entry generation with custom cron frequency."""
         transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
             'source': '/source/',
             'source_port': '',
             'destination': '/dest/',
@@ -259,16 +320,16 @@ class TestGenerateRsyncCommand:
             'flock_file': '/tmp/test.lock',
             'frequency': '0 0 * * *'  # Daily at midnight
         }
-        
-        cmd = gcf.generate_rsync_command(transfer)
-        
-        # Should use the custom frequency
-        assert cmd.startswith('0 0 * * *')
-        assert '/usr/bin/flock' in cmd
-    
-    def test_rsync_default_frequency_when_empty(self):
-        """Test that default frequency is used when frequency is empty"""
+
+        cmd = gcf.generate_cron_entry(transfer, '/tmp/scripts/sample.sh')
+
+        assert cmd == '0 0 * * * /bin/sh /tmp/scripts/sample.sh'
+
+    def test_generate_cron_entry_default_frequency_when_empty(self):
+        """Test that default frequency is used when frequency is empty."""
         transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
             'source': '/source/',
             'source_port': '',
             'destination': '/dest/',
@@ -279,15 +340,16 @@ class TestGenerateRsyncCommand:
             'flock_file': '/tmp/test.lock',
             'frequency': ''  # Empty, should use default
         }
-        
-        cmd = gcf.generate_rsync_command(transfer)
-        
-        # Should use the default frequency (*/15 * * * *)
-        assert cmd.startswith('*/15 * * * *')
-    
-    def test_rsync_default_frequency_when_nan(self):
-        """Test that default frequency is used when frequency is 'nan'"""
+
+        cmd = gcf.generate_cron_entry(transfer, '/tmp/scripts/sample.sh')
+
+        assert cmd == '*/15 * * * * /bin/sh /tmp/scripts/sample.sh'
+
+    def test_generate_cron_entry_default_frequency_when_nan(self):
+        """Test that default frequency is used when frequency is 'nan'."""
         transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
             'source': '/source/',
             'source_port': '',
             'destination': '/dest/',
@@ -298,11 +360,43 @@ class TestGenerateRsyncCommand:
             'flock_file': '/tmp/test.lock',
             'frequency': 'nan'  # NaN string, should use default
         }
-        
-        cmd = gcf.generate_rsync_command(transfer)
-        
-        # Should use the default frequency (*/15 * * * *)
-        assert cmd.startswith('*/15 * * * *')
+
+        cmd = gcf.generate_cron_entry(transfer, '/tmp/scripts/sample.sh')
+
+        assert cmd == '*/15 * * * * /bin/sh /tmp/scripts/sample.sh'
+
+    def test_generate_script_content(self):
+        """Test shell script content generation."""
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': '/source/',
+            'source_port': '',
+            'destination': '/dest/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
+        }
+
+        original_runtime_config = dict(gcf.config._runtime_config)
+        gcf.config._runtime_config['flock_paths'] = {'server1': '/opt/bin/flock'}
+        try:
+            script = gcf.generate_script_content(transfer)
+        finally:
+            gcf.config._runtime_config = original_runtime_config
+
+        assert script.startswith('#!/bin/sh\n')
+        assert 'set -eu' in script
+        assert 'rsync -av --remove-source-files /source/ /dest/' in script
+        assert 'exec 9>"$flock_file"' in script
+        assert '/opt/bin/flock -n 9' in script
+        assert 'flock_file="/tmp/test.lock"' in script
+        assert 'cat "$run_log" >> "$log_file"' in script
+        assert 'latest_log_file="/tmp/test.log.latest"' in script
+        assert 'cat "$run_log" > "$latest_log_file"' in script
 
 
 class TestGenerateCronHeader:
@@ -334,6 +428,7 @@ class TestGroupTransfersBySystemUser:
         import pandas as pd
         
         data = {
+            'identifiers': ['first', 'second', 'third'],
             'system': ['server1', 'server1', 'server2'],
             'users': ['user1', 'user1', 'user2'],
             'source': ['/src1/', '/src2/', '/src3/'],
@@ -362,8 +457,8 @@ class TestCronFileGeneration:
     def test_generates_cron_file(self, tmp_path):
         """Test that cron files are generated correctly"""
         # Create test TSV
-        tsv_content = """system\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
-localhost\ttestuser\t/tmp/src/\t\t/tmp/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
+        tsv_content = """identifiers\tsystem\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+local_copy\tlocalhost\ttestuser\t/tmp/src/\t\t/tmp/dest/\t\t\t\t/tmp/test.log\t/tmp/test.lock
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -375,21 +470,25 @@ localhost\ttestuser\t/tmp/src/\t\t/tmp/dest/\t\t\t\t/tmp/test.log\t/tmp/test.loc
         system = 'localhost'
         user = 'testuser'
         transfers = df[(df['system'] == system) & (df['users'] == user)]
-        
-        header = gcf.generate_cron_header(system, user)
-        commands = []
-        for _, transfer in transfers.iterrows():
-            cmd = gcf.generate_rsync_command(transfer.to_dict())
-            commands.append(cmd)
-        
-        cron_content = header + '\n'.join(commands)
-        
+        original_runtime_config = dict(gcf.config._runtime_config)
+        gcf.config._runtime_config['rit_managed_locations'] = {
+            'localhost': '/srv/deployed'
+        }
+        gcf.config._runtime_config['rit_managed_folder_structure'] = {
+            'sh_output': 'output/scripts'
+        }
+        try:
+            cron_content = gcf.generate_cron_file(
+                '{0}.{1}'.format(system, user), transfers, '/tmp/scripts'
+            )
+        finally:
+            gcf.config._runtime_config = original_runtime_config
+
         assert 'localhost' in cron_content
         assert 'testuser' in cron_content
         assert '/tmp/src/' in cron_content
         assert '/tmp/dest/' in cron_content
-        assert 'rsync' in cron_content
-        assert 'flock' in cron_content
+        assert '/bin/sh /srv/deployed/output/scripts/local_copy.sh' in cron_content
 
 
 class TestEnvironmentVariableExpansion:
@@ -398,6 +497,7 @@ class TestEnvironmentVariableExpansion:
     def test_home_variable_not_expanded_in_output(self):
         """Test that $HOME is preserved in the cron output"""
         transfer = {
+            'system': 'server1',
             'source': '$HOME/source/',
             'source_port': '',
             'destination': '/dest/',
@@ -421,6 +521,7 @@ class TestEdgeCases:
     def test_empty_port_handled(self):
         """Test that empty port is handled correctly"""
         transfer = {
+            'system': 'server1',
             'source': '/source/',
             'source_port': '',
             'destination': 'user@host:/dest/',
@@ -440,6 +541,7 @@ class TestEdgeCases:
     def test_nan_port_handled(self):
         """Test that NaN port values are handled"""
         transfer = {
+            'system': 'server1',
             'source': '/source/',
             'source_port': '',
             'destination': '/dest/',
