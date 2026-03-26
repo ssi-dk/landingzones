@@ -394,7 +394,11 @@ class TestGenerateRsyncCommand:
         assert 'exec 9>"$flock_file"' in script
         assert '/opt/bin/flock -n 9' in script
         assert 'flock_file="/tmp/test.lock"' in script
+        assert 'if rsync -av --remove-source-files /source/ /dest/ >"$run_log" 2>&1; then' in script
+        assert 'rsync_status=$?' in script
         assert 'cat "$run_log" >> "$log_file"' in script
+        assert 'printf \'%s\n\' "rsync failed with exit code $rsync_status" >> "$log_file"' in script
+        assert 'exit "$rsync_status"' in script
         assert 'latest_log_file="/tmp/test.log.latest"' in script
         assert 'cat "$run_log" > "$latest_log_file"' in script
 
