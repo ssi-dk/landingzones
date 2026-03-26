@@ -341,8 +341,19 @@ if ! {4} -n 9; then
     exit 0
 fi
 
-{5} >"$run_log" 2>&1
+if {5} >"$run_log" 2>&1; then
+    rsync_status=0
+else
+    rsync_status=$?
+fi
+
 cat "$run_log" >> "$log_file"
+
+if [ "$rsync_status" -ne 0 ]; then
+    printf '%s\n' "rsync failed with exit code $rsync_status" >> "$log_file"
+    cat "$run_log" > "$latest_log_file"
+    exit "$rsync_status"
+fi
 
 {6} >"$cleanup_log" 2>&1
 if [ -s "$cleanup_log" ]; then
