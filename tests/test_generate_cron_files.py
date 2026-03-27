@@ -159,7 +159,7 @@ class TestGenerateRsyncCommand:
     """Test the generate_rsync_command function"""
     
     def test_basic_rsync_command(self):
-        """Test basic rsync command generation"""
+        """Test basic rsync command generation with per-subdir loop"""
         transfer = {
             'system': 'server1',
             'source': '/source/path/',
@@ -172,16 +172,20 @@ class TestGenerateRsyncCommand:
             'flock_file': '/tmp/test.lock',
             'frequency': ''
         }
-        
+
         cmd = gcf.generate_rsync_command(transfer)
-        
+
         assert 'rsync' in cmd
         assert 'ionice' not in cmd
         assert '-av' in cmd
         assert '--remove-source-files' in cmd
-        assert '/source/path/' in cmd
-        assert '/dest/path/' in cmd
         assert '/tmp/test.log' in cmd
+        # Per-subdir loop with sentinel logic
+        assert 'for subdir in "/source/path"' in cmd
+        assert 'transfer_successful.txt' in cmd
+        assert "[ -f \"$sentinel\" ] || continue" in cmd
+        assert "--exclude='/transfer_successful.txt'" in cmd
+        assert 'dest_subdir="/dest/path/${subdir_name}/"' in cmd
     
     def test_rsync_with_ssh_port(self):
         """Test rsync command with SSH port"""
@@ -197,11 +201,11 @@ class TestGenerateRsyncCommand:
             'flock_file': '/tmp/test.lock',
             'frequency': '*/5 * * * *'
         }
-        
+
         cmd = gcf.generate_rsync_command(transfer)
-        
+
         assert '-e "ssh -p 2222"' in cmd or "-e 'ssh -p 2222'" in cmd
-        assert 'user@host:/dest/' in cmd
+        assert 'dest_subdir="user@host:/dest/${subdir_name}/"' in cmd
     
     def test_rsync_with_source_ssh_port(self):
         """Test rsync command with SSH port on source"""
@@ -217,13 +221,13 @@ class TestGenerateRsyncCommand:
             'flock_file': '/tmp/test.lock',
             'frequency': '*/5 * * * *'
         }
-        
+
         cmd = gcf.generate_rsync_command(transfer)
-        
+
         # Should use source port when pulling from remote
         assert '-e "ssh -p 2222"' in cmd or "-e 'ssh -p 2222'" in cmd
-        assert 'user@remote:/source/' in cmd
-        assert '/local/dest/' in cmd
+        assert 'for subdir in "user@remote:/source"' in cmd
+        assert 'dest_subdir="/local/dest/${subdir_name}/"' in cmd
     
     def test_rsync_with_custom_options(self):
         """Test rsync command with custom options"""
@@ -239,12 +243,13 @@ class TestGenerateRsyncCommand:
             'flock_file': '/tmp/test.lock',
             'frequency': '0 * * * *'
         }
-        
+
         cmd = gcf.generate_rsync_command(transfer)
-        
+
         assert '--chown=:group' in cmd
         assert '--chmod=Du=rwx' in cmd
         assert 'ionice -c2 -n4 rsync' in cmd
+        assert "--exclude='/transfer_successful.txt'" in cmd
 
     def test_rsync_with_io_nice_arguments_only(self):
         """Test that bare io_nice arguments are prefixed with ionice."""
@@ -283,7 +288,8 @@ class TestGenerateRsyncCommand:
         cmd = gcf.generate_rsync_command(transfer)
 
         assert 'ionice' not in cmd
-        assert 'rsync -av --remove-source-files /source/ /dest/' in cmd
+        assert 'rsync -av --remove-source-files' in cmd
+        assert "--exclude='/transfer_successful.txt'" in cmd
     
     def test_rsync_validates_flock_file(self):
         """Test that rsync command requires flock_file"""
@@ -390,13 +396,20 @@ class TestGenerateRsyncCommand:
 
         assert script.startswith('#!/bin/sh\n')
         assert 'set -eu' in script
-        assert 'rsync -av --remove-source-files /source/ /dest/' in script
         assert 'exec 9>"$flock_file"' in script
         assert '/opt/bin/flock -n 9' in script
         assert 'flock_file="/tmp/test.lock"' in script
-        assert 'cat "$run_log" >> "$log_file"' in script
         assert 'latest_log_file="/tmp/test.log.latest"' in script
-        assert 'cat "$run_log" > "$latest_log_file"' in script
+        assert 'cat "$run_log" >> "$log_file"' in script
+        # Loop-based per-subdirectory transfer
+        assert 'for subdir in "/source"/*/; do' in script
+        assert 'transfer_successful.txt' in script
+        assert "--exclude='/transfer_successful.txt'" in script
+        assert 'rsync -av --remove-source-files' in script
+        assert 'dest_subdir="/dest/${subdir_name}/"' in script
+        assert 'overall_status' in script
+        assert 'exit "$overall_status"' in script
+        assert 'cat "$all_rsync_log" > "$latest_log_file"' in script
 
 
 class TestGenerateCronHeader:
@@ -532,11 +545,11 @@ class TestEdgeCases:
             'flock_file': '/tmp/test.lock',
             'frequency': ''
         }
-        
+
         cmd = gcf.generate_rsync_command(transfer)
-        
-        # Should not have port specification
-        assert '-p ' not in cmd.split('ssh')[1].split('"')[0] if 'ssh' in cmd else True
+
+        # Should not have ssh port specification
+        assert 'ssh' not in cmd
     
     def test_nan_port_handled(self):
         """Test that NaN port values are handled"""
