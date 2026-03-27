@@ -299,6 +299,10 @@ def build_transfer_commands(transfer):
 
     return {
         'rsync_cmd': rsync_cmd,
+        'rsync_flags': options,
+        'io_nice_cmd': io_nice_cmd,
+        'source_base': find_target,
+        'destination': destination,
         'find_cmd': find_cmd,
         'log_file': log_file,
         'latest_log_file': latest_log_file,
@@ -308,72 +312,157 @@ def build_transfer_commands(transfer):
 
 
 def build_transfer_command(transfer):
-    """Build the shell command executed by a transfer script."""
+    """Build the shell command executed by a transfer script.
+
+    Returns a multi-line shell snippet that iterates over top-level
+    subdirectories, checks for a ``transfer_successful.txt`` sentinel,
+    rsyncs the directory contents (excluding the sentinel), and then
+    transfers the sentinel on success.
+    """
     commands = build_transfer_commands(transfer)
     log_file = commands['log_file']
     log_redirect = " >> {0} 2>&1".format(log_file) if log_file else ''
-    if log_redirect:
-        return "{0}{1} && {2}{3}".format(
-            commands['rsync_cmd'], log_redirect, commands['find_cmd'], log_redirect
-        )
-    return "{0} && {1}".format(commands['rsync_cmd'], commands['find_cmd'])
+
+    io_nice_cmd = commands['io_nice_cmd']
+    rsync_flags = commands['rsync_flags']
+    source_base = commands['source_base'].rstrip('/')
+    destination_stripped = commands['destination'].rstrip('/')
+
+    if io_nice_cmd:
+        rsync_prefix = "{0} rsync {1}".format(io_nice_cmd, rsync_flags)
+    else:
+        rsync_prefix = "rsync {0}".format(rsync_flags)
+
+    rsync_main = "{0} --exclude='/transfer_successful.txt'".format(rsync_prefix)
+    rsync_sentinel = rsync_prefix
+
+    lines = [
+        '# Process each top-level subdirectory independently',
+        'for subdir in "{0}"/*/; do'.format(source_base),
+        '  [ -d "$subdir" ] || continue',
+        '  # Skip directories where the source has not finished writing',
+        '  sentinel="${{subdir%/}}/transfer_successful.txt"',
+        '  [ -f "$sentinel" ] || continue',
+        '  subdir_name=$(basename "$subdir")',
+        '  dest_subdir="{0}/${{subdir_name}}/"'.format(destination_stripped),
+        '  # Transfer directory contents, excluding the marker file',
+        '  {0} "$subdir" "$dest_subdir"{1} &&'.format(rsync_main, log_redirect),
+        '  # Transfer the marker file to signal completion to the destination',
+        '  {0} "$sentinel" "$dest_subdir"{1}'.format(rsync_sentinel, log_redirect),
+        'done',
+        '# Remove empty directories left behind by --remove-source-files',
+        '{0}{1}'.format(commands['find_cmd'], log_redirect),
+    ]
+
+    return '\n'.join(lines)
 
 
 def generate_script_content(transfer):
     """Generate shell script content for a transfer."""
     commands = build_transfer_commands(transfer)
+    identifier = sanitize_identifier(transfer.get('identifiers', 'transfer'))
+
+    io_nice_cmd = commands['io_nice_cmd']
+    rsync_flags = commands['rsync_flags']
+    source_base = commands['source_base'].rstrip('/')
+    destination_stripped = commands['destination'].rstrip('/')
+
+    rsync_prefix = "{0} rsync".format(io_nice_cmd) if io_nice_cmd else "rsync"
+    rsync_main = (
+        "{0} {1} --exclude='/transfer_successful.txt'"
+        ' "$subdir" "$dest_subdir"'
+    ).format(rsync_prefix, rsync_flags)
+    rsync_sentinel = '{0} {1} "$sentinel" "$dest_subdir"'.format(
+        rsync_prefix, rsync_flags)
+
     return """#!/bin/sh
 set -eu
 
-log_file="{0}"
-latest_log_file="{1}"
-flock_file="{2}"
-run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{3}.rsync.XXXXXX")"
-cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{3}.cleanup.XXXXXX")"
+log_file="{log_file}"
+latest_log_file="{latest_log_file}"
+flock_file="{flock_file}"
+run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{identifier}.rsync.XXXXXX")"
+cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{identifier}.cleanup.XXXXXX")"
+all_rsync_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{identifier}.all.XXXXXX")"
 
 cleanup() {{
-    rm -f "$run_log" "$cleanup_log"
+    rm -f "$run_log" "$cleanup_log" "$all_rsync_log"
 }}
 trap cleanup EXIT HUP INT TERM
 
+# Acquire exclusive lock; exit silently if another instance is running
 exec 9>"$flock_file"
-if ! {4} -n 9; then
+if ! {flock_command} -n 9; then
     exit 0
 fi
 
-if {5} >"$run_log" 2>&1; then
-    rsync_status=0
-else
-    rsync_status=$?
+overall_status=0
+
+# Process each top-level subdirectory independently
+for subdir in "{source_base}"/*/; do
+    [ -d "$subdir" ] || continue
+    # Skip directories where the source has not finished writing
+    sentinel="${{subdir%/}}/transfer_successful.txt"
+    if [ ! -f "$sentinel" ]; then
+        continue
+    fi
+    subdir_name=$(basename "$subdir")
+    dest_subdir="{destination_stripped}/${{subdir_name}}/"
+
+    # Transfer directory contents, excluding the marker file
+    if {rsync_main} >"$run_log" 2>&1; then
+        cat "$run_log" >> "$log_file"
+        cat "$run_log" >> "$all_rsync_log"
+        # Transfer the marker file to signal completion to the destination
+        if {rsync_sentinel} >"$run_log" 2>&1; then
+            cat "$run_log" >> "$log_file"
+            cat "$run_log" >> "$all_rsync_log"
+        else
+            sentinel_status=$?
+            cat "$run_log" >> "$log_file"
+            cat "$run_log" >> "$all_rsync_log"
+            printf '%s\n' "sentinel rsync failed for ${{subdir}} with exit code ${{sentinel_status}}" >> "$log_file"
+            overall_status=$sentinel_status
+        fi
+    else
+        dir_status=$?
+        cat "$run_log" >> "$log_file"
+        cat "$run_log" >> "$all_rsync_log"
+        printf '%s\n' "rsync failed for ${{subdir}} with exit code ${{dir_status}}" >> "$log_file"
+        overall_status=$dir_status
+    fi
+done
+
+# Abort before cleanup if any rsync failed
+if [ "$overall_status" -ne 0 ]; then
+    cat "$all_rsync_log" > "$latest_log_file"
+    exit "$overall_status"
 fi
 
-cat "$run_log" >> "$log_file"
-
-if [ "$rsync_status" -ne 0 ]; then
-    printf '%s\n' "rsync failed with exit code $rsync_status" >> "$log_file"
-    cat "$run_log" > "$latest_log_file"
-    exit "$rsync_status"
-fi
-
-{6} >"$cleanup_log" 2>&1
+# Remove empty directories left behind by --remove-source-files
+{find_cmd} >"$cleanup_log" 2>&1
 if [ -s "$cleanup_log" ]; then
     cat "$cleanup_log" >> "$log_file"
 fi
 
-if sed '/^sending incremental file list$/d; /^sent .* bytes .*$/d; /^total size is .*$/d; /^$/d' "$run_log" | grep -q .; then
-    cat "$run_log" > "$latest_log_file"
+# Write latest log only when files were actually transferred
+if sed '/^sending incremental file list$/d; /^sent .* bytes .*$/d; /^total size is .*$/d; /^$/d' "$all_rsync_log" | grep -q .; then
+    cat "$all_rsync_log" > "$latest_log_file"
     if [ -s "$cleanup_log" ]; then
         cat "$cleanup_log" >> "$latest_log_file"
     fi
 fi
 """.format(
-        commands['log_file'],
-        commands['latest_log_file'],
-        commands['flock_file'],
-        sanitize_identifier(transfer.get('identifiers', 'transfer')),
-        commands['flock_command'],
-        commands['rsync_cmd'],
-        commands['find_cmd'],
+        log_file=commands['log_file'],
+        latest_log_file=commands['latest_log_file'],
+        flock_file=commands['flock_file'],
+        identifier=identifier,
+        flock_command=commands['flock_command'],
+        source_base=source_base,
+        destination_stripped=destination_stripped,
+        rsync_main=rsync_main,
+        rsync_sentinel=rsync_sentinel,
+        find_cmd=commands['find_cmd'],
     )
 
 
