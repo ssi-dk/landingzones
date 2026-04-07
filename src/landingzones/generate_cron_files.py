@@ -10,6 +10,7 @@ import os
 import sys
 import argparse
 import re
+import shlex
 import pandas as pd
 
 from landingzones.config import config
@@ -111,6 +112,13 @@ def normalize_source_path(source):
     return path
 
 
+def source_uses_directory_iteration(source):
+    """Return True when the source should be processed one top-level dir at a time."""
+    _, source_path = split_remote_path(source)
+    value = str(source_path).strip() if source_path is not None else ''
+    return value.endswith('/') or value.endswith('/*') or value.endswith('*')
+
+
 def normalize_io_nice(io_nice):
     """Normalize io_nice input to a shell command prefix or empty string."""
     value = str(io_nice).strip() if io_nice is not None else ''
@@ -128,6 +136,96 @@ def sanitize_identifier(identifier):
         return ''
     value = re.sub(r'[^A-Za-z0-9._-]+', '_', value)
     return value.strip('._-')
+
+
+def split_remote_path(path):
+    """Split an rsync path into remote target and filesystem path."""
+    value = str(path).strip() if path is not None else ''
+    if not value or ':' not in value:
+        return None, value
+    remote, remote_path = value.split(':', 1)
+    if not remote or not remote_path:
+        return None, value
+    return remote, remote_path
+
+
+def join_remote_path(remote, path):
+    """Join a remote target and filesystem path into rsync syntax."""
+    if remote:
+        return "{0}:{1}".format(remote, path)
+    return path
+
+
+def shell_quote(value):
+    """Shell-quote a string value."""
+    return shlex.quote(str(value))
+
+
+def shell_path(value):
+    """Quote a path for shell use while preserving env-var expansion."""
+    text = str(value)
+    escaped = text.replace('\\', '\\\\').replace('"', '\\"')
+    return '"{0}"'.format(escaped)
+
+
+def build_ssh_command(remote, port=''):
+    """Build an ssh command targeting a remote host."""
+    command = "ssh"
+    port_value = str(port).strip() if port is not None else ''
+    if port_value.isdigit():
+        command = "{0} -p {1}".format(command, port_value)
+    return "{0} {1}".format(command, shell_quote(remote))
+
+
+def build_directory_command(command, path, remote=None, port=''):
+    """Build a local or remote directory-management shell command."""
+    quoted_path = shell_quote(path)
+    if remote:
+        ssh_cmd = build_ssh_command(remote, port)
+        return '{0} "{1} {2}"'.format(
+            ssh_cmd,
+            command,
+            quoted_path,
+        )
+    return "{0} {1}".format(command, quoted_path)
+
+
+def build_staging_paths(destination, identifier):
+    """Return destination metadata for staged transfers."""
+    remote, destination_path = split_remote_path(destination)
+    destination_dir = destination_path.rstrip('/') or destination_path
+    staging_root = "{0}/.staging".format(destination_dir.rstrip('/'))
+    staging_dir = "{0}/{1}".format(staging_root, sanitize_identifier(identifier))
+    staged_destination = join_remote_path(remote, staging_dir + '/')
+    return {
+        'destination_remote': remote,
+        'destination_dir': destination_dir,
+        'staging_root': staging_root,
+        'staging_dir': staging_dir,
+        'staged_destination': staged_destination,
+    }
+
+
+def build_promote_command(destination_dir, staging_dir, remote=None, port=''):
+    """Move staged content into the final destination."""
+    move_cmd = (
+        "find {0} -mindepth 1 -maxdepth 1 -exec mv {{}} {1}/ \\;".format(
+            shell_quote(staging_dir),
+            shell_quote(destination_dir),
+        )
+    )
+    cleanup_cmd = (
+        "{{ rmdir {0} 2>/dev/null || true; }} && "
+        "{{ rmdir {1} 2>/dev/null || true; }}".format(
+            shell_quote(staging_dir),
+            shell_quote(os.path.dirname(staging_dir)),
+        )
+    )
+    full_cmd = "{0} && {1}".format(move_cmd, cleanup_cmd)
+    if remote:
+        ssh_cmd = build_ssh_command(remote, port)
+        return '{0} "{1}"'.format(ssh_cmd, full_cmd)
+    return full_cmd
 
 
 def resolve_transfer_file_paths(df):
@@ -219,6 +317,7 @@ def build_transfer_commands(transfer):
     flock_file = transfer.get('flock_file', '')
     frequency = transfer.get('frequency', '')
     io_nice = transfer.get('io_nice', '')
+    identifier = transfer.get('identifiers', 'transfer')
     
     # Ensure all values are strings and handle potential NaN values
     rsync_options = str(rsync_options) if rsync_options is not None else ''
@@ -249,6 +348,7 @@ def build_transfer_commands(transfer):
     
     # Base rsync options
     base_options = "-av --remove-source-files"
+    staging_paths = build_staging_paths(destination, identifier)
     
     # Build SSH options for ports (both source and destination may need ports)
     ssh_ports = []
@@ -276,9 +376,11 @@ def build_transfer_commands(transfer):
     io_nice_cmd = normalize_io_nice(io_nice)
     if io_nice_cmd:
         rsync_cmd = "{0} rsync {1} {2} {3}".format(
-            io_nice_cmd, options, source, destination)
+            io_nice_cmd, options, source, staging_paths['staged_destination'])
     else:
-        rsync_cmd = "rsync {0} {1} {2}".format(options, source, destination)
+        rsync_cmd = "rsync {0} {1} {2}".format(
+            options, source, staging_paths['staged_destination']
+        )
 
     # For find, strip a trailing wildcard so 'find' targets the parent dir
     # This avoids passing a literal '*' to find (which won't expand inside -c quotes)
@@ -288,20 +390,48 @@ def build_transfer_commands(transfer):
     elif source.endswith('*'):
         # Generic fallback: remove trailing '*' and any trailing '/'
         find_target = source.rstrip('*').rstrip('/')
-    find_cmd = "find {0} -mindepth 1 -type d -empty -delete".format(find_target)
+    source_remote, source_path = split_remote_path(find_target)
+    find_path = source_path if source_remote else find_target
+    find_inner_cmd = "find {0} -mindepth 1 -type d -empty -delete".format(
+        shell_quote(find_path) if source_remote else shell_path(find_path)
+    )
+    if source_remote:
+        find_cmd = '{0} "{1}"'.format(
+            build_ssh_command(source_remote, source_port),
+            find_inner_cmd,
+        )
+    else:
+        find_cmd = find_inner_cmd
+
+    prepare_cmd = build_directory_command(
+        "mkdir -p",
+        staging_paths['staging_dir'],
+        staging_paths['destination_remote'],
+        destination_port,
+    )
+    promote_cmd = build_promote_command(
+        staging_paths['destination_dir'],
+        staging_paths['staging_dir'],
+        staging_paths['destination_remote'],
+        destination_port,
+    )
 
     if not flock_file or not flock_file.strip():
         raise ValueError("flock_file is required but not specified for "
                          "transfer: {0} -> {1}".format(source, destination))
 
     latest_log_file = "{0}.latest".format(log_file) if log_file else ''
+    mini_log_file = "{0}.mini".format(log_file) if log_file else ''
     flock_command = config.get_flock_path(transfer['system'])
 
     return {
+        'prepare_cmd': prepare_cmd,
         'rsync_cmd': rsync_cmd,
+        'promote_cmd': promote_cmd,
         'find_cmd': find_cmd,
         'log_file': log_file,
         'latest_log_file': latest_log_file,
+        'mini_log_file': mini_log_file,
         'flock_file': flock_file,
         'flock_command': flock_command,
     }
@@ -313,44 +443,87 @@ def build_transfer_command(transfer):
     log_file = commands['log_file']
     log_redirect = " >> {0} 2>&1".format(log_file) if log_file else ''
     if log_redirect:
-        return "{0}{1} && {2}{3}".format(
-            commands['rsync_cmd'], log_redirect, commands['find_cmd'], log_redirect
+        return "{0}{1} && {2}{3} && {4}{5} && {6}{7}".format(
+            commands['prepare_cmd'],
+            log_redirect,
+            commands['rsync_cmd'],
+            log_redirect,
+            commands['promote_cmd'],
+            log_redirect,
+            commands['find_cmd'],
+            log_redirect,
         )
-    return "{0} && {1}".format(commands['rsync_cmd'], commands['find_cmd'])
+    return "{0} && {1} && {2} && {3}".format(
+        commands['prepare_cmd'],
+        commands['rsync_cmd'],
+        commands['promote_cmd'],
+        commands['find_cmd'],
+    )
 
 
 def generate_script_content(transfer):
     """Generate shell script content for a transfer."""
+    if source_uses_directory_iteration(transfer['source']):
+        return generate_iterative_script_content(transfer)
     commands = build_transfer_commands(transfer)
     return """#!/bin/sh
 set -eu
 
 log_file="{0}"
 latest_log_file="{1}"
-flock_file="{2}"
-run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{3}.rsync.XXXXXX")"
-cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{3}.cleanup.XXXXXX")"
+mini_log_file="{2}"
+flock_file="{3}"
+run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.rsync.XXXXXX")"
+cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.cleanup.XXXXXX")"
+promote_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.promote.XXXXXX")"
 
 cleanup() {{
-    rm -f "$run_log" "$cleanup_log"
+    rm -f "$run_log" "$cleanup_log" "$promote_log"
 }}
 trap cleanup EXIT HUP INT TERM
 
+log_status() {{
+    printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" >> "$mini_log_file"
+}}
+
+debug() {{
+    if [ -t 1 ] || [ "${{LZ_DEBUG_CLI:-0}}" = "1" ]; then
+        printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" >&2
+    fi
+}}
+
+mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")"
+debug "using lock file $flock_file"
+
 exec 9>"$flock_file"
-if ! {4} -n 9; then
+if ! {5} -n 9; then
+    debug "lock busy, exiting"
     exit 0
 fi
 
-{5} >"$run_log" 2>&1
+log_status "{6} initiated"
+debug "{6} initiated"
+{7}
+{8} >"$run_log" 2>&1
 cat "$run_log" >> "$log_file"
 
-{6} >"$cleanup_log" 2>&1
+{9} >"$promote_log" 2>&1
+if [ -s "$promote_log" ]; then
+    cat "$promote_log" >> "$log_file"
+fi
+log_status "{6} completed"
+debug "{6} completed"
+
+{10} >"$cleanup_log" 2>&1
 if [ -s "$cleanup_log" ]; then
     cat "$cleanup_log" >> "$log_file"
 fi
 
 if sed '/^sending incremental file list$/d; /^sent .* bytes .*$/d; /^total size is .*$/d; /^$/d' "$run_log" | grep -q .; then
     cat "$run_log" > "$latest_log_file"
+    if [ -s "$promote_log" ]; then
+        cat "$promote_log" >> "$latest_log_file"
+    fi
     if [ -s "$cleanup_log" ]; then
         cat "$cleanup_log" >> "$latest_log_file"
     fi
@@ -358,10 +531,181 @@ fi
 """.format(
         commands['log_file'],
         commands['latest_log_file'],
+        commands['mini_log_file'],
         commands['flock_file'],
         sanitize_identifier(transfer.get('identifiers', 'transfer')),
         commands['flock_command'],
+        sanitize_identifier(transfer.get('identifiers', 'transfer')),
+        commands['prepare_cmd'],
         commands['rsync_cmd'],
+        commands['promote_cmd'],
+        commands['find_cmd'],
+    )
+
+
+def generate_iterative_script_content(transfer):
+    """Generate shell script content that scans source dirs and stages each one."""
+    source = transfer['source']
+    destination = transfer['destination']
+    source_remote, source_path = split_remote_path(source)
+    destination_remote, destination_path = split_remote_path(destination)
+    commands = build_transfer_commands(transfer)
+    source_root = normalize_source_path(source_path if source_remote else source)
+    destination_root = destination_path.rstrip('/') or destination_path
+
+    base_options = "-av --remove-source-files"
+    source_port = str(transfer.get('source_port', '') or '').strip()
+    destination_port = str(transfer.get('destination_port', '') or '').strip()
+    if source_port.isdigit():
+        base_options = "{0} -e 'ssh -p {1}'".format(base_options, source_port)
+    elif destination_port.isdigit():
+        base_options = "{0} -e 'ssh -p {1}'".format(base_options, destination_port)
+
+    rsync_options = str(transfer.get('rsync_options', '') or '').strip()
+    if rsync_options and rsync_options != 'nan':
+        base_options = "{0} {1}".format(base_options, rsync_options)
+
+    io_nice_cmd = normalize_io_nice(transfer.get('io_nice', ''))
+    rsync_cmd = "rsync {0}".format(base_options)
+    if io_nice_cmd:
+        rsync_cmd = "{0} {1}".format(io_nice_cmd, rsync_cmd)
+
+    if source_remote:
+        source_loop = (
+            '{0} sh -c \'find "$1" -mindepth 1 -maxdepth 1 -type d -print\' '
+            'sh {1} | while IFS= read -r source_dir; do'
+        ).format(
+            build_ssh_command(source_remote, source_port),
+            shell_path(source_root),
+        )
+        rsync_source = '"{0}:$source_dir/"'.format(source_remote)
+    else:
+        source_loop = (
+            'find {0} -mindepth 1 -maxdepth 1 -type d -print | '
+            'while IFS= read -r source_dir; do'
+        ).format(shell_path(source_root))
+        rsync_source = '"$source_dir/"'
+
+    if destination_remote:
+        mkdir_cmd = (
+            '{0} sh -c \'mkdir -p "$1"\' sh "{1}/.staging/$dir_name"'
+        ).format(
+            build_ssh_command(destination_remote, destination_port),
+            destination_root,
+        )
+        promote_cmd = (
+            '{0} sh -c \''
+            'if [ -d "$2/$3" ]; then '
+            'find "$1" -mindepth 1 -maxdepth 1 -exec mv {{}} "$2/$3"/ \\; && '
+            'rmdir "$1" 2>/dev/null || true; '
+            'else '
+            'mv "$1" "$2/$3"; '
+            'fi; '
+            'rmdir "$2/.staging" 2>/dev/null || true'
+            '\' sh "{1}/.staging/$dir_name" "{1}" "$dir_name"'
+        ).format(
+            build_ssh_command(destination_remote, destination_port),
+            destination_root,
+        )
+        rsync_destination = '"{0}:{1}/.staging/$dir_name/"'.format(
+            destination_remote,
+            destination_root,
+        )
+    else:
+        mkdir_cmd = 'mkdir -p "{0}/.staging/$dir_name"'.format(destination_root)
+        promote_cmd = (
+            'if [ -d "{0}/$dir_name" ]; then '
+            'find "{0}/.staging/$dir_name" -mindepth 1 -maxdepth 1 -exec mv {{}} "{0}/$dir_name"/ \\; && '
+            'rmdir "{0}/.staging/$dir_name" 2>/dev/null || true; '
+            'else '
+            'mv "{0}/.staging/$dir_name" "{0}/$dir_name"; '
+            'fi; '
+            'rmdir "{0}/.staging" 2>/dev/null || true'
+        ).format(destination_root)
+        rsync_destination = '"{0}/.staging/$dir_name/"'.format(destination_root)
+
+    return """#!/bin/sh
+set -eu
+
+log_file="{0}"
+latest_log_file="{1}"
+mini_log_file="{2}"
+flock_file="{3}"
+run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.rsync.XXXXXX")"
+cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.cleanup.XXXXXX")"
+promote_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.promote.XXXXXX")"
+
+cleanup() {{
+    rm -f "$run_log" "$cleanup_log" "$promote_log"
+}}
+trap cleanup EXIT HUP INT TERM
+
+log_status() {{
+    printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" >> "$mini_log_file"
+}}
+
+debug() {{
+    if [ -t 1 ] || [ "${{LZ_DEBUG_CLI:-0}}" = "1" ]; then
+        printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" >&2
+    fi
+}}
+
+mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")"
+debug "using lock file $flock_file"
+
+exec 9>"$flock_file"
+if ! {5} -n 9; then
+    debug "lock busy, exiting"
+    exit 0
+fi
+
+: >"$run_log"
+: >"$promote_log"
+{6}
+    [ -n "$source_dir" ] || continue
+    dir_name=$(basename "$source_dir")
+    log_status "$dir_name initiated"
+    debug "$dir_name initiated"
+    {7} >>"$promote_log" 2>&1
+    {8} {9} {10} >>"$run_log" 2>&1
+    {11} >>"$promote_log" 2>&1
+    log_status "$dir_name completed"
+    debug "$dir_name completed"
+done
+if [ -s "$run_log" ]; then
+    cat "$run_log" >> "$log_file"
+fi
+if [ -s "$promote_log" ]; then
+    cat "$promote_log" >> "$log_file"
+fi
+
+{12} >"$cleanup_log" 2>&1
+if [ -s "$cleanup_log" ]; then
+    cat "$cleanup_log" >> "$log_file"
+fi
+
+if sed '/^sending incremental file list$/d; /^sent .* bytes .*$/d; /^total size is .*$/d; /^$/d' "$run_log" | grep -q .; then
+    cat "$run_log" > "$latest_log_file"
+    if [ -s "$promote_log" ]; then
+        cat "$promote_log" >> "$latest_log_file"
+    fi
+    if [ -s "$cleanup_log" ]; then
+        cat "$cleanup_log" >> "$latest_log_file"
+    fi
+fi
+""".format(
+        commands['log_file'],
+        commands['latest_log_file'],
+        commands['mini_log_file'],
+        commands['flock_file'],
+        sanitize_identifier(transfer.get('identifiers', 'transfer')),
+        commands['flock_command'],
+        source_loop,
+        mkdir_cmd,
+        rsync_cmd,
+        rsync_source,
+        rsync_destination,
+        promote_cmd,
         commands['find_cmd'],
     )
 

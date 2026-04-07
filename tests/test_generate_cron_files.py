@@ -180,7 +180,7 @@ class TestGenerateRsyncCommand:
         assert '-av' in cmd
         assert '--remove-source-files' in cmd
         assert '/source/path/' in cmd
-        assert '/dest/path/' in cmd
+        assert '/dest/path/.staging/transfer/' in cmd
         assert '/tmp/test.log' in cmd
     
     def test_rsync_with_ssh_port(self):
@@ -201,7 +201,7 @@ class TestGenerateRsyncCommand:
         cmd = gcf.generate_rsync_command(transfer)
         
         assert '-e "ssh -p 2222"' in cmd or "-e 'ssh -p 2222'" in cmd
-        assert 'user@host:/dest/' in cmd
+        assert 'user@host:/dest/.staging/transfer/' in cmd
     
     def test_rsync_with_source_ssh_port(self):
         """Test rsync command with SSH port on source"""
@@ -223,7 +223,7 @@ class TestGenerateRsyncCommand:
         # Should use source port when pulling from remote
         assert '-e "ssh -p 2222"' in cmd or "-e 'ssh -p 2222'" in cmd
         assert 'user@remote:/source/' in cmd
-        assert '/local/dest/' in cmd
+        assert '/local/dest/.staging/transfer/' in cmd
     
     def test_rsync_with_custom_options(self):
         """Test rsync command with custom options"""
@@ -245,6 +245,7 @@ class TestGenerateRsyncCommand:
         assert '--chown=:group' in cmd
         assert '--chmod=Du=rwx' in cmd
         assert 'ionice -c2 -n4 rsync' in cmd
+        assert 'find /dest/.staging/transfer -mindepth 1 -maxdepth 1 -exec mv {} /dest/ \\;' in cmd
 
     def test_rsync_with_io_nice_arguments_only(self):
         """Test that bare io_nice arguments are prefixed with ionice."""
@@ -283,7 +284,49 @@ class TestGenerateRsyncCommand:
         cmd = gcf.generate_rsync_command(transfer)
 
         assert 'ionice' not in cmd
-        assert 'rsync -av --remove-source-files /source/ /dest/' in cmd
+        assert 'rsync -av --remove-source-files /source/ /dest/.staging/transfer/' in cmd
+
+    def test_rsync_uses_remote_staging_and_remote_promote(self):
+        """Test that remote destinations are staged and promoted remotely."""
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': '/source/',
+            'source_port': '',
+            'destination': 'user@host:/dest/',
+            'destination_port': '2222',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
+        }
+
+        cmd = gcf.generate_rsync_command(transfer)
+
+        assert 'ssh -p 2222 user@host "mkdir -p /dest/.staging/sample"' in cmd
+        assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' /source/ user@host:/dest/.staging/sample/' in cmd
+        assert 'ssh -p 2222 user@host "find /dest/.staging/sample -mindepth 1 -maxdepth 1 -exec mv {} /dest/ \\; && { rmdir /dest/.staging/sample 2>/dev/null || true; } && { rmdir /dest/.staging 2>/dev/null || true; }"' in cmd
+
+    def test_rsync_cleans_remote_sources_via_ssh(self):
+        """Test that remote source cleanup runs on the remote host."""
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': 'user@remote:/source/*',
+            'source_port': '2200',
+            'destination': '/dest/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
+        }
+
+        cmd = gcf.generate_rsync_command(transfer)
+
+        assert 'ssh -p 2200 user@remote "find /source -mindepth 1 -type d -empty -delete"' in cmd
     
     def test_rsync_validates_flock_file(self):
         """Test that rsync command requires flock_file"""
@@ -390,13 +433,107 @@ class TestGenerateRsyncCommand:
 
         assert script.startswith('#!/bin/sh\n')
         assert 'set -eu' in script
-        assert 'rsync -av --remove-source-files /source/ /dest/' in script
+        assert 'find "/source" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r source_dir; do' in script
+        assert 'mkdir -p "/dest/.staging/$dir_name"' in script
+        assert 'rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
+        assert 'mv "/dest/.staging/$dir_name" "/dest/$dir_name"' in script
         assert 'exec 9>"$flock_file"' in script
         assert '/opt/bin/flock -n 9' in script
         assert 'flock_file="/tmp/test.lock"' in script
-        assert 'cat "$run_log" >> "$log_file"' in script
+        assert 'mini_log_file="/tmp/test.log.mini"' in script
+        assert "printf '%s %s\\n'" in script
+        assert 'mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")"' in script
+        assert 'debug "$dir_name initiated"' in script
+        assert 'debug "$dir_name completed"' in script
+        assert 'log_status "$dir_name initiated"' in script
+        assert 'log_status "$dir_name completed"' in script
         assert 'latest_log_file="/tmp/test.log.latest"' in script
         assert 'cat "$run_log" > "$latest_log_file"' in script
+
+    def test_generate_script_content_iterates_wildcard_source_dirs(self):
+        """Test shell script content for wildcard local sources."""
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': 'input/*',
+            'source_port': '',
+            'destination': 'output/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
+        }
+
+        original_runtime_config = dict(gcf.config._runtime_config)
+        gcf.config._runtime_config['flock_paths'] = {'server1': '/opt/bin/flock'}
+        try:
+            script = gcf.generate_script_content(transfer)
+        finally:
+            gcf.config._runtime_config = original_runtime_config
+
+        assert 'find "input" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r source_dir; do' in script
+        assert 'mkdir -p "output/.staging/$dir_name"' in script
+        assert 'rsync -av --remove-source-files "$source_dir/" "output/.staging/$dir_name/" >>"$run_log" 2>&1' in script
+        assert 'mv "output/.staging/$dir_name" "output/$dir_name"' in script
+        assert 'log_status "$dir_name initiated"' in script
+        assert 'log_status "$dir_name completed"' in script
+        assert 'find "input" -mindepth 1 -type d -empty -delete >"$cleanup_log" 2>&1' in script
+
+    def test_generate_script_content_iterates_into_remote_staging_dirs(self):
+        """Test shell script content for local source to remote destination."""
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': '/source/',
+            'source_port': '',
+            'destination': 'user@host:/dest/',
+            'destination_port': '2222',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
+        }
+
+        original_runtime_config = dict(gcf.config._runtime_config)
+        gcf.config._runtime_config['flock_paths'] = {'server1': '/opt/bin/flock'}
+        try:
+            script = gcf.generate_script_content(transfer)
+        finally:
+            gcf.config._runtime_config = original_runtime_config
+
+        assert 'find "/source" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r source_dir; do' in script
+        assert 'ssh -p 2222 user@host sh -c \'mkdir -p "$1"\' sh "/dest/.staging/$dir_name"' in script
+        assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' "$source_dir/" "user@host:/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
+        assert 'ssh -p 2222 user@host sh -c \'if [ -d "$2/$3" ]; then ' in script
+
+    def test_generate_script_content_iterates_remote_source_dirs(self):
+        """Test shell script content for remote source to local destination."""
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': 'user@remote:/source/',
+            'source_port': '2200',
+            'destination': '/dest/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
+        }
+
+        original_runtime_config = dict(gcf.config._runtime_config)
+        gcf.config._runtime_config['flock_paths'] = {'server1': '/opt/bin/flock'}
+        try:
+            script = gcf.generate_script_content(transfer)
+        finally:
+            gcf.config._runtime_config = original_runtime_config
+
+        assert 'ssh -p 2200 user@remote sh -c \'find "$1" -mindepth 1 -maxdepth 1 -type d -print\' sh "/source" | while IFS= read -r source_dir; do' in script
+        assert 'rsync -av --remove-source-files -e \'ssh -p 2200\' "user@remote:$source_dir/" "/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
 
 
 class TestGenerateCronHeader:
@@ -514,6 +651,10 @@ class TestEnvironmentVariableExpansion:
         # $HOME should be preserved for cron to expand at runtime
         assert '$HOME' in cmd
 
+    def test_shell_path_preserves_home_expansion(self):
+        """Test that shell path quoting does not suppress $HOME expansion."""
+        assert gcf.shell_path('$HOME/source dir') == '"$HOME/source dir"'
+
 
 class TestEdgeCases:
     """Test edge cases and error conditions"""
@@ -620,6 +761,13 @@ class TestOverlappingSourceDetection:
         assert gcf.normalize_source_path('/path/to/dir/') == '/path/to/dir'
         assert gcf.normalize_source_path('/path/to/dir') == '/path/to/dir'
         assert gcf.normalize_source_path('/path/to/dir* ') == '/path/to/dir'
+
+    def test_detects_directory_iteration_sources(self):
+        """Test wildcard source detection for per-directory transfer scripts."""
+        assert gcf.source_uses_directory_iteration('/path/to/input/*') is True
+        assert gcf.source_uses_directory_iteration('/path/to/input*') is True
+        assert gcf.source_uses_directory_iteration('/path/to/input/') is True
+        assert gcf.source_uses_directory_iteration('/path/to/file.txt') is False
 
 
 if __name__ == '__main__':
