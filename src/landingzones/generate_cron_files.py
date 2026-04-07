@@ -480,17 +480,41 @@ promote_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.promote.XXXXXX")"
 cleanup() {{
     rm -f "$run_log" "$cleanup_log" "$promote_log"
 }}
-trap cleanup EXIT HUP INT TERM
+debug_enabled() {{
+    [ -t 1 ] || [ "${{LZ_DEBUG_CLI:-0}}" = "1" ]
+}}
 
 log_status() {{
     printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" >> "$mini_log_file"
 }}
 
 debug() {{
-    if [ -t 1 ] || [ "${{LZ_DEBUG_CLI:-0}}" = "1" ]; then
+    if debug_enabled; then
         printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" >&2
     fi
 }}
+
+dump_debug_log() {{
+    label="$1"
+    path="$2"
+    if debug_enabled && [ -s "$path" ]; then
+        debug "$label follows"
+        cat "$path" >&2
+    fi
+}}
+
+on_exit() {{
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        debug "script failed with exit code $status"
+        dump_debug_log "run log" "$run_log"
+        dump_debug_log "promote log" "$promote_log"
+        dump_debug_log "cleanup log" "$cleanup_log"
+    fi
+    cleanup
+    exit "$status"
+}}
+trap on_exit EXIT HUP INT TERM
 
 mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")"
 debug "using lock file $flock_file"
@@ -587,22 +611,18 @@ def generate_iterative_script_content(transfer):
         rsync_source = '"$source_dir/"'
 
     if destination_remote:
-        mkdir_cmd = (
-            '{0} sh -c \'mkdir -p "$1"\' sh "{1}/.staging/$dir_name"'
-        ).format(
+        mkdir_cmd = '{0} "mkdir -p \\"{1}/.staging/$dir_name\\""'.format(
             build_ssh_command(destination_remote, destination_port),
             destination_root,
         )
         promote_cmd = (
-            '{0} sh -c \''
-            'if [ -d "$2/$3" ]; then '
-            'find "$1" -mindepth 1 -maxdepth 1 -exec mv {{}} "$2/$3"/ \\; && '
-            'rmdir "$1" 2>/dev/null || true; '
+            '{0} "if [ -d \\"{1}/$dir_name\\" ]; then '
+            'find \\"{1}/.staging/$dir_name\\" -mindepth 1 -maxdepth 1 -exec mv {{}} \\"{1}/$dir_name/\\" \\; && '
+            'rmdir \\"{1}/.staging/$dir_name\\" 2>/dev/null || true; '
             'else '
-            'mv "$1" "$2/$3"; '
+            'mv \\"{1}/.staging/$dir_name\\" \\"{1}/$dir_name\\"; '
             'fi; '
-            'rmdir "$2/.staging" 2>/dev/null || true'
-            '\' sh "{1}/.staging/$dir_name" "{1}" "$dir_name"'
+            'rmdir \\"{1}/.staging\\" 2>/dev/null || true"'
         ).format(
             build_ssh_command(destination_remote, destination_port),
             destination_root,
@@ -638,17 +658,41 @@ promote_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.promote.XXXXXX")"
 cleanup() {{
     rm -f "$run_log" "$cleanup_log" "$promote_log"
 }}
-trap cleanup EXIT HUP INT TERM
+debug_enabled() {{
+    [ -t 1 ] || [ "${{LZ_DEBUG_CLI:-0}}" = "1" ]
+}}
 
 log_status() {{
     printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" >> "$mini_log_file"
 }}
 
 debug() {{
-    if [ -t 1 ] || [ "${{LZ_DEBUG_CLI:-0}}" = "1" ]; then
+    if debug_enabled; then
         printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" >&2
     fi
 }}
+
+dump_debug_log() {{
+    label="$1"
+    path="$2"
+    if debug_enabled && [ -s "$path" ]; then
+        debug "$label follows"
+        cat "$path" >&2
+    fi
+}}
+
+on_exit() {{
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        debug "script failed with exit code $status"
+        dump_debug_log "run log" "$run_log"
+        dump_debug_log "promote log" "$promote_log"
+        dump_debug_log "cleanup log" "$cleanup_log"
+    fi
+    cleanup
+    exit "$status"
+}}
+trap on_exit EXIT HUP INT TERM
 
 mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")"
 debug "using lock file $flock_file"

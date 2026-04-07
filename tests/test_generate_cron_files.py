@@ -443,6 +443,10 @@ class TestGenerateRsyncCommand:
         assert 'mini_log_file="/tmp/test.log.mini"' in script
         assert "printf '%s %s\\n'" in script
         assert 'mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")"' in script
+        assert 'dump_debug_log "run log" "$run_log"' in script
+        assert 'dump_debug_log "promote log" "$promote_log"' in script
+        assert 'dump_debug_log "cleanup log" "$cleanup_log"' in script
+        assert 'debug "script failed with exit code $status"' in script
         assert 'debug "$dir_name initiated"' in script
         assert 'debug "$dir_name completed"' in script
         assert 'log_status "$dir_name initiated"' in script
@@ -505,9 +509,9 @@ class TestGenerateRsyncCommand:
             gcf.config._runtime_config = original_runtime_config
 
         assert 'find "/source" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r source_dir; do' in script
-        assert 'ssh -p 2222 user@host sh -c \'mkdir -p "$1"\' sh "/dest/.staging/$dir_name"' in script
+        assert 'ssh -p 2222 user@host "mkdir -p \\"/dest/.staging/$dir_name\\""' in script
         assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' "$source_dir/" "user@host:/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
-        assert 'ssh -p 2222 user@host sh -c \'if [ -d "$2/$3" ]; then ' in script
+        assert 'ssh -p 2222 user@host "if [ -d \\"/dest/$dir_name\\" ]; then ' in script
 
     def test_generate_script_content_iterates_remote_source_dirs(self):
         """Test shell script content for remote source to local destination."""
