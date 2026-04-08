@@ -555,8 +555,18 @@ fi
 log_status "{8} initiated"
 debug "{8} initiated"
 {9}
-{10} >"$run_log" 2>&1
+if {10} >"$run_log" 2>&1; then
+    rsync_status=0
+else
+    rsync_status=$?
+fi
 cat "$run_log" >> "$log_file"
+
+if [ "$rsync_status" -ne 0 ]; then
+    printf '%s\\n' "rsync failed with exit code $rsync_status" >> "$log_file"
+    cat "$run_log" > "$latest_log_file"
+    exit "$rsync_status"
+fi
 
 {11} >"$promote_log" 2>&1
 if [ -s "$promote_log" ]; then
