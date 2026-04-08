@@ -409,7 +409,7 @@ class TestGenerateRsyncCommand:
         assert cmd == '*/15 * * * * /bin/sh /tmp/scripts/sample.sh'
 
     def test_generate_script_content(self):
-        """Test shell script content generation."""
+        """Test shell script content generation for the normal path."""
         transfer = {
             'identifiers': 'sample',
             'system': 'server1',
@@ -438,11 +438,7 @@ class TestGenerateRsyncCommand:
         assert 'exec 9>"$flock_file"' in script
         assert '/opt/bin/flock -n 9' in script
         assert 'flock_file="/tmp/test.lock"' in script
-        assert 'if rsync -av --remove-source-files /source/ /dest/ >"$run_log" 2>&1; then' in script
-        assert 'rsync_status=$?' in script
         assert 'cat "$run_log" >> "$log_file"' in script
-        assert 'printf \'%s\n\' "rsync failed with exit code $rsync_status" >> "$log_file"' in script
-        assert 'exit "$rsync_status"' in script
         assert 'mini_log_file="/tmp/test.log.mini"' in script
         assert "printf '%s %s\\n'" in script
         assert 'mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")"' in script
@@ -458,6 +454,37 @@ class TestGenerateRsyncCommand:
         assert 'source directory missing: /source' in script
         assert 'latest_log_file="/tmp/test.log.latest"' in script
         assert 'cat "$run_log" > "$latest_log_file"' in script
+
+    def test_generate_script_content_handles_rsync_failure(self):
+        """Test shell script content generation for the rsync failure path."""
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': '/source/',
+            'source_port': '',
+            'destination': '/dest/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
+        }
+
+        original_runtime_config = dict(gcf.config._runtime_config)
+        gcf.config._runtime_config['flock_paths'] = {'server1': '/opt/bin/flock'}
+        try:
+            script = gcf.generate_script_content(transfer)
+        finally:
+            gcf.config._runtime_config = original_runtime_config
+
+        assert 'if rsync -av --remove-source-files /source/ /dest/.staging/sample/ >"$run_log" 2>&1; then' in script
+        assert 'rsync_status=0' in script
+        assert 'rsync_status=$?' in script
+        assert 'if [ "$rsync_status" -ne 0 ]; then' in script
+        assert 'printf \'%s\\n\' "rsync failed with exit code $rsync_status" >> "$log_file"' in script
+        assert 'cat "$run_log" > "$latest_log_file"' in script
+        assert 'exit "$rsync_status"' in script
 
     def test_generate_script_content_iterates_wildcard_source_dirs(self):
         """Test shell script content for wildcard local sources."""
