@@ -433,10 +433,8 @@ class TestGenerateRsyncCommand:
 
         assert script.startswith('#!/bin/sh\n')
         assert 'set -eu' in script
-        assert 'find "/source" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r source_dir; do' in script
-        assert 'mkdir -p "/dest/.staging/$dir_name"' in script
-        assert 'rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
-        assert 'mv "/dest/.staging/$dir_name" "/dest/$dir_name"' in script
+        assert 'find "/source" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r source_dir; do' not in script
+        assert 'rsync -av --remove-source-files /source/ /dest/.staging/sample/' in script
         assert 'exec 9>"$flock_file"' in script
         assert '/opt/bin/flock -n 9' in script
         assert 'flock_file="/tmp/test.lock"' in script
@@ -447,10 +445,10 @@ class TestGenerateRsyncCommand:
         assert 'dump_debug_log "promote log" "$promote_log"' in script
         assert 'dump_debug_log "cleanup log" "$cleanup_log"' in script
         assert 'debug "script failed with exit code $status"' in script
-        assert 'debug "$dir_name initiated"' in script
-        assert 'debug "$dir_name completed"' in script
-        assert 'log_status "$dir_name initiated"' in script
-        assert 'log_status "$dir_name completed"' in script
+        assert 'debug "sample initiated"' in script
+        assert 'debug "sample completed"' in script
+        assert 'log_status "sample initiated"' in script
+        assert 'log_status "sample completed"' in script
         assert 'latest_log_file="/tmp/test.log.latest"' in script
         assert 'cat "$run_log" > "$latest_log_file"' in script
 
@@ -477,7 +475,7 @@ class TestGenerateRsyncCommand:
         finally:
             gcf.config._runtime_config = original_runtime_config
 
-        assert 'find "input" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r source_dir; do' in script
+        assert 'find "input" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | while IFS= read -r source_dir; do' in script
         assert 'mkdir -p "output/.staging/$dir_name"' in script
         assert 'rsync -av --remove-source-files "$source_dir/" "output/.staging/$dir_name/" >>"$run_log" 2>&1' in script
         assert 'mv "output/.staging/$dir_name" "output/$dir_name"' in script
@@ -490,7 +488,7 @@ class TestGenerateRsyncCommand:
         transfer = {
             'identifiers': 'sample',
             'system': 'server1',
-            'source': '/source/',
+            'source': '/source/*',
             'source_port': '',
             'destination': 'user@host:/dest/',
             'destination_port': '2222',
@@ -508,7 +506,7 @@ class TestGenerateRsyncCommand:
         finally:
             gcf.config._runtime_config = original_runtime_config
 
-        assert 'find "/source" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r source_dir; do' in script
+        assert 'find "/source" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | while IFS= read -r source_dir; do' in script
         assert 'ssh -p 2222 user@host "mkdir -p \\"/dest/.staging/$dir_name\\""' in script
         assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' "$source_dir/" "user@host:/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
         assert 'ssh -p 2222 user@host "if [ -d \\"/dest/$dir_name\\" ]; then ' in script
@@ -518,7 +516,7 @@ class TestGenerateRsyncCommand:
         transfer = {
             'identifiers': 'sample',
             'system': 'server1',
-            'source': 'user@remote:/source/',
+            'source': 'user@remote:/source/*',
             'source_port': '2200',
             'destination': '/dest/',
             'destination_port': '',
@@ -536,8 +534,33 @@ class TestGenerateRsyncCommand:
         finally:
             gcf.config._runtime_config = original_runtime_config
 
-        assert 'ssh -p 2200 user@remote sh -c \'find "$1" -mindepth 1 -maxdepth 1 -type d -print\' sh "/source" | while IFS= read -r source_dir; do' in script
+        assert "ssh -p 2200 user@remote 'find \"/source\" -mindepth 1 -maxdepth 1 -type d ! -name \".*\" -print' | while IFS= read -r source_dir; do" in script
         assert 'rsync -av --remove-source-files -e \'ssh -p 2200\' "user@remote:$source_dir/" "/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
+
+    def test_generate_script_content_skips_hidden_top_level_dirs(self):
+        """Test iterative scripts exclude hidden directories such as .ssh."""
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': '/source/*',
+            'source_port': '',
+            'destination': '/dest/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
+        }
+
+        original_runtime_config = dict(gcf.config._runtime_config)
+        gcf.config._runtime_config['flock_paths'] = {'server1': '/opt/bin/flock'}
+        try:
+            script = gcf.generate_script_content(transfer)
+        finally:
+            gcf.config._runtime_config = original_runtime_config
+
+        assert '! -name ".*"' in script
 
 
 class TestGenerateCronHeader:
@@ -770,8 +793,34 @@ class TestOverlappingSourceDetection:
         """Test wildcard source detection for per-directory transfer scripts."""
         assert gcf.source_uses_directory_iteration('/path/to/input/*') is True
         assert gcf.source_uses_directory_iteration('/path/to/input*') is True
-        assert gcf.source_uses_directory_iteration('/path/to/input/') is True
+        assert gcf.source_uses_directory_iteration('/path/to/input/') is False
         assert gcf.source_uses_directory_iteration('/path/to/file.txt') is False
+
+    def test_generate_script_content_keeps_plain_directory_sources_as_single_rsync(self):
+        """Test shell script content for a normal directory source."""
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': '/source/',
+            'source_port': '',
+            'destination': '/dest/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': ''
+        }
+
+        original_runtime_config = dict(gcf.config._runtime_config)
+        gcf.config._runtime_config['flock_paths'] = {'server1': '/opt/bin/flock'}
+        try:
+            script = gcf.generate_script_content(transfer)
+        finally:
+            gcf.config._runtime_config = original_runtime_config
+
+        assert 'find "/source" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r source_dir; do' not in script
+        assert 'rsync -av --remove-source-files /source/ /dest/.staging/sample/' in script
 
 
 if __name__ == '__main__':

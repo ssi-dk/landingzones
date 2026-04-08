@@ -116,7 +116,7 @@ def source_uses_directory_iteration(source):
     """Return True when the source should be processed one top-level dir at a time."""
     _, source_path = split_remote_path(source)
     value = str(source_path).strip() if source_path is not None else ''
-    return value.endswith('/') or value.endswith('/*') or value.endswith('*')
+    return value.endswith('/*') or value.endswith('*')
 
 
 def normalize_io_nice(io_nice):
@@ -175,6 +175,12 @@ def build_ssh_command(remote, port=''):
     if port_value.isdigit():
         command = "{0} -p {1}".format(command, port_value)
     return "{0} {1}".format(command, shell_quote(remote))
+
+
+def build_remote_shell_command(command, remote, port=''):
+    """Run a shell command on a remote host through ssh."""
+    ssh_cmd = build_ssh_command(remote, port)
+    return "{0} {1}".format(ssh_cmd, shell_quote(command))
 
 
 def build_directory_command(command, path, remote=None, port=''):
@@ -595,17 +601,20 @@ def generate_iterative_script_content(transfer):
         rsync_cmd = "{0} {1}".format(io_nice_cmd, rsync_cmd)
 
     if source_remote:
+        remote_find_cmd = (
+            'find {0} -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print'.format(
+                shell_path(source_root),
+            )
+        )
         source_loop = (
-            '{0} sh -c \'find "$1" -mindepth 1 -maxdepth 1 -type d -print\' '
-            'sh {1} | while IFS= read -r source_dir; do'
+            '{0} | while IFS= read -r source_dir; do'
         ).format(
-            build_ssh_command(source_remote, source_port),
-            shell_path(source_root),
+            build_remote_shell_command(remote_find_cmd, source_remote, source_port),
         )
         rsync_source = '"{0}:$source_dir/"'.format(source_remote)
     else:
         source_loop = (
-            'find {0} -mindepth 1 -maxdepth 1 -type d -print | '
+            'find {0} -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | '
             'while IFS= read -r source_dir; do'
         ).format(shell_path(source_root))
         rsync_source = '"$source_dir/"'
