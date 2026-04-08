@@ -449,6 +449,8 @@ class TestGenerateRsyncCommand:
         assert 'debug "sample completed"' in script
         assert 'log_status "sample initiated"' in script
         assert 'log_status "sample completed"' in script
+        assert 'if ! [ -d "/source" ]; then' in script
+        assert 'source directory missing: /source' in script
         assert 'latest_log_file="/tmp/test.log.latest"' in script
         assert 'cat "$run_log" > "$latest_log_file"' in script
 
@@ -482,6 +484,8 @@ class TestGenerateRsyncCommand:
         assert 'log_status "$dir_name initiated"' in script
         assert 'log_status "$dir_name completed"' in script
         assert 'find "input" -mindepth 1 -type d -empty -delete >"$cleanup_log" 2>&1' in script
+        assert 'if ! [ -d "input" ]; then' in script
+        assert 'source directory missing: input' in script
 
     def test_generate_script_content_iterates_into_remote_staging_dirs(self):
         """Test shell script content for local source to remote destination."""
@@ -510,6 +514,8 @@ class TestGenerateRsyncCommand:
         assert 'ssh -p 2222 user@host "mkdir -p \\"/dest/.staging/$dir_name\\""' in script
         assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' "$source_dir/" "user@host:/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
         assert 'ssh -p 2222 user@host "if [ -d \\"/dest/$dir_name\\" ]; then ' in script
+        assert 'if ! [ -d "/source" ]; then' in script
+        assert 'source directory missing: /source' in script
 
     def test_generate_script_content_iterates_remote_source_dirs(self):
         """Test shell script content for remote source to local destination."""
@@ -536,6 +542,8 @@ class TestGenerateRsyncCommand:
 
         assert "ssh -p 2200 user@remote 'find \"/source\" -mindepth 1 -maxdepth 1 -type d ! -name \".*\" -print' | while IFS= read -r source_dir; do" in script
         assert 'rsync -av --remove-source-files -e \'ssh -p 2200\' "user@remote:$source_dir/" "/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
+        assert 'if ! ssh -p 2200 user@remote \'[ -d "/source" ]\'; then' in script
+        assert 'source directory missing: /source' in script
 
     def test_generate_script_content_skips_hidden_top_level_dirs(self):
         """Test iterative scripts exclude hidden directories such as .ssh."""
@@ -820,6 +828,8 @@ class TestOverlappingSourceDetection:
             gcf.config._runtime_config = original_runtime_config
 
         assert 'find "/source" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r source_dir; do' not in script
+        assert 'if ! [ -d "/source" ]; then' in script
+        assert 'source directory missing: /source' in script
         assert 'rsync -av --remove-source-files /source/ /dest/.staging/sample/' in script
 
 

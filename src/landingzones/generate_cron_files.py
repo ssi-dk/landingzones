@@ -183,6 +183,16 @@ def build_remote_shell_command(command, remote, port=''):
     return "{0} {1}".format(ssh_cmd, shell_quote(command))
 
 
+def build_source_exists_command(source, port=''):
+    """Build a shell command that checks whether the source directory exists."""
+    remote, source_path = split_remote_path(source)
+    source_root = normalize_source_path(source_path if remote else source)
+    test_cmd = '[ -d {0} ]'.format(shell_path(source_root))
+    if remote:
+        return build_remote_shell_command(test_cmd, remote, port), source_root
+    return test_cmd, source_root
+
+
 def build_directory_command(command, path, remote=None, port=''):
     """Build a local or remote directory-management shell command."""
     quoted_path = shell_quote(path)
@@ -472,6 +482,10 @@ def generate_script_content(transfer):
     if source_uses_directory_iteration(transfer['source']):
         return generate_iterative_script_content(transfer)
     commands = build_transfer_commands(transfer)
+    source_exists_cmd, source_root = build_source_exists_command(
+        transfer['source'],
+        transfer.get('source_port', ''),
+    )
     return """#!/bin/sh
 set -eu
 
@@ -531,20 +545,27 @@ if ! {5} -n 9; then
     exit 0
 fi
 
-log_status "{6} initiated"
-debug "{6} initiated"
-{7}
-{8} >"$run_log" 2>&1
+if ! {6}; then
+    log_status "{7}"
+    printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "{7}" >> "$log_file"
+    debug "{7}"
+    exit 0
+fi
+
+log_status "{8} initiated"
+debug "{8} initiated"
+{9}
+{10} >"$run_log" 2>&1
 cat "$run_log" >> "$log_file"
 
-{9} >"$promote_log" 2>&1
+{11} >"$promote_log" 2>&1
 if [ -s "$promote_log" ]; then
     cat "$promote_log" >> "$log_file"
 fi
-log_status "{6} completed"
-debug "{6} completed"
+log_status "{8} completed"
+debug "{8} completed"
 
-{10} >"$cleanup_log" 2>&1
+{12} >"$cleanup_log" 2>&1
 if [ -s "$cleanup_log" ]; then
     cat "$cleanup_log" >> "$log_file"
 fi
@@ -565,6 +586,8 @@ fi
         commands['flock_file'],
         sanitize_identifier(transfer.get('identifiers', 'transfer')),
         commands['flock_command'],
+        source_exists_cmd,
+        'source directory missing: {0}'.format(source_root),
         sanitize_identifier(transfer.get('identifiers', 'transfer')),
         commands['prepare_cmd'],
         commands['rsync_cmd'],
@@ -581,6 +604,10 @@ def generate_iterative_script_content(transfer):
     destination_remote, destination_path = split_remote_path(destination)
     commands = build_transfer_commands(transfer)
     source_root = normalize_source_path(source_path if source_remote else source)
+    source_exists_cmd, _ = build_source_exists_command(
+        transfer['source'],
+        transfer.get('source_port', ''),
+    )
     destination_root = destination_path.rstrip('/') or destination_path
 
     base_options = "-av --remove-source-files"
@@ -712,16 +739,23 @@ if ! {5} -n 9; then
     exit 0
 fi
 
+if ! {6}; then
+    log_status "{7}"
+    printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "{7}" >> "$log_file"
+    debug "{7}"
+    exit 0
+fi
+
 : >"$run_log"
 : >"$promote_log"
-{6}
+{8}
     [ -n "$source_dir" ] || continue
     dir_name=$(basename "$source_dir")
     log_status "$dir_name initiated"
     debug "$dir_name initiated"
-    {7} >>"$promote_log" 2>&1
-    {8} {9} {10} >>"$run_log" 2>&1
-    {11} >>"$promote_log" 2>&1
+    {9} >>"$promote_log" 2>&1
+    {10} {11} {12} >>"$run_log" 2>&1
+    {13} >>"$promote_log" 2>&1
     log_status "$dir_name completed"
     debug "$dir_name completed"
 done
@@ -732,7 +766,7 @@ if [ -s "$promote_log" ]; then
     cat "$promote_log" >> "$log_file"
 fi
 
-{12} >"$cleanup_log" 2>&1
+{14} >"$cleanup_log" 2>&1
 if [ -s "$cleanup_log" ]; then
     cat "$cleanup_log" >> "$log_file"
 fi
@@ -753,6 +787,8 @@ fi
         commands['flock_file'],
         sanitize_identifier(transfer.get('identifiers', 'transfer')),
         commands['flock_command'],
+        source_exists_cmd,
+        'source directory missing: {0}'.format(source_root),
         source_loop,
         mkdir_cmd,
         rsync_cmd,
