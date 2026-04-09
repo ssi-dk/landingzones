@@ -173,7 +173,7 @@ server1_main\tserver1\tuser1\t/src/\tuser@host/dest/\t\t\t\t/tmp/log.txt\t/tmp/l
     def test_parse_accepts_host_alias_remote_endpoint(self, tmp_path):
         """SSH aliases without an explicit user should still parse."""
         tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
-server1_main\tserver1\tuser1\t/src/\tcalck:$HOME/Landing_Zone/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+server1_main\tserver1\tuser1\t/src/\tremotealias:$HOME/Landing_Zone/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -181,7 +181,7 @@ server1_main\tserver1\tuser1\t/src/\tcalck:$HOME/Landing_Zone/\t\t\t\t/tmp/log.t
         df = gcf.parse_transfers_file(str(test_file))
 
         assert len(df) == 1
-        assert df.iloc[0]['destination'] == 'calck:$HOME/Landing_Zone/'
+        assert df.iloc[0]['destination'] == 'remotealias:$HOME/Landing_Zone/'
 
     def test_parse_records_shared_file_pair_warnings(self, tmp_path):
         """Duplicate log/flock pairs should be surfaced as warnings."""
@@ -277,7 +277,7 @@ class TestGenerateRsyncCommand:
         transfer = {
             'system': 'server1',
             'identifiers': 'remote_home_cleanup',
-            'source': 'calck:$HOME/Landing_Zone/',
+            'source': 'remotealias:$HOME/Landing_Zone/',
             'source_port': '',
             'destination': './dest/',
             'destination_port': '',
@@ -290,7 +290,7 @@ class TestGenerateRsyncCommand:
 
         script = gcf.generate_script_content(transfer)
 
-        assert 'ssh calck' in script
+        assert 'ssh remotealias' in script
         assert 'find "$HOME/Landing_Zone/" -mindepth 1 -type d -empty -delete' in script
 
     def test_remote_destination_preserves_home_expansion(self):
@@ -300,7 +300,7 @@ class TestGenerateRsyncCommand:
             'identifiers': 'remote_home_destination',
             'source': './source/',
             'source_port': '',
-            'destination': 'calck:$HOME/Landing_Zone/',
+            'destination': 'remotealias:$HOME/Landing_Zone/',
             'destination_port': '',
             'rsync_options': '',
             'io_nice': '',
@@ -311,9 +311,30 @@ class TestGenerateRsyncCommand:
 
         script = gcf.generate_script_content(transfer)
 
-        assert 'resolved_destination_root="$(ssh calck \'printf %s "$HOME/Landing_Zone"\')"' in script
-        assert 'ssh calck "mkdir -p \\"${resolved_destination_root}/.staging/$dir_name\\""' in script
-        assert 'rsync -av --remove-source-files "$source_dir/" "calck:${resolved_destination_root}/.staging/$dir_name/"' in script
+        assert 'resolved_destination_root="$(ssh remotealias \'printf %s "$HOME/Landing_Zone"\')"' in script
+        assert 'ssh remotealias "mkdir -p \\"${resolved_destination_root}/.staging/$dir_name\\"" </dev/null' in script
+        assert 'rsync -av --remove-source-files "$source_dir/" "remotealias:${resolved_destination_root}/.staging/$dir_name/" </dev/null' in script
+
+    def test_loop_commands_detach_stdin_for_remote_transfers(self):
+        """Remote loop bodies should not consume the remaining find output."""
+        transfer = {
+            'system': 'server1',
+            'identifiers': 'remote_stdin_guard',
+            'source': './source/',
+            'source_port': '',
+            'destination': 'remotealias:$HOME/Landing_Zone/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': '* * * * *'
+        }
+
+        script = gcf.generate_script_content(transfer)
+
+        assert ' </dev/null >>"$promote_log" 2>&1' in script
+        assert ' </dev/null >>"$run_log" 2>&1' in script
 
     def test_remove_stale_generated_scripts_keeps_only_expected_shell_files(self, tmp_path):
         """Old generated scripts should be removed on regeneration."""
@@ -542,7 +563,7 @@ class TestGenerateRsyncCommand:
         assert script.startswith('#!/bin/sh\n')
         assert 'set -eu' in script
         assert 'find "/source" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | while IFS= read -r source_dir; do' in script
-        assert 'rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
+        assert 'rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'exec 9>"$flock_file"' in script
         assert '/opt/bin/flock -n 9' in script
         assert 'flock_file="/tmp/test.lock"' in script
@@ -587,7 +608,7 @@ class TestGenerateRsyncCommand:
             gcf.config._runtime_config = original_runtime_config
 
         assert ': >"$run_log"' in script
-        assert 'rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
+        assert 'rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'dump_debug_log "run log" "$run_log"' in script
         assert 'debug "script failed with exit code $status"' in script
 
@@ -616,7 +637,7 @@ class TestGenerateRsyncCommand:
 
         assert 'find "input" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | while IFS= read -r source_dir; do' in script
         assert 'mkdir -p "output/.staging/$dir_name"' in script
-        assert 'rsync -av --remove-source-files "$source_dir/" "output/.staging/$dir_name/" >>"$run_log" 2>&1' in script
+        assert 'rsync -av --remove-source-files "$source_dir/" "output/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'mv "output/.staging/$dir_name" "output/$dir_name"' in script
         assert 'find "output/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {} "output/$dir_name"/ \\;' in script
         assert 'log_status "$dir_name initiated"' in script
@@ -650,7 +671,7 @@ class TestGenerateRsyncCommand:
 
         assert 'find "/source" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | while IFS= read -r source_dir; do' in script
         assert 'ssh -p 2222 user@host "mkdir -p \\"/dest/.staging/$dir_name\\""' in script
-        assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' "$source_dir/" "user@host:/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
+        assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' "$source_dir/" "user@host:/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'ssh -p 2222 user@host "if [ -d \\"/dest/$dir_name\\" ]; then ' in script
         assert 'find \\"/dest/.staging/$dir_name\\" -mindepth 1 -maxdepth 1 ! -name \\".staging\\" -exec mv {} \\"/dest/$dir_name/\\" \\;' in script
         assert 'if ! [ -d "/source" ]; then' in script
@@ -680,7 +701,7 @@ class TestGenerateRsyncCommand:
             gcf.config._runtime_config = original_runtime_config
 
         assert "ssh -p 2200 user@remote 'find \"/source\" -mindepth 1 -maxdepth 1 -type d ! -name \".*\" -print' | while IFS= read -r source_dir; do" in script
-        assert 'rsync -av --remove-source-files -e \'ssh -p 2200\' "user@remote:$source_dir/" "/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
+        assert 'rsync -av --remove-source-files -e \'ssh -p 2200\' "user@remote:$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'if ! ssh -p 2200 user@remote \'[ -d "/source" ]\'; then' in script
         assert 'source directory missing: /source' in script
 
@@ -1012,7 +1033,7 @@ class TestOverlappingSourceDetection:
         assert 'find "/source" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | while IFS= read -r source_dir; do' in script
         assert 'if ! [ -d "/source" ]; then' in script
         assert 'source directory missing: /source' in script
-        assert 'rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" >>"$run_log" 2>&1' in script
+        assert 'rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
 
 
 if __name__ == '__main__':

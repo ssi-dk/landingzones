@@ -49,10 +49,10 @@ class TestParseRemoteDestination:
 
     def test_host_alias_without_user(self):
         """Test parsing a remote ssh alias without an explicit user."""
-        user, host, path = cdr.parse_remote_destination('calck:$HOME/Landing_Zone/')
+        user, host, path = cdr.parse_remote_destination('remotealias:$HOME/Landing_Zone/')
 
         assert user is None
-        assert host == 'calck'
+        assert host == 'remotealias'
         assert path == '$HOME/Landing_Zone/'
 
 
@@ -360,25 +360,32 @@ class TestIntegration:
         assert dest_ok is True
 
 
-class TestLocalScriptTests:
-    """End-to-end coverage for the real-transfer run-tests mode."""
+class TestTestWithData:
+    """End-to-end coverage for the real-transfer test-with-data mode."""
 
-    def _write_run_test_fixture(self, tmp_path):
+    def _write_test_with_data_fixture(self, tmp_path):
         config_file = tmp_path / 'config.yaml'
         transfers_file = tmp_path / 'transfers.tsv'
         source_root = tmp_path / 'source_root'
         transit_root = tmp_path / 'transit_root'
         final_root = tmp_path / 'final_root'
         rit_managed = tmp_path / 'rit_managed'
+        toy_data_root = tmp_path / 'tests' / 'toy_data' / 'source_root'
 
         source_root.mkdir()
         transit_root.mkdir()
         final_root.mkdir()
         rit_managed.mkdir()
+        toy_data_root.mkdir(parents=True)
+        for directory_name in ('flow_one', 'flow_two'):
+            run_dir = toy_data_root / directory_name
+            run_dir.mkdir()
+            (run_dir / 'payload.txt').write_text(directory_name)
 
         config_file.write_text(
             "\n".join([
                 "transfers_file: {0}".format(transfers_file),
+                "test_data: {0}".format(tmp_path / 'tests' / 'toy_data'),
                 "rit_managed_locations:",
                 "  testbox: {0}".format(rit_managed),
                 "flock_paths:",
@@ -403,51 +410,76 @@ class TestLocalScriptTests:
                 "",
             ])
         )
-        return config_file, transfers_file, source_root, transit_root, final_root
+        return (
+            config_file,
+            transfers_file,
+            source_root,
+            transit_root,
+            final_root,
+            rit_managed,
+        )
 
     @pytest.mark.skipif(
         shutil.which('rsync') is None,
         reason='rsync is required for local script-test execution',
     )
-    def test_run_local_script_tests_executes_chained_outputs(
+    def test_run_test_with_data_executes_chained_outputs(
         self, tmp_path, monkeypatch
     ):
         """Run the generated scripts against a real local transfer chain."""
-        config_file, transfers_file, source_root, transit_root, final_root = (
-            self._write_run_test_fixture(tmp_path)
+        (
+            config_file,
+            transfers_file,
+            source_root,
+            transit_root,
+            final_root,
+            rit_managed,
+        ) = (
+            self._write_test_with_data_fixture(tmp_path)
         )
-        test_root = tmp_path / '20260409T120000_run_tests_keep'
-        monkeypatch.setattr(cdr, 'create_test_root', lambda: str(test_root))
         monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
         monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+        monkeypatch.setattr('builtins.input', lambda: 'n')
 
-        result = cdr.run_local_script_tests(
+        result = cdr.run_test_with_data(
             config_file=str(config_file),
             transfers_file=str(transfers_file),
-            keep_test_env=True,
         )
 
         assert result is True
         assert cdr.list_visible_entries(str(source_root)) == []
         assert cdr.list_visible_entries(str(transit_root)) == []
-        assert cdr.list_visible_entries(str(final_root)) == []
-        assert test_root.exists()
+        assert cdr.list_visible_directories(str(final_root)) == ['flow_one', 'flow_two']
+        assert (final_root / 'flow_one' / 'payload.txt').read_text() == 'flow_one'
+        assert (final_root / 'flow_two' / 'payload.txt').read_text() == 'flow_two'
+        assert (rit_managed / 'scripts' / 'step1.sh').exists()
+        assert (rit_managed / 'scripts' / 'step2.sh').exists()
+        assert (rit_managed / 'log' / 'step1.log').exists()
+        assert (rit_managed / 'flock' / 'step1.lock').exists()
 
     @pytest.mark.skipif(
         shutil.which('rsync') is None,
         reason='rsync is required for local script-test execution',
     )
-    def test_run_local_script_tests_cleans_up_workspace(self, tmp_path, monkeypatch):
-        """Run-tests should remove its temporary workspace by default."""
-        config_file, transfers_file, source_root, transit_root, final_root = (
-            self._write_run_test_fixture(tmp_path)
+    def test_run_test_with_data_cleans_up_when_user_confirms(
+        self, tmp_path, monkeypatch
+    ):
+        """The post-run prompt should allow cleanup back to the initial state."""
+        (
+            config_file,
+            transfers_file,
+            source_root,
+            transit_root,
+            final_root,
+            rit_managed,
+        ) = (
+            self._write_test_with_data_fixture(tmp_path)
         )
-        test_root = tmp_path / '20260409T120000_run_tests_cleanup'
-        monkeypatch.setattr(cdr, 'create_test_root', lambda: str(test_root))
         monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
         monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+        monkeypatch.setattr('builtins.input', lambda: 'y')
 
-        result = cdr.run_local_script_tests(
+        result = cdr.run_test_with_data(
             config_file=str(config_file),
             transfers_file=str(transfers_file),
         )
@@ -456,7 +488,8 @@ class TestLocalScriptTests:
         assert cdr.list_visible_entries(str(source_root)) == []
         assert cdr.list_visible_entries(str(transit_root)) == []
         assert cdr.list_visible_entries(str(final_root)) == []
-        assert not test_root.exists()
+        assert not (rit_managed / 'log' / 'step1.log').exists()
+        assert not (rit_managed / 'flock' / 'step1.lock').exists()
 
     def test_build_run_test_plan_identifies_initial_and_terminal_roots(self, tmp_path):
         """Intermediate destinations should not be treated as initial or terminal."""
@@ -486,30 +519,49 @@ class TestLocalScriptTests:
             str(tmp_path / 'final')
         ]
 
-    def test_load_run_test_transfers_ignores_placeholder_rows(self, tmp_path):
-        """run-tests should skip synthetic $LZ_TEST_ROOT rows."""
+    def test_load_test_with_data_transfers_preserves_env_var_paths(self, tmp_path):
+        """test-with-data should keep env-var based paths unchanged."""
         transfers_file = tmp_path / 'transfers.tsv'
-        output_file = tmp_path / 'subset.tsv'
         transfers_file.write_text(
             "\n".join([
                 "identifiers\tenabled\tsystem\tnotes\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tfrequency",
-                "real\tTRUE\ttestbox\t''\trunner\t{0}/\t\t{1}/\t\t\t\treal.log\treal.lock\t* * * * *".format(
-                    tmp_path / 'source', tmp_path / 'dest'
-                ),
                 "placeholder\tTRUE\ttestbox\t''\trunner\t$LZ_TEST_ROOT/source/\t\t$LZ_TEST_ROOT/dest/\t\t\t\tplaceholder.log\tplaceholder.lock\t* * * * *",
                 "",
             ])
         )
 
-        subset_df = cdr.load_run_test_transfers(
-            str(transfers_file), 'testbox', 'runner', str(output_file), str(tmp_path)
+        subset_df = cdr.load_test_with_data_transfers(
+            str(transfers_file), 'testbox', 'runner', str(tmp_path)
         )
 
-        assert subset_df['identifiers'].tolist() == ['real']
-        assert subset_df.attrs['skipped_placeholder_rows'] == 1
+        assert subset_df['source'].tolist() == ['$LZ_TEST_ROOT/source/']
+        assert subset_df['destination'].tolist() == ['$LZ_TEST_ROOT/dest/']
+
+    def test_build_test_with_data_seed_plan_uses_only_available_toy_data_directory(
+        self, tmp_path
+    ):
+        """A single toy-data directory should seed any unmatched source root."""
+        toy_data_root = tmp_path / 'tests' / 'toy_data' / 'shared_seed'
+        toy_data_root.mkdir(parents=True)
+        (toy_data_root / 'flow_one').mkdir()
+
+        test_plan = {
+            'initial_sources': [
+                {'value': str(tmp_path / 'somewhere' / 'source_root') + '/', 'port': ''}
+            ]
+        }
+
+        seed_plan = cdr.build_test_with_data_seed_plan(
+            test_plan,
+            str(tmp_path / 'tests' / 'toy_data'),
+            str(tmp_path),
+        )
+
+        assert seed_plan[0]['toy_data_dir'] == str(toy_data_root)
+        assert seed_plan[0]['entry_names'] == ['flow_one']
 
     def test_run_generated_scripts_enables_debug_cli(self, tmp_path, monkeypatch):
-        """Generated scripts should run with debug logging enabled in run-tests."""
+        """Generated scripts should run with debug logging enabled in test-with-data."""
         script = tmp_path / 'sample.sh'
         script.write_text("#!/bin/sh\nexit 0\n")
         script.chmod(0o755)

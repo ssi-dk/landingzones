@@ -691,9 +691,9 @@ fi
     dir_name=$(basename "$source_dir")
     log_status "$dir_name initiated"
     debug "$dir_name initiated"
-    {9} >>"$promote_log" 2>&1
-    {10} {11} {12} >>"$run_log" 2>&1
-    {13} >>"$promote_log" 2>&1
+    {9} </dev/null >>"$promote_log" 2>&1
+    {10} {11} {12} </dev/null >>"$run_log" 2>&1
+    {13} </dev/null >>"$promote_log" 2>&1
     log_status "$dir_name completed"
     debug "$dir_name completed"
 done

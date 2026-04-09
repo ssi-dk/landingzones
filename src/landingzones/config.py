@@ -104,6 +104,7 @@ class Config:
     Environment variables:
         - LZ_CONFIG_FILE: Path to config.yaml file
         - LZ_TRANSFERS_FILE: Path to transfers.tsv
+        - LZ_TEST_DATA: Path to toy test data for --test-with-data
         - LZ_LOCK_FILE: Path to default lock file
         - LZ_LOG_DIR: Default log directory
         - LZ_OUTPUT_DIR: Default output directory
@@ -135,6 +136,7 @@ class Config:
             config_file: Path to YAML config file (optional)
             **kwargs: Runtime configuration overrides:
                 - transfers_file
+                - test_data
                 - log_dir
                 - output_dir
                 - crontab_dir
@@ -192,6 +194,11 @@ class Config:
     def default_lock_file(self):
         """Default lock file path for flock"""
         return self._get_value('default_lock_file', 'LZ_LOCK_FILE', '/tmp/landingzones.lock')
+
+    @property
+    def test_data(self):
+        """Path to toy data used by --test-with-data."""
+        return self._get_value('test_data', 'LZ_TEST_DATA', 'tests/toy_data')
     
     @property
     def log_dir(self):
@@ -304,6 +311,7 @@ class Config:
         return {
             'config_file': self.config_file,
             'transfers_file': self.transfers_file,
+            'test_data': self.test_data,
             'default_lock_file': self.default_lock_file,
             'log_dir': self.log_dir,
             'output_dir': self.output_dir,

@@ -10,10 +10,13 @@ pip install -e .
 
 # Generate cron files
 lz-generate-cron --help
-lz-generate-cron --transfers config/transfers.tsv --output-dir output/crontab.d --scripts-dir output/scripts --log-dir log
+lz-generate-cron
 
 # Check deployment readiness
 lz-check-deployment
+
+# Run toy data through the configured flows
+lz-check-deployment --test-with-data
 ```
 
 ## Project Structure
@@ -64,11 +67,11 @@ local_copy	localhost	testuser	input/*		output/				transfers.log	landingzones.loc
 # Generate cron files with defaults
 lz-generate-cron
 
-# Custom paths
-lz-generate-cron -t config/transfers.tsv -o output/crontab.d -s output/scripts -l log
-
-# Check deployment
+# Check deployment readiness
 lz-check-deployment
+
+# Seed toy data and run the real scripts/logs/locks
+lz-check-deployment --test-with-data
 ```
 
 ### Generated Cron Format
@@ -105,6 +108,57 @@ pytest --cov=landingzones --cov-report=html
 # Specific test
 pytest tests/test_generate_cron_files.py::TestClassName::test_method
 ```
+
+### Test With Data
+
+`--test-with-data` is the integration-style test mode. It copies toy data into the configured starting locations, generates the real shell scripts, and runs the transfers using the normal log and flock paths. After a successful run the data should be visible in the terminal destinations unless you choose cleanup at the prompt.
+
+Required config in your deployment `config.yaml`:
+
+```yaml
+transfers_file: input/transfers.tsv
+test_data: tests/toy_data/
+rit_managed_locations:
+  test_local: tests/test_local
+flock_paths:
+  test_local: /opt/homebrew/bin/flock
+rit_managed_folder_structure:
+  log: output/log/
+  flock: output/flock/
+  sh_output: output/scripts/
+  crontabs: output/crontab.d/
+```
+
+Typical local fixture layout:
+
+```text
+deploy/local/
+├── config/config.yaml
+├── input/transfers.tsv
+├── tests/toy_data/
+└── tests/test_local/
+```
+
+How to run it:
+
+```bash
+# Run from the deployment root that owns config/, input/, and tests/
+cd deploy/local
+
+# Generate and execute the transfer scripts with toy data
+lz-check-deployment --config config/config.yaml --test-with-data
+```
+
+What it does:
+
+- Filters `transfers.tsv` to the current `system` and `user`
+- Seeds each initial source root from `test_data`
+- Generates scripts into the configured `sh_output` directory
+- Uses the configured `log` and `flock` directories
+- Executes the scripts in transfer order
+- Validates that the seeded top-level directories reached the terminal destinations
+
+After a successful run it asks whether you want cleanup. Answer `y` to remove the propagated test directories plus generated log and lock artifacts so the next run starts from the initial state. Answer `n` to inspect the final tree and logs.
 
 ## Deployment
 

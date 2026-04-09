@@ -18,9 +18,6 @@ import shutil
 import glob
 import errno
 import argparse
-import tempfile
-import shlex
-from datetime import datetime
 from io import StringIO
 
 import pandas as pd
@@ -42,9 +39,6 @@ class Colors:
     BLUE = '\033[94m'
     BOLD = '\033[1m'
     END = '\033[0m'
-
-
-RUN_TEST_FILE_NAME = 'lz-check-deployment.txt'
 
 
 def get_test_flock_path():
@@ -103,12 +97,6 @@ def get_repo_root():
     )
 
 
-def create_test_root():
-    """Create a timestamp-prefixed temporary root for run-tests artifacts."""
-    prefix = "{0}_lz_check_".format(datetime.now().strftime('%Y%m%dT%H%M%S'))
-    return tempfile.mkdtemp(prefix=prefix)
-
-
 def list_visible_entries(path):
     """List non-hidden entries under a directory."""
     if not os.path.isdir(path):
@@ -117,6 +105,14 @@ def list_visible_entries(path):
         name for name in os.listdir(path)
         if not name.startswith('.')
     )
+
+
+def list_visible_directories(path):
+    """List non-hidden directories under a directory."""
+    return [
+        name for name in list_visible_entries(path)
+        if os.path.isdir(os.path.join(path, name))
+    ]
 
 
 def endpoint_key(value):
@@ -130,7 +126,7 @@ def absolutize_local_endpoint(value, base_dir):
     """Resolve a local endpoint against the command working directory."""
     text = str(value).strip()
     remote, _ = split_remote_path(text)
-    if remote or not text or os.path.isabs(text):
+    if remote or not text or os.path.isabs(text) or text.startswith('$') or text.startswith('~'):
         return text
 
     suffix = ''
@@ -228,9 +224,193 @@ def get_endpoint_root(endpoint):
     return root
 
 
-def join_test_path(root, folder_name):
-    """Join a normalized root with a test folder name."""
-    return os.path.join(root, folder_name)
+def get_test_data_toy_data_candidates(endpoint_root, test_tree_root):
+    """Return candidate toy-data subdirectories for an initial source root."""
+    root = os.path.abspath(endpoint_root)
+    deployment_tests_root = os.path.join(
+        os.path.abspath(test_tree_root), 'tests'
+    )
+    candidates = []
+
+    if root.startswith(deployment_tests_root + os.sep):
+        relative_parts = os.path.relpath(root, deployment_tests_root).split(os.sep)
+        if len(relative_parts) >= 2 and relative_parts[0] == 'test_local':
+            candidates.append(relative_parts[1])
+        elif relative_parts:
+            candidates.append(relative_parts[0])
+
+    basename = os.path.basename(root.rstrip(os.sep))
+    if basename:
+        candidates.append(basename)
+
+    result = []
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        result.append(candidate)
+    return result
+
+
+def resolve_test_data_dir(endpoint, toy_data_root, test_tree_root):
+    """Resolve which toy-data directory seeds a given initial source root."""
+    if not os.path.isdir(toy_data_root):
+        raise ValueError(
+            "Toy data directory not found: {0}".format(toy_data_root)
+        )
+
+    endpoint_root = get_endpoint_root(endpoint)
+    checked_paths = []
+    for candidate in get_test_data_toy_data_candidates(endpoint_root, test_tree_root):
+        toy_dir = os.path.join(toy_data_root, candidate)
+        checked_paths.append(toy_dir)
+        if os.path.isdir(toy_dir):
+            return toy_dir
+
+    available = list_visible_directories(toy_data_root)
+    if len(available) == 1:
+        return os.path.join(toy_data_root, available[0])
+
+    raise ValueError(
+        "No toy data found for source root '{0}'. Checked: {1}".format(
+            endpoint_root,
+            ', '.join(checked_paths) if checked_paths else toy_data_root,
+        )
+    )
+
+
+def remove_local_path(path):
+    """Remove a local file or directory if it exists."""
+    if os.path.islink(path) or os.path.isfile(path):
+        os.remove(path)
+        return
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def remove_endpoint_entries(endpoint, entry_names):
+    """Remove specific entry names from an endpoint root."""
+    root = get_endpoint_root(endpoint)
+    user, host, _ = parse_remote_destination(endpoint['value'])
+    port = endpoint.get('port', '')
+
+    if host:
+        if not entry_names:
+            return
+        command = "rm -rf {0}".format(
+            ' '.join(
+                shell_path(os.path.join(root, entry_name))
+                for entry_name in entry_names
+            )
+        )
+        rc, _, stderr = run_remote_shell(user, host, command, port)
+        if rc != 0:
+            raise ValueError(
+                "Cannot clean test entries on {0}: {1}".format(
+                    shell_target(user, host), stderr.strip()
+                )
+            )
+        return
+
+    os.makedirs(root, exist_ok=True)
+    for entry_name in entry_names:
+        remove_local_path(os.path.join(root, entry_name))
+
+
+def build_test_with_data_seed_plan(test_plan, toy_data_root, test_tree_root):
+    """Resolve toy-data sources and expected top-level directories for testing with data."""
+    seed_plan = []
+    for endpoint in test_plan['initial_sources']:
+        user, host, _ = parse_remote_destination(endpoint['value'])
+        if host:
+            raise ValueError(
+                "test-with-data toy-data seeding does not support remote initial source: {0}".format(
+                    endpoint['value']
+                )
+            )
+        toy_data_dir = resolve_test_data_dir(
+            endpoint, toy_data_root, test_tree_root
+        )
+        entry_names = list_visible_directories(toy_data_dir)
+        if not entry_names:
+            raise ValueError(
+                "Toy data directory contains no visible directories: {0}".format(
+                    toy_data_dir
+                )
+            )
+        seed_plan.append({
+            'endpoint': endpoint,
+            'toy_data_dir': toy_data_dir,
+            'entry_names': entry_names,
+        })
+    return seed_plan
+
+
+def cleanup_test_with_data_entries(test_plan, entry_names):
+    """Remove seeded test directories from all test-with-data roots."""
+    cleanup_errors = []
+    all_entries = sorted(set(entry_names) | {'.staging'})
+    for endpoint in test_plan['all_destinations'] + test_plan['all_sources']:
+        try:
+            remove_endpoint_entries(endpoint, all_entries)
+        except ValueError as exc:
+            cleanup_errors.append(str(exc))
+    if cleanup_errors:
+        raise ValueError('\n'.join(cleanup_errors))
+
+
+def cleanup_test_with_data_runtime_artifacts(transfers_df):
+    """Remove old lock and log artifacts for the test-with-data transfer subset."""
+    artifact_paths = set()
+    for _, transfer in transfers_df.iterrows():
+        log_file = str(transfer.get('log_file', '') or '').strip()
+        flock_file = str(transfer.get('flock_file', '') or '').strip()
+        if log_file and log_file != 'nan':
+            artifact_paths.update([
+                log_file,
+                "{0}.latest".format(log_file),
+                "{0}.mini".format(log_file),
+            ])
+        if flock_file and flock_file != 'nan':
+            artifact_paths.add(flock_file)
+
+    for path in artifact_paths:
+        if os.path.exists(path) or os.path.islink(path):
+            remove_local_path(path)
+
+
+def seed_test_data_sources(seed_plan):
+    """Copy toy-data directories into the initial source roots."""
+    seeded_count = 0
+    for seed in seed_plan:
+        root = get_endpoint_root(seed['endpoint'])
+        os.makedirs(root, exist_ok=True)
+        for entry_name in seed['entry_names']:
+            shutil.copytree(
+                os.path.join(seed['toy_data_dir'], entry_name),
+                os.path.join(root, entry_name),
+            )
+            seeded_count += 1
+    return seeded_count
+
+
+def build_test_with_data_expectations(transfers_df, seed_plan):
+    """Predict which seeded directories should arrive at terminal destinations."""
+    root_contents = {}
+    for seed in seed_plan:
+        root_contents[endpoint_key(seed['endpoint']['value'])] = set(seed['entry_names'])
+
+    for _, transfer in transfers_df.iterrows():
+        source_key = endpoint_key(transfer['source'])
+        destination_key = endpoint_key(transfer['destination'])
+        moved_entries = set(root_contents.get(source_key, set()))
+        if not moved_entries:
+            continue
+        root_contents.setdefault(destination_key, set()).update(moved_entries)
+        root_contents[source_key] = set()
+
+    return root_contents
 
 
 def shell_target(user, host):
@@ -251,107 +431,10 @@ def run_remote_shell(user, host, command, port=''):
     return proc.returncode, stdout.decode('utf-8'), stderr.decode('utf-8')
 
 
-def create_test_folder(endpoint, folder_name):
-    """Create a test folder with a marker file under a source root."""
-    root = get_endpoint_root(endpoint)
-    test_dir = join_test_path(root, folder_name)
-    marker_path = os.path.join(test_dir, RUN_TEST_FILE_NAME)
-    marker_text = "landingzones run-tests marker for {0}\n".format(folder_name)
-    user, host, _ = parse_remote_destination(endpoint['value'])
-    port = endpoint.get('port', '')
-
-    if host:
-        command = "mkdir -p {0} && printf %s {1} > {2}".format(
-            shell_path(test_dir),
-            shlex.quote(marker_text),
-            shell_path(marker_path),
-        )
-        rc, _, stderr = run_remote_shell(user, host, command, port)
-        if rc != 0:
-            raise ValueError(
-                "Cannot create test folder on {0}: {1}".format(
-                    shell_target(user, host), stderr.strip()
-                )
-            )
-        return
-
-    os.makedirs(test_dir)
-    with open(marker_path, 'w') as handle:
-        handle.write(marker_text)
-
-
-def cleanup_test_folder(endpoint, folder_name):
-    """Remove a test folder from a source or destination root."""
-    root = get_endpoint_root(endpoint)
-    test_dir = join_test_path(root, folder_name)
-    user, host, _ = parse_remote_destination(endpoint['value'])
-    port = endpoint.get('port', '')
-
-    if host:
-        command = "rm -rf {0}".format(shell_path(test_dir))
-        rc, _, stderr = run_remote_shell(user, host, command, port)
-        if rc != 0:
-            raise ValueError(
-                "Cannot clean test folder on {0}: {1}".format(
-                    shell_target(user, host), stderr.strip()
-                )
-            )
-        return
-
-    if os.path.isdir(test_dir):
-        shutil.rmtree(test_dir)
-
-
-def test_folder_exists(endpoint, folder_name):
-    """Check whether a test folder exists under an endpoint root."""
-    root = get_endpoint_root(endpoint)
-    test_dir = join_test_path(root, folder_name)
-    marker_path = os.path.join(test_dir, RUN_TEST_FILE_NAME)
-    user, host, _ = parse_remote_destination(endpoint['value'])
-    port = endpoint.get('port', '')
-
-    if host:
-        command = '[ -f {0} ] && echo EXISTS || echo MISSING'.format(
-            shell_path(marker_path)
-        )
-        rc, stdout, stderr = run_remote_shell(user, host, command, port)
-        if rc != 0:
-            return False, "Remote check failed: {0}".format(stderr.strip())
-        return 'EXISTS' in stdout, marker_path
-
-    return os.path.isfile(marker_path), marker_path
-
-
-def prepare_run_test_environment(test_plan, folder_name):
-    """Create one unique test folder in each true source root."""
-    cleanup_errors = []
-    for endpoint in test_plan['all_destinations'] + test_plan['all_sources']:
-        try:
-            cleanup_test_folder(endpoint, folder_name)
-        except ValueError as exc:
-            cleanup_errors.append(str(exc))
-    if cleanup_errors:
-        raise ValueError('\n'.join(cleanup_errors))
-
-    for endpoint in test_plan['initial_sources']:
-        create_test_folder(endpoint, folder_name)
-
-
-def build_test_runtime_overrides(config_file, transfers_file, test_root):
-    """Build runtime overrides for generated script output and test locks/logs."""
-    config.load_config(config_file=config_file)
-    return {
-        'config_file': config_file,
-        'transfers_file': transfers_file,
-        'crontab_dir': os.path.join(test_root, 'generated', 'crontab.d'),
-        'log_dir': os.path.join(test_root, 'generated', 'log'),
-    }
-
-
-def load_run_test_transfers(
-    transfers_file, current_system, current_user, output_file, base_dir
+def load_test_with_data_transfers(
+    transfers_file, current_system, current_user, base_dir
 ):
-    """Write the current system/user transfer subset for run-tests."""
+    """Load the current system/user transfer subset for test-with-data."""
     df = parse_transfers_file(transfers_file)
     df = df[(df['system'] == current_system) & (df['users'] == current_user)].copy()
     if df.empty:
@@ -360,53 +443,22 @@ def load_run_test_transfers(
                 current_user, current_system
             )
         )
-    placeholder_mask = (
-        df['source'].astype(str).str.contains(r'\$LZ_TEST_ROOT', regex=True)
-        | df['destination'].astype(str).str.contains(r'\$LZ_TEST_ROOT', regex=True)
-    )
-    skipped = int(placeholder_mask.sum())
-    df = df[~placeholder_mask].copy()
-    if df.empty:
-        raise ValueError(
-            "No real transfers found for user '{0}' on system '{1}'. "
-            "run-tests ignores placeholder test rows containing $LZ_TEST_ROOT.".format(
-                current_user, current_system
-            )
-        )
     for column in ('source', 'destination'):
         df[column] = df[column].apply(
             lambda value: absolutize_local_endpoint(value, base_dir)
         )
-    df.to_csv(output_file, sep='\t', index=False)
-    df.attrs['skipped_placeholder_rows'] = skipped
     return df
 
 
-def build_runtime_test_dataframe(transfers_df, test_root):
-    """Redirect run-test logging and locking into the temporary workspace."""
-    transfers_df = transfers_df.copy()
-    log_dir = os.path.join(test_root, 'generated', 'log')
-    flock_dir = os.path.join(test_root, 'generated', 'flock')
-
-    transfers_df['log_file'] = transfers_df['identifiers'].apply(
-        lambda ident: os.path.join(log_dir, '{0}.log'.format(ident))
-    )
-    transfers_df['flock_file'] = transfers_df['identifiers'].apply(
-        lambda ident: os.path.join(flock_dir, '{0}.lock'.format(ident))
-    )
-    return transfers_df
-
-
-def generate_test_scripts(runtime_overrides, scripts_dir, test_root):
+def generate_test_scripts(transfers_df, scripts_dir, crontab_dir):
     """Generate shell scripts and cron files for the current transfer subset."""
     from landingzones import generate_cron_files as gcf
 
-    config.load_config(**runtime_overrides)
-    transfers_df = gcf.parse_transfers_file(config.transfers_file)
-    transfers_df = build_runtime_test_dataframe(transfers_df, test_root)
-    os.makedirs(config.crontab_dir)
-    os.makedirs(config.log_dir)
-    os.makedirs(scripts_dir)
+    os.makedirs(crontab_dir, exist_ok=True)
+    os.makedirs(scripts_dir, exist_ok=True)
+    gcf.remove_stale_generated_scripts(
+        scripts_dir, transfers_df['script_name'].dropna().tolist()
+    )
 
     grouped = transfers_df.groupby('system_user')
     for system_user, group_df in grouped:
@@ -418,7 +470,7 @@ def generate_test_scripts(runtime_overrides, scripts_dir, test_root):
             os.chmod(script_path, 0o755)
 
         cron_path = os.path.join(
-            config.crontab_dir, "{0}.Landing_Zone.cron".format(system_user)
+            crontab_dir, "{0}.Landing_Zone.cron".format(system_user)
         )
         with open(cron_path, 'w') as handle:
             handle.write(gcf.generate_cron_file(system_user, group_df, scripts_dir))
@@ -426,12 +478,15 @@ def generate_test_scripts(runtime_overrides, scripts_dir, test_root):
     return transfers_df
 
 
-def run_generated_scripts(transfers_df, scripts_dir, test_root):
+def run_generated_scripts(transfers_df, scripts_dir, runtime_root=None):
     """Execute generated scripts in transfer order."""
     env = os.environ.copy()
-    env['LZ_TEST_ROOT'] = test_root
     env['LZ_DEBUG_CLI'] = '1'
-    env.setdefault('TMPDIR', test_root)
+    if runtime_root:
+        env['LZ_TEST_ROOT'] = runtime_root
+        env.setdefault('TMPDIR', runtime_root)
+    else:
+        env.pop('LZ_TEST_ROOT', None)
     results = []
 
     for _, transfer in transfers_df.iterrows():
@@ -441,7 +496,7 @@ def run_generated_scripts(transfers_df, scripts_dir, test_root):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
-            cwd=test_root,
+            cwd=runtime_root or os.getcwd(),
         )
         stdout, stderr = proc.communicate()
         results.append({
@@ -455,24 +510,77 @@ def run_generated_scripts(transfers_df, scripts_dir, test_root):
     return results
 
 
-def validate_script_test_results(test_plan, folder_name):
-    """Validate that the test folder reached each terminal destination."""
+def endpoint_directory_exists(endpoint, directory_name):
+    """Check whether a named directory exists directly under an endpoint root."""
+    root = get_endpoint_root(endpoint)
+    directory_path = os.path.join(root, directory_name)
+    user, host, _ = parse_remote_destination(endpoint['value'])
+    port = endpoint.get('port', '')
+
+    if host:
+        command = '[ -d {0} ] && echo EXISTS || echo MISSING'.format(
+            shell_path(directory_path)
+        )
+        rc, stdout, stderr = run_remote_shell(user, host, command, port)
+        if rc != 0:
+            return False, "Remote check failed: {0}".format(stderr.strip())
+        return 'EXISTS' in stdout, directory_path
+
+    return os.path.isdir(directory_path), directory_path
+
+
+def validate_script_test_results(test_plan, expected_contents):
+    """Validate that seeded toy-data directories reached each terminal destination."""
     errors = []
     for endpoint in test_plan['terminal_destinations']:
-        exists, marker_path = test_folder_exists(endpoint, folder_name)
-        if not exists:
-            errors.append("Test folder missing at terminal destination: {0}".format(marker_path))
+        expected_entries = sorted(
+            expected_contents.get(endpoint_key(endpoint['value']), set())
+        )
+        for entry_name in expected_entries:
+            exists, path = endpoint_directory_exists(endpoint, entry_name)
+            if not exists:
+                errors.append(
+                    "Expected test directory missing at terminal destination: {0}".format(
+                        path
+                    )
+                )
     return errors
 
 
-def run_local_script_tests(config_file=None, transfers_file=None, keep_test_env=False):
-    """Run generated scripts against the real transfer roots using a marker folder."""
-    print_header("Transfer Script Tests")
+def cleanup_test_with_data_outputs(test_plan, transfers_df, seed_plan):
+    """Remove seeded test directories and runtime artifacts after a test-with-data run."""
+    entry_names = sorted({
+        entry_name
+        for seed in seed_plan
+        for entry_name in seed['entry_names']
+    })
+    cleanup_test_with_data_entries(test_plan, entry_names)
+    cleanup_test_with_data_runtime_artifacts(transfers_df)
+
+
+def ask_yes_no(prompt_text):
+    """Ask a yes/no question and return True for yes."""
+    prompt = "\n{0}{1} (y/N): {2}".format(
+        Colors.YELLOW, prompt_text, Colors.END
+    )
+    print(prompt, end="")
+    try:
+        response = input().strip().lower()
+        return response in ['y', 'yes']
+    except KeyboardInterrupt:
+        print("\n{0}Operation cancelled.{1}".format(Colors.YELLOW, Colors.END))
+        return False
+
+
+def run_test_with_data(config_file=None, transfers_file=None):
+    """Run generated scripts against seeded toy-data in the real test tree."""
+    print_header("Transfer Test With Data")
     snapshot = _snapshot_config_state()
-    test_root = None
-    folder_name = None
     current_system = None
     current_user = None
+    transfers_df = None
+    test_plan = None
+    seed_plan = None
 
     try:
         work_root = os.getcwd()
@@ -483,52 +591,59 @@ def run_local_script_tests(config_file=None, transfers_file=None, keep_test_env=
         transfers_path = transfers_file or config.transfers_file
         current_system = get_current_system()
         current_user = get_current_user()
-        test_root = create_test_root()
-        print_status("Test workspace", "INFO", test_root)
-        os.makedirs(test_root, exist_ok=True)
-
-        subset_file = os.path.join(test_root, 'run_tests.transfers.tsv')
-        subset_df = load_run_test_transfers(
-            transfers_path, current_system, current_user, subset_file, work_root
-        )
-        skipped_placeholder_rows = subset_df.attrs.get('skipped_placeholder_rows', 0)
-        if skipped_placeholder_rows:
-            print_status(
-                "Skipped placeholder transfers",
-                "INFO",
-                "Ignored {0} row(s) containing $LZ_TEST_ROOT".format(
-                    skipped_placeholder_rows
-                ),
+        test_tree_root = os.path.dirname(
+            os.path.abspath(
+                transfers_path if os.path.isabs(transfers_path)
+                else os.path.join(work_root, transfers_path)
             )
-        test_plan = build_run_test_plan(subset_df)
-        folder_name = "lz_check_{0}".format(datetime.now().strftime('%Y%m%dT%H%M%S'))
-        prepare_run_test_environment(test_plan, folder_name)
-        print_status(
-            "Seeded test folders",
-            "OK",
-            "Prepared {0} starting location(s)".format(
-                len(test_plan['initial_sources'])
-            ),
         )
-        runtime_overrides = build_test_runtime_overrides(
-            config_file, subset_file, test_root
+        if os.path.basename(test_tree_root) == 'input':
+            test_tree_root = os.path.dirname(test_tree_root)
+        toy_data_root = config.test_data
+        if not os.path.isabs(toy_data_root):
+            toy_data_root = os.path.abspath(os.path.join(work_root, toy_data_root))
+        transfers_df = load_test_with_data_transfers(
+            transfers_path, current_system, current_user, work_root
+        )
+        test_plan = build_run_test_plan(transfers_df)
+        seed_plan = build_test_with_data_seed_plan(
+            test_plan, toy_data_root, test_tree_root
+        )
+        expected_entry_names = sorted({
+            entry_name
+            for seed in seed_plan
+            for entry_name in seed['entry_names']
+        })
+        cleanup_test_with_data_entries(test_plan, expected_entry_names)
+        cleanup_test_with_data_runtime_artifacts(transfers_df)
+        seeded_count = seed_test_data_sources(seed_plan)
+        print_status(
+            "Seeded toy data",
+            "OK",
+            "Copied {0} directory tree(s) into {1} starting location(s)".format(
+                seeded_count, len(seed_plan)
+            ),
         )
         if get_test_flock_path() == '/usr/bin/true':
             print_status(
                 "Flock fallback",
                 "WARN",
-                "No flock binary found on PATH; run-tests are running without lock enforcement",
+                "No flock binary found on PATH; test-with-data is running without lock enforcement",
             )
-        scripts_dir = os.path.join(test_root, 'generated', 'scripts')
-        transfers_df = generate_test_scripts(runtime_overrides, scripts_dir, test_root)
+        scripts_dir = config.get_rit_managed_path(current_system, 'sh_output')
+        crontab_dir = config.get_rit_managed_path(current_system, 'crontabs')
+        generate_test_scripts(transfers_df, scripts_dir, crontab_dir)
 
         print_status(
             "Generated test scripts",
             "OK",
-            "Prepared {0} scripts".format(len(transfers_df)),
+            "Prepared {0} scripts in {1}".format(len(transfers_df), scripts_dir),
         )
 
-        run_results = run_generated_scripts(transfers_df, scripts_dir, test_root)
+        expected_contents = build_test_with_data_expectations(
+            transfers_df, seed_plan
+        )
+        run_results = run_generated_scripts(transfers_df, scripts_dir)
         failed_runs = [result for result in run_results if result['returncode'] != 0]
         if failed_runs:
             first_failure = failed_runs[0]
@@ -556,7 +671,9 @@ def run_local_script_tests(config_file=None, transfers_file=None, keep_test_env=
             "Executed {0} generated scripts".format(len(run_results)),
         )
 
-        validation_errors = validate_script_test_results(test_plan, folder_name)
+        validation_errors = validate_script_test_results(
+            test_plan, expected_contents
+        )
         if validation_errors:
             print_status(
                 "Script validation",
@@ -568,56 +685,26 @@ def run_local_script_tests(config_file=None, transfers_file=None, keep_test_env=
         print_status(
             "Script validation",
             "OK",
-            "Test folder reached all terminal destinations",
+            "Seeded toy-data directories reached all terminal destinations",
         )
+        if ask_yes_no(
+            "Do you want to clean up the propagated output locations so test-with-data can be rerun from the initial state?"
+        ):
+            cleanup_test_with_data_outputs(test_plan, transfers_df, seed_plan)
+            print_status(
+                "Test-with-data cleanup",
+                "OK",
+                "Removed propagated test data and runtime artifacts from the test tree",
+            )
+        else:
+            print_status(
+                "Test-with-data final state",
+                "INFO",
+                "Seeded data and generated artifacts were left in the real test locations",
+            )
         return True
     finally:
         _restore_config_state(snapshot)
-        if folder_name:
-            cleanup_errors = []
-            try:
-                cleanup_config_path = transfers_file or config.transfers_file
-                if cleanup_config_path:
-                    config.load_config(
-                        config_file=config_file,
-                        transfers_file=cleanup_config_path,
-                    )
-                if current_system is None:
-                    current_system = get_current_system()
-                if current_user is None:
-                    current_user = get_current_user()
-                cleanup_df = parse_transfers_file(transfers_file or config.transfers_file)
-                cleanup_df = cleanup_df[
-                    (cleanup_df['system'] == current_system)
-                    & (cleanup_df['users'] == current_user)
-                ].copy()
-                if not cleanup_df.empty:
-                    cleanup_plan = build_run_test_plan(cleanup_df)
-                    for endpoint in cleanup_plan['all_destinations'] + cleanup_plan['all_sources']:
-                        try:
-                            cleanup_test_folder(endpoint, folder_name)
-                        except ValueError as exc:
-                            cleanup_errors.append(str(exc))
-            except Exception as exc:
-                cleanup_errors.append(str(exc))
-            if cleanup_errors:
-                print_status(
-                    "Run-tests cleanup",
-                    "WARN",
-                    "\n".join(cleanup_errors),
-                )
-            else:
-                print_status(
-                    "Run-tests cleanup",
-                    "OK",
-                    "Removed test folders from source and destination roots",
-                )
-        if test_root and os.path.isdir(test_root):
-            if keep_test_env:
-                print_status("Test workspace retained", "INFO", test_root)
-            else:
-                shutil.rmtree(test_root)
-                print_status("Test workspace cleanup", "OK", "Removed temporary test data")
 
 
 def check_required_tools():
@@ -1110,19 +1197,6 @@ def deploy_cron_files(current_system, current_user=None):
         return False
 
 
-def ask_user_permission():
-    """Ask user if they want to proceed with automatic deployment"""
-    prompt = ("\n{0}Do you want to automatically deploy "
-              "the cron files now? (y/N): {1}").format(Colors.YELLOW, Colors.END)
-    print(prompt, end="")
-    try:
-        response = input().strip().lower()
-        return response in ['y', 'yes']
-    except KeyboardInterrupt:
-        print("\n{0}Operation cancelled.{1}".format(Colors.YELLOW, Colors.END))
-        return False
-
-
 def main():
     """Main verification function"""
     # Parse command line arguments
@@ -1140,14 +1214,9 @@ def main():
         help='Path to transfers.tsv file (overrides config file)'
     )
     parser.add_argument(
-        '--run-tests',
+        '--test-with-data',
         action='store_true',
-        help='Generate and execute local script tests from prod toy data without deploying cron'
-    )
-    parser.add_argument(
-        '--keep-test-env',
-        action='store_true',
-        help='Keep the timestamped local script-test workspace instead of removing it'
+        help='Seed toy data from config.test_data into the real test tree and execute the generated transfer scripts'
     )
     args = parser.parse_args()
     
@@ -1157,11 +1226,10 @@ def main():
         transfers_file=args.transfers
     )
 
-    if args.run_tests:
-        return run_local_script_tests(
+    if args.test_with_data:
+        return run_test_with_data(
             config_file=args.config,
             transfers_file=args.transfers,
-            keep_test_env=args.keep_test_env,
         )
     
     print("{0}{1}".format(Colors.BOLD, Colors.BLUE))
@@ -1327,7 +1395,7 @@ def main():
         print("\n{0}{1}✓ READY TO DEPLOY{2}".format(Colors.GREEN, Colors.BOLD, Colors.END))
         
         # Ask user if they want automatic deployment
-        if ask_user_permission():
+        if ask_yes_no("Do you want to automatically deploy the cron files now?"):
             print_header("Automatic Deployment")
             deploy_ok = deploy_cron_files(current_system, current_user)
             
