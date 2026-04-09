@@ -3,6 +3,7 @@
 """Test suite for generate_cron_files.py"""
 
 import os
+import sys
 import tempfile
 import shutil
 import pytest
@@ -153,6 +154,52 @@ server1_main\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t22\t-av\t\ttrans
 
         assert df.iloc[0]['log_file'] == '/srv/rit_managed/log/transfer.log'
         assert df.iloc[0]['flock_file'] == '/srv/rit_managed/flock/transfer.lock'
+
+    def test_parse_rejects_malformed_remote_endpoint(self, tmp_path):
+        """Remote-looking endpoints must include the host:path separator."""
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\tserver1\tuser1\t/src/\tuser@host/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        with pytest.raises(ValueError) as exc_info:
+            gcf.parse_transfers_file(str(test_file))
+
+        message = str(exc_info.value)
+        assert "Invalid destination for transfer 'server1_main'" in message
+        assert "user@host/dest/" in message
+
+    def test_parse_accepts_host_alias_remote_endpoint(self, tmp_path):
+        """SSH aliases without an explicit user should still parse."""
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\tserver1\tuser1\t/src/\tcalck:$HOME/Landing_Zone/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        df = gcf.parse_transfers_file(str(test_file))
+
+        assert len(df) == 1
+        assert df.iloc[0]['destination'] == 'calck:$HOME/Landing_Zone/'
+
+    def test_parse_records_shared_file_pair_warnings(self, tmp_path):
+        """Duplicate log/flock pairs should be surfaced as warnings."""
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+first\tserver1\tuser1\t/src1/\t/dest1/\t\t\t\t/tmp/shared.log\t/tmp/shared.lock
+second\tserver1\tuser1\t/src2/\t/dest2/\t\t\t\t/tmp/shared.log\t/tmp/shared.lock
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        df = gcf.parse_transfers_file(str(test_file))
+
+        warnings = df.attrs['shared_file_pair_warnings']
+        assert len(warnings) == 1
+        assert "shared.log" in warnings[0]
+        assert "shared.lock" in warnings[0]
+        assert "first" in warnings[0]
+        assert "second" in warnings[0]
 
 
 class TestGenerateRsyncCommand:
@@ -753,6 +800,39 @@ local_copy\tlocalhost\ttestuser\t/tmp/src/\t\t/tmp/dest/\t\t\t\t/tmp/test.log\t/
         assert '/tmp/src/' in cron_content
         assert '/tmp/dest/' in cron_content
         assert '/bin/sh /srv/deployed/output/scripts/local_copy.sh' in cron_content
+
+    def test_main_prints_shared_file_pair_warning(self, tmp_path, monkeypatch, capsys):
+        """Generation should emit warnings for duplicate log/flock pairs."""
+        transfers_file = tmp_path / "test_transfers.tsv"
+        output_dir = tmp_path / "crontab.d"
+        log_dir = tmp_path / "log"
+        scripts_dir = tmp_path / "scripts"
+        transfers_file.write_text(
+            """identifiers\tsystem\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+first\tlocalhost\ttestuser\t/tmp/src1/\t\t/tmp/dest1/\t\t\t\t/tmp/shared.log\t/tmp/shared.lock
+second\tlocalhost\ttestuser\t/tmp/src2/\t\t/tmp/dest2/\t\t\t\t/tmp/shared.log\t/tmp/shared.lock
+"""
+        )
+
+        monkeypatch.setattr(
+            sys,
+            'argv',
+            [
+                'generate_cron_files.py',
+                '--transfers', str(transfers_file),
+                '--output-dir', str(output_dir),
+                '--log-dir', str(log_dir),
+                '--scripts-dir', str(scripts_dir),
+            ],
+        )
+
+        rc = gcf.main()
+        captured = capsys.readouterr()
+
+        assert rc == 0
+        assert 'Shared log/flock pairs detected' in captured.out
+        assert 'first' in captured.out
+        assert 'second' in captured.out
 
 
 class TestEnvironmentVariableExpansion:

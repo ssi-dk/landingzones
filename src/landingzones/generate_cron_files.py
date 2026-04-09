@@ -15,6 +15,7 @@ import pandas as pd
 
 from landingzones.config import config
 
+
 def parse_transfers_file(filename):
     """Parse the transfers.tsv file and return a pandas DataFrame"""
     # Read the TSV file with pandas - now with proper header line
@@ -90,8 +91,11 @@ def parse_transfers_file(filename):
                 ', '.join(duplicates)
             )
         )
+
+    validate_transfer_endpoints(df)
     df['script_name'] = sanitized_identifiers + '.sh'
     df = resolve_transfer_file_paths(df)
+    df.attrs['shared_file_pair_warnings'] = audit_shared_file_pairs(df)
     
     return df
 
@@ -140,6 +144,43 @@ def split_remote_path(path):
     if not remote or not remote_path:
         return None, value
     return remote, remote_path
+
+
+def validate_transfer_endpoints(df):
+    """Reject malformed remote endpoints before generating scripts."""
+    errors = []
+    for _, row in df.iterrows():
+        identifier = row.get('identifiers', '')
+        for field_name in ('source', 'destination'):
+            value = str(row.get(field_name, '')).strip()
+            if not value or value == 'nan':
+                continue
+            if '@' in value and ':' not in value:
+                errors.append(
+                    "Invalid {0} for transfer '{1}': expected host:path, got '{2}'".format(
+                        field_name, identifier, value
+                    )
+                )
+    if errors:
+        raise ValueError("\n".join(errors))
+
+
+def audit_shared_file_pairs(df):
+    """Return warnings for transfers that share the same log/flock pair."""
+    warnings = []
+    grouped = df.groupby(['log_file', 'flock_file'], dropna=False)
+    for (log_file, flock_file), group_df in grouped:
+        identifiers = sorted(group_df['identifiers'].tolist())
+        if len(identifiers) < 2:
+            continue
+        warnings.append(
+            "Shared log/flock pair: log_file='{0}', flock_file='{1}', identifiers={2}".format(
+                log_file,
+                flock_file,
+                ', '.join(identifiers),
+            )
+        )
+    return warnings
 
 
 def join_remote_path(remote, path):
@@ -834,6 +875,16 @@ def main():
             print("\n" + warning)
         print("\n" + "=" * 60)
         print("Consider adjusting your transfers.tsv to avoid conflicts.")
+        print("Continuing with generation...\n")
+
+    shared_file_pair_warnings = transfers_df.attrs.get('shared_file_pair_warnings', [])
+    if shared_file_pair_warnings:
+        print("\n\033[93m⚠ WARNING: Shared log/flock pairs detected!\033[0m")
+        print("=" * 60)
+        for warning in shared_file_pair_warnings:
+            print("\n" + warning)
+        print("\n" + "=" * 60)
+        print("Review transfer definitions for accidental log/lock reuse.")
         print("Continuing with generation...\n")
     
     remove_stale_generated_scripts(
