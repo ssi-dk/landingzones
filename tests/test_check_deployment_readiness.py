@@ -3,8 +3,11 @@
 """Test suite for check_deployment_readiness.py"""
 
 import os
+import shutil
 import tempfile
+from pathlib import Path
 import pytest
+import pandas as pd
 
 from landingzones import check_deployment_readiness as cdr
 
@@ -43,6 +46,14 @@ class TestParseRemoteDestination:
         assert user == 'user'
         assert host == 'host'
         assert path == '/path with spaces/'
+
+    def test_host_alias_without_user(self):
+        """Test parsing a remote ssh alias without an explicit user."""
+        user, host, path = cdr.parse_remote_destination('calck:$HOME/Landing_Zone/')
+
+        assert user is None
+        assert host == 'calck'
+        assert path == '$HOME/Landing_Zone/'
 
 
 class TestCheckLocalDirectory:
@@ -347,6 +358,192 @@ class TestIntegration:
         
         assert source_ok is True
         assert dest_ok is True
+
+
+class TestLocalScriptTests:
+    """End-to-end coverage for the real-transfer run-tests mode."""
+
+    def _write_run_test_fixture(self, tmp_path):
+        config_file = tmp_path / 'config.yaml'
+        transfers_file = tmp_path / 'transfers.tsv'
+        source_root = tmp_path / 'source_root'
+        transit_root = tmp_path / 'transit_root'
+        final_root = tmp_path / 'final_root'
+        rit_managed = tmp_path / 'rit_managed'
+
+        source_root.mkdir()
+        transit_root.mkdir()
+        final_root.mkdir()
+        rit_managed.mkdir()
+
+        config_file.write_text(
+            "\n".join([
+                "transfers_file: {0}".format(transfers_file),
+                "rit_managed_locations:",
+                "  testbox: {0}".format(rit_managed),
+                "flock_paths:",
+                "  testbox: /usr/bin/true",
+                "rit_managed_folder_structure:",
+                "  log: log/",
+                "  flock: flock/",
+                "  sh_output: scripts/",
+                "  crontabs: crontab.d/",
+                "",
+            ])
+        )
+        transfers_file.write_text(
+            "\n".join([
+                "identifiers\tenabled\tsystem\tnotes\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tfrequency",
+                "step1\tTRUE\ttestbox\t''\trunner\t{0}/\t\t{1}/\t\t--out-format='%t %o %i %n%L'\t\tstep1.log\tstep1.lock\t* * * * *".format(
+                    source_root, transit_root
+                ),
+                "step2\tTRUE\ttestbox\t''\trunner\t{0}/\t\t{1}/\t\t--out-format='%t %o %i %n%L'\t\tstep2.log\tstep2.lock\t* * * * *".format(
+                    transit_root, final_root
+                ),
+                "",
+            ])
+        )
+        return config_file, transfers_file, source_root, transit_root, final_root
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_local_script_tests_executes_chained_outputs(
+        self, tmp_path, monkeypatch
+    ):
+        """Run the generated scripts against a real local transfer chain."""
+        config_file, transfers_file, source_root, transit_root, final_root = (
+            self._write_run_test_fixture(tmp_path)
+        )
+        test_root = tmp_path / '20260409T120000_run_tests_keep'
+        monkeypatch.setattr(cdr, 'create_test_root', lambda: str(test_root))
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        result = cdr.run_local_script_tests(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+            keep_test_env=True,
+        )
+
+        assert result is True
+        assert cdr.list_visible_entries(str(source_root)) == []
+        assert cdr.list_visible_entries(str(transit_root)) == []
+        assert cdr.list_visible_entries(str(final_root)) == []
+        assert test_root.exists()
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_local_script_tests_cleans_up_workspace(self, tmp_path, monkeypatch):
+        """Run-tests should remove its temporary workspace by default."""
+        config_file, transfers_file, source_root, transit_root, final_root = (
+            self._write_run_test_fixture(tmp_path)
+        )
+        test_root = tmp_path / '20260409T120000_run_tests_cleanup'
+        monkeypatch.setattr(cdr, 'create_test_root', lambda: str(test_root))
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        result = cdr.run_local_script_tests(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+
+        assert result is True
+        assert cdr.list_visible_entries(str(source_root)) == []
+        assert cdr.list_visible_entries(str(transit_root)) == []
+        assert cdr.list_visible_entries(str(final_root)) == []
+        assert not test_root.exists()
+
+    def test_build_run_test_plan_identifies_initial_and_terminal_roots(self, tmp_path):
+        """Intermediate destinations should not be treated as initial or terminal."""
+        df = pd.DataFrame([
+            {
+                'identifiers': 'step1',
+                'source': str(tmp_path / 'source') + '/',
+                'source_port': '',
+                'destination': str(tmp_path / 'mid') + '/',
+                'destination_port': '',
+            },
+            {
+                'identifiers': 'step2',
+                'source': str(tmp_path / 'mid') + '/',
+                'source_port': '',
+                'destination': str(tmp_path / 'final') + '/',
+                'destination_port': '',
+            },
+        ])
+
+        plan = cdr.build_run_test_plan(df)
+
+        assert [cdr.get_endpoint_root(item) for item in plan['initial_sources']] == [
+            str(tmp_path / 'source')
+        ]
+        assert [cdr.get_endpoint_root(item) for item in plan['terminal_destinations']] == [
+            str(tmp_path / 'final')
+        ]
+
+    def test_load_run_test_transfers_ignores_placeholder_rows(self, tmp_path):
+        """run-tests should skip synthetic $LZ_TEST_ROOT rows."""
+        transfers_file = tmp_path / 'transfers.tsv'
+        output_file = tmp_path / 'subset.tsv'
+        transfers_file.write_text(
+            "\n".join([
+                "identifiers\tenabled\tsystem\tnotes\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tfrequency",
+                "real\tTRUE\ttestbox\t''\trunner\t{0}/\t\t{1}/\t\t\t\treal.log\treal.lock\t* * * * *".format(
+                    tmp_path / 'source', tmp_path / 'dest'
+                ),
+                "placeholder\tTRUE\ttestbox\t''\trunner\t$LZ_TEST_ROOT/source/\t\t$LZ_TEST_ROOT/dest/\t\t\t\tplaceholder.log\tplaceholder.lock\t* * * * *",
+                "",
+            ])
+        )
+
+        subset_df = cdr.load_run_test_transfers(
+            str(transfers_file), 'testbox', 'runner', str(output_file), str(tmp_path)
+        )
+
+        assert subset_df['identifiers'].tolist() == ['real']
+        assert subset_df.attrs['skipped_placeholder_rows'] == 1
+
+    def test_run_generated_scripts_enables_debug_cli(self, tmp_path, monkeypatch):
+        """Generated scripts should run with debug logging enabled in run-tests."""
+        script = tmp_path / 'sample.sh'
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+
+        transfers_df = pd.DataFrame([
+            {
+                'identifiers': 'sample',
+                'script_name': 'sample.sh',
+                'log_file': str(tmp_path / 'sample.log'),
+            }
+        ])
+
+        captured = {}
+
+        class DummyProcess:
+            def __init__(self, args, stdout=None, stderr=None, env=None, cwd=None):
+                captured['args'] = args
+                captured['env'] = env
+                captured['cwd'] = cwd
+                self.returncode = 0
+
+            def communicate(self):
+                return b'', b''
+
+        monkeypatch.setattr(cdr.subprocess, 'Popen', DummyProcess)
+
+        results = cdr.run_generated_scripts(
+            transfers_df,
+            str(tmp_path),
+            str(tmp_path / 'test_root'),
+        )
+
+        assert results[0]['returncode'] == 0
+        assert captured['env']['LZ_DEBUG_CLI'] == '1'
 
 
 if __name__ == '__main__':

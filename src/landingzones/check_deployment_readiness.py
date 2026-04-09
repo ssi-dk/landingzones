@@ -18,12 +18,20 @@ import shutil
 import glob
 import errno
 import argparse
+import tempfile
+import shlex
+from datetime import datetime
 from io import StringIO
 
 import pandas as pd
 
 from landingzones.config import config
-from landingzones.generate_cron_files import parse_transfers_file
+from landingzones.generate_cron_files import (
+    parse_transfers_file,
+    normalize_source_path,
+    split_remote_path,
+    shell_path,
+)
 
 
 class Colors:
@@ -34,6 +42,17 @@ class Colors:
     BLUE = '\033[94m'
     BOLD = '\033[1m'
     END = '\033[0m'
+
+
+RUN_TEST_FILE_NAME = 'lz-check-deployment.txt'
+
+
+def get_test_flock_path():
+    """Prefer a real flock binary, but allow a no-op lock command for local tests."""
+    flock_path = shutil.which('flock')
+    if flock_path:
+        return flock_path
+    return '/usr/bin/true'
 
 
 def print_status(message, status, details=None):
@@ -59,6 +78,546 @@ def print_status(message, status, details=None):
 def print_header(title):
     """Print section header"""
     print("\n{0}{1}=== {2} ==={3}".format(Colors.BOLD, Colors.BLUE, title, Colors.END))
+
+
+def _snapshot_config_state():
+    """Capture config state so temporary overrides can be restored."""
+    return {
+        'yaml_config': dict(config._yaml_config),
+        'runtime_config': dict(config._runtime_config),
+        'config_file': config._config_file,
+    }
+
+
+def _restore_config_state(snapshot):
+    """Restore config state after temporary overrides."""
+    config._yaml_config = snapshot['yaml_config']
+    config._runtime_config = snapshot['runtime_config']
+    config._config_file = snapshot['config_file']
+
+
+def get_repo_root():
+    """Return the repository root from the installed package path."""
+    return os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..', '..', '..')
+    )
+
+
+def create_test_root():
+    """Create a timestamp-prefixed temporary root for run-tests artifacts."""
+    prefix = "{0}_lz_check_".format(datetime.now().strftime('%Y%m%dT%H%M%S'))
+    return tempfile.mkdtemp(prefix=prefix)
+
+
+def list_visible_entries(path):
+    """List non-hidden entries under a directory."""
+    if not os.path.isdir(path):
+        return []
+    return sorted(
+        name for name in os.listdir(path)
+        if not name.startswith('.')
+    )
+
+
+def endpoint_key(value):
+    """Return a normalized endpoint key for comparing transfer roots."""
+    remote, path = split_remote_path(value)
+    root = normalize_source_path(path if remote else value)
+    return remote or '', root
+
+
+def absolutize_local_endpoint(value, base_dir):
+    """Resolve a local endpoint against the command working directory."""
+    text = str(value).strip()
+    remote, _ = split_remote_path(text)
+    if remote or not text or os.path.isabs(text):
+        return text
+
+    suffix = ''
+    if text.endswith('/*'):
+        suffix = '/*'
+        text = text[:-2]
+    elif text.endswith('*'):
+        suffix = '*'
+        text = text[:-1]
+    elif text.endswith('/'):
+        suffix = '/'
+        text = text[:-1]
+
+    resolved = os.path.normpath(os.path.join(base_dir, text))
+    return resolved + suffix
+
+
+def unique_transfer_endpoints(transfers_df, column, port_column):
+    """Return unique endpoints preserving the first seen port value."""
+    endpoints = {}
+    for _, transfer in transfers_df.iterrows():
+        value = transfer[column]
+        key = endpoint_key(value)
+        if key not in endpoints:
+            port = transfer.get(port_column, '')
+            port = str(port).strip() if port is not None else ''
+            endpoints[key] = {
+                'value': value,
+                'port': port if port and port != 'nan' else '',
+            }
+    return endpoints
+
+
+def build_run_test_plan(transfers_df):
+    """Build source/destination relationships for the real-transfer smoke test."""
+    source_keys = {
+        endpoint_key(transfer['source']) for _, transfer in transfers_df.iterrows()
+    }
+    destination_keys = {
+        endpoint_key(transfer['destination']) for _, transfer in transfers_df.iterrows()
+    }
+
+    initial_sources = []
+    terminal_destinations = []
+    for _, transfer in transfers_df.iterrows():
+        source_info = {
+            'value': transfer['source'],
+            'port': str(transfer.get('source_port', '') or '').strip(),
+        }
+        destination_info = {
+            'value': transfer['destination'],
+            'port': str(transfer.get('destination_port', '') or '').strip(),
+        }
+        if endpoint_key(transfer['source']) not in destination_keys:
+            initial_sources.append(source_info)
+        if endpoint_key(transfer['destination']) not in source_keys:
+            terminal_destinations.append(destination_info)
+
+    return {
+        'initial_sources': dedupe_test_endpoints(initial_sources),
+        'all_sources': dedupe_test_endpoints([
+            {
+                'value': transfer['source'],
+                'port': str(transfer.get('source_port', '') or '').strip(),
+            }
+            for _, transfer in transfers_df.iterrows()
+        ]),
+        'all_destinations': dedupe_test_endpoints([
+            {
+                'value': transfer['destination'],
+                'port': str(transfer.get('destination_port', '') or '').strip(),
+            }
+            for _, transfer in transfers_df.iterrows()
+        ]),
+        'terminal_destinations': dedupe_test_endpoints(terminal_destinations),
+    }
+
+
+def dedupe_test_endpoints(endpoints):
+    """Remove duplicate endpoints while keeping order."""
+    seen = set()
+    result = []
+    for endpoint in endpoints:
+        key = endpoint_key(endpoint['value'])
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(endpoint)
+    return result
+
+
+def get_endpoint_root(endpoint):
+    """Return the normalized root path for an endpoint."""
+    _, root = endpoint_key(endpoint['value'])
+    return root
+
+
+def join_test_path(root, folder_name):
+    """Join a normalized root with a test folder name."""
+    return os.path.join(root, folder_name)
+
+
+def shell_target(user, host):
+    """Format a target suitable for ssh."""
+    if user:
+        return '{0}@{1}'.format(user, host)
+    return host
+
+
+def run_remote_shell(user, host, command, port=''):
+    """Run a shell command over ssh."""
+    cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
+    if port:
+        cmd.extend(['-p', str(port)])
+    cmd.extend([shell_target(user, host), command])
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate()
+    return proc.returncode, stdout.decode('utf-8'), stderr.decode('utf-8')
+
+
+def create_test_folder(endpoint, folder_name):
+    """Create a test folder with a marker file under a source root."""
+    root = get_endpoint_root(endpoint)
+    test_dir = join_test_path(root, folder_name)
+    marker_path = os.path.join(test_dir, RUN_TEST_FILE_NAME)
+    marker_text = "landingzones run-tests marker for {0}\n".format(folder_name)
+    user, host, _ = parse_remote_destination(endpoint['value'])
+    port = endpoint.get('port', '')
+
+    if host:
+        command = "mkdir -p {0} && printf %s {1} > {2}".format(
+            shell_path(test_dir),
+            shlex.quote(marker_text),
+            shell_path(marker_path),
+        )
+        rc, _, stderr = run_remote_shell(user, host, command, port)
+        if rc != 0:
+            raise ValueError(
+                "Cannot create test folder on {0}: {1}".format(
+                    shell_target(user, host), stderr.strip()
+                )
+            )
+        return
+
+    os.makedirs(test_dir)
+    with open(marker_path, 'w') as handle:
+        handle.write(marker_text)
+
+
+def cleanup_test_folder(endpoint, folder_name):
+    """Remove a test folder from a source or destination root."""
+    root = get_endpoint_root(endpoint)
+    test_dir = join_test_path(root, folder_name)
+    user, host, _ = parse_remote_destination(endpoint['value'])
+    port = endpoint.get('port', '')
+
+    if host:
+        command = "rm -rf {0}".format(shell_path(test_dir))
+        rc, _, stderr = run_remote_shell(user, host, command, port)
+        if rc != 0:
+            raise ValueError(
+                "Cannot clean test folder on {0}: {1}".format(
+                    shell_target(user, host), stderr.strip()
+                )
+            )
+        return
+
+    if os.path.isdir(test_dir):
+        shutil.rmtree(test_dir)
+
+
+def test_folder_exists(endpoint, folder_name):
+    """Check whether a test folder exists under an endpoint root."""
+    root = get_endpoint_root(endpoint)
+    test_dir = join_test_path(root, folder_name)
+    marker_path = os.path.join(test_dir, RUN_TEST_FILE_NAME)
+    user, host, _ = parse_remote_destination(endpoint['value'])
+    port = endpoint.get('port', '')
+
+    if host:
+        command = '[ -f {0} ] && echo EXISTS || echo MISSING'.format(
+            shell_path(marker_path)
+        )
+        rc, stdout, stderr = run_remote_shell(user, host, command, port)
+        if rc != 0:
+            return False, "Remote check failed: {0}".format(stderr.strip())
+        return 'EXISTS' in stdout, marker_path
+
+    return os.path.isfile(marker_path), marker_path
+
+
+def prepare_run_test_environment(test_plan, folder_name):
+    """Create one unique test folder in each true source root."""
+    cleanup_errors = []
+    for endpoint in test_plan['all_destinations'] + test_plan['all_sources']:
+        try:
+            cleanup_test_folder(endpoint, folder_name)
+        except ValueError as exc:
+            cleanup_errors.append(str(exc))
+    if cleanup_errors:
+        raise ValueError('\n'.join(cleanup_errors))
+
+    for endpoint in test_plan['initial_sources']:
+        create_test_folder(endpoint, folder_name)
+
+
+def build_test_runtime_overrides(config_file, transfers_file, test_root):
+    """Build runtime overrides for generated script output and test locks/logs."""
+    config.load_config(config_file=config_file)
+    return {
+        'config_file': config_file,
+        'transfers_file': transfers_file,
+        'crontab_dir': os.path.join(test_root, 'generated', 'crontab.d'),
+        'log_dir': os.path.join(test_root, 'generated', 'log'),
+    }
+
+
+def load_run_test_transfers(
+    transfers_file, current_system, current_user, output_file, base_dir
+):
+    """Write the current system/user transfer subset for run-tests."""
+    df = parse_transfers_file(transfers_file)
+    df = df[(df['system'] == current_system) & (df['users'] == current_user)].copy()
+    if df.empty:
+        raise ValueError(
+            "No transfers found for user '{0}' on system '{1}'".format(
+                current_user, current_system
+            )
+        )
+    placeholder_mask = (
+        df['source'].astype(str).str.contains(r'\$LZ_TEST_ROOT', regex=True)
+        | df['destination'].astype(str).str.contains(r'\$LZ_TEST_ROOT', regex=True)
+    )
+    skipped = int(placeholder_mask.sum())
+    df = df[~placeholder_mask].copy()
+    if df.empty:
+        raise ValueError(
+            "No real transfers found for user '{0}' on system '{1}'. "
+            "run-tests ignores placeholder test rows containing $LZ_TEST_ROOT.".format(
+                current_user, current_system
+            )
+        )
+    for column in ('source', 'destination'):
+        df[column] = df[column].apply(
+            lambda value: absolutize_local_endpoint(value, base_dir)
+        )
+    df.to_csv(output_file, sep='\t', index=False)
+    df.attrs['skipped_placeholder_rows'] = skipped
+    return df
+
+
+def build_runtime_test_dataframe(transfers_df, test_root):
+    """Redirect run-test logging and locking into the temporary workspace."""
+    transfers_df = transfers_df.copy()
+    log_dir = os.path.join(test_root, 'generated', 'log')
+    flock_dir = os.path.join(test_root, 'generated', 'flock')
+
+    transfers_df['log_file'] = transfers_df['identifiers'].apply(
+        lambda ident: os.path.join(log_dir, '{0}.log'.format(ident))
+    )
+    transfers_df['flock_file'] = transfers_df['identifiers'].apply(
+        lambda ident: os.path.join(flock_dir, '{0}.lock'.format(ident))
+    )
+    return transfers_df
+
+
+def generate_test_scripts(runtime_overrides, scripts_dir, test_root):
+    """Generate shell scripts and cron files for the current transfer subset."""
+    from landingzones import generate_cron_files as gcf
+
+    config.load_config(**runtime_overrides)
+    transfers_df = gcf.parse_transfers_file(config.transfers_file)
+    transfers_df = build_runtime_test_dataframe(transfers_df, test_root)
+    os.makedirs(config.crontab_dir)
+    os.makedirs(config.log_dir)
+    os.makedirs(scripts_dir)
+
+    grouped = transfers_df.groupby('system_user')
+    for system_user, group_df in grouped:
+        for _, transfer in group_df.iterrows():
+            script_path = os.path.join(scripts_dir, transfer['script_name'])
+            script_content = gcf.generate_script_content(transfer)
+            with open(script_path, 'w') as handle:
+                handle.write(script_content)
+            os.chmod(script_path, 0o755)
+
+        cron_path = os.path.join(
+            config.crontab_dir, "{0}.Landing_Zone.cron".format(system_user)
+        )
+        with open(cron_path, 'w') as handle:
+            handle.write(gcf.generate_cron_file(system_user, group_df, scripts_dir))
+
+    return transfers_df
+
+
+def run_generated_scripts(transfers_df, scripts_dir, test_root):
+    """Execute generated scripts in transfer order."""
+    env = os.environ.copy()
+    env['LZ_TEST_ROOT'] = test_root
+    env['LZ_DEBUG_CLI'] = '1'
+    env.setdefault('TMPDIR', test_root)
+    results = []
+
+    for _, transfer in transfers_df.iterrows():
+        script_path = os.path.join(scripts_dir, transfer['script_name'])
+        proc = subprocess.Popen(
+            ['/bin/sh', script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=test_root,
+        )
+        stdout, stderr = proc.communicate()
+        results.append({
+            'identifier': transfer['identifiers'],
+            'script_path': script_path,
+            'log_file': transfer.get('log_file', ''),
+            'returncode': proc.returncode,
+            'stdout': stdout.decode('utf-8'),
+            'stderr': stderr.decode('utf-8'),
+        })
+    return results
+
+
+def validate_script_test_results(test_plan, folder_name):
+    """Validate that the test folder reached each terminal destination."""
+    errors = []
+    for endpoint in test_plan['terminal_destinations']:
+        exists, marker_path = test_folder_exists(endpoint, folder_name)
+        if not exists:
+            errors.append("Test folder missing at terminal destination: {0}".format(marker_path))
+    return errors
+
+
+def run_local_script_tests(config_file=None, transfers_file=None, keep_test_env=False):
+    """Run generated scripts against the real transfer roots using a marker folder."""
+    print_header("Transfer Script Tests")
+    snapshot = _snapshot_config_state()
+    test_root = None
+    folder_name = None
+    current_system = None
+    current_user = None
+
+    try:
+        work_root = os.getcwd()
+        config.load_config(
+            config_file=config_file,
+            transfers_file=transfers_file,
+        )
+        transfers_path = transfers_file or config.transfers_file
+        current_system = get_current_system()
+        current_user = get_current_user()
+        test_root = create_test_root()
+        print_status("Test workspace", "INFO", test_root)
+        os.makedirs(test_root, exist_ok=True)
+
+        subset_file = os.path.join(test_root, 'run_tests.transfers.tsv')
+        subset_df = load_run_test_transfers(
+            transfers_path, current_system, current_user, subset_file, work_root
+        )
+        skipped_placeholder_rows = subset_df.attrs.get('skipped_placeholder_rows', 0)
+        if skipped_placeholder_rows:
+            print_status(
+                "Skipped placeholder transfers",
+                "INFO",
+                "Ignored {0} row(s) containing $LZ_TEST_ROOT".format(
+                    skipped_placeholder_rows
+                ),
+            )
+        test_plan = build_run_test_plan(subset_df)
+        folder_name = "lz_check_{0}".format(datetime.now().strftime('%Y%m%dT%H%M%S'))
+        prepare_run_test_environment(test_plan, folder_name)
+        print_status(
+            "Seeded test folders",
+            "OK",
+            "Prepared {0} starting location(s)".format(
+                len(test_plan['initial_sources'])
+            ),
+        )
+        runtime_overrides = build_test_runtime_overrides(
+            config_file, subset_file, test_root
+        )
+        if get_test_flock_path() == '/usr/bin/true':
+            print_status(
+                "Flock fallback",
+                "WARN",
+                "No flock binary found on PATH; run-tests are running without lock enforcement",
+            )
+        scripts_dir = os.path.join(test_root, 'generated', 'scripts')
+        transfers_df = generate_test_scripts(runtime_overrides, scripts_dir, test_root)
+
+        print_status(
+            "Generated test scripts",
+            "OK",
+            "Prepared {0} scripts".format(len(transfers_df)),
+        )
+
+        run_results = run_generated_scripts(transfers_df, scripts_dir, test_root)
+        failed_runs = [result for result in run_results if result['returncode'] != 0]
+        if failed_runs:
+            first_failure = failed_runs[0]
+            log_excerpt = ''
+            log_file = first_failure.get('log_file', '')
+            if log_file and os.path.exists(log_file):
+                with open(log_file, 'r') as handle:
+                    log_excerpt = handle.read().strip()
+            details = (
+                "{0} failed with exit code {1}\nstdout:\n{2}\nstderr:\n{3}".format(
+                    first_failure['identifier'],
+                    first_failure['returncode'],
+                    first_failure['stdout'].strip(),
+                    first_failure['stderr'].strip(),
+                )
+            )
+            if log_excerpt:
+                details = "{0}\nlog:\n{1}".format(details, log_excerpt)
+            print_status("Script execution", "ERROR", details)
+            return False
+
+        print_status(
+            "Script execution",
+            "OK",
+            "Executed {0} generated scripts".format(len(run_results)),
+        )
+
+        validation_errors = validate_script_test_results(test_plan, folder_name)
+        if validation_errors:
+            print_status(
+                "Script validation",
+                "ERROR",
+                "\n".join(validation_errors),
+            )
+            return False
+
+        print_status(
+            "Script validation",
+            "OK",
+            "Test folder reached all terminal destinations",
+        )
+        return True
+    finally:
+        _restore_config_state(snapshot)
+        if folder_name:
+            cleanup_errors = []
+            try:
+                cleanup_config_path = transfers_file or config.transfers_file
+                if cleanup_config_path:
+                    config.load_config(
+                        config_file=config_file,
+                        transfers_file=cleanup_config_path,
+                    )
+                if current_system is None:
+                    current_system = get_current_system()
+                if current_user is None:
+                    current_user = get_current_user()
+                cleanup_df = parse_transfers_file(transfers_file or config.transfers_file)
+                cleanup_df = cleanup_df[
+                    (cleanup_df['system'] == current_system)
+                    & (cleanup_df['users'] == current_user)
+                ].copy()
+                if not cleanup_df.empty:
+                    cleanup_plan = build_run_test_plan(cleanup_df)
+                    for endpoint in cleanup_plan['all_destinations'] + cleanup_plan['all_sources']:
+                        try:
+                            cleanup_test_folder(endpoint, folder_name)
+                        except ValueError as exc:
+                            cleanup_errors.append(str(exc))
+            except Exception as exc:
+                cleanup_errors.append(str(exc))
+            if cleanup_errors:
+                print_status(
+                    "Run-tests cleanup",
+                    "WARN",
+                    "\n".join(cleanup_errors),
+                )
+            else:
+                print_status(
+                    "Run-tests cleanup",
+                    "OK",
+                    "Removed test folders from source and destination roots",
+                )
+        if test_root and os.path.isdir(test_root):
+            if keep_test_env:
+                print_status("Test workspace retained", "INFO", test_root)
+            else:
+                shutil.rmtree(test_root)
+                print_status("Test workspace cleanup", "OK", "Removed temporary test data")
 
 
 def check_required_tools():
@@ -149,13 +708,29 @@ def check_local_directory(path, description, check_writable=True):
 
 
 def parse_remote_destination(destination):
-    """Parse remote destination into components"""
-    if '@' in destination and ':' in destination:
-        # Format: user@host:/path
-        user_host, path = destination.split(':', 1)
-        user, host = user_host.split('@', 1)
-        return user, host, path
-    return None, None, destination  # Local path
+    """Parse a transfer endpoint into remote target components."""
+    value = str(destination).strip() if destination is not None else ''
+    if ':' not in value:
+        return None, None, value
+
+    remote, path = value.split(':', 1)
+    if not remote or not path or '/' in remote:
+        return None, None, value
+
+    if '@' in remote:
+        user, host = remote.split('@', 1)
+        if user and host:
+            return user, host, path
+        return None, None, value
+
+    return None, remote, path
+
+
+def build_ssh_target(user, host):
+    """Build an ssh target string from parsed endpoint parts."""
+    if user:
+        return '{0}@{1}'.format(user, host)
+    return host
 
 
 def check_ssh_connection(user, host, port=None):
@@ -164,7 +739,7 @@ def check_ssh_connection(user, host, port=None):
         cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
         if port:
             cmd.extend(['-p', str(port)])
-        cmd.extend(['{0}@{1}'.format(user, host), 'echo', 'SSH_TEST_OK'])
+        cmd.extend([build_ssh_target(user, host), 'echo', 'SSH_TEST_OK'])
         
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = proc.communicate()
@@ -181,16 +756,22 @@ def check_ssh_connection(user, host, port=None):
         return False, "SSH test error: {0}".format(str(e))
 
 
-def check_remote_directory(user, host, path, port=None, description="Remote directory"):
-    """Check if remote directory exists and is writable"""
+def check_remote_directory(
+    user, host, path, port=None, description="Remote directory", check_writable=True
+):
+    """Check if a remote directory exists and is optionally writable."""
     try:
         cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
         if port:
             cmd.extend(['-p', str(port)])
         
-        # Check if directory exists and is writable
-        test_cmd = '[ -d "{0}" ] && [ -w "{0}" ] && echo "DIR_OK" || echo "DIR_FAIL"'.format(path)
-        cmd.extend(['{0}@{1}'.format(user, host), test_cmd])
+        if check_writable:
+            test_cmd = (
+                '[ -d "{0}" ] && [ -w "{0}" ] && echo "DIR_OK" || echo "DIR_FAIL"'
+            ).format(path)
+        else:
+            test_cmd = '[ -d "{0}" ] && echo "DIR_OK" || echo "DIR_FAIL"'.format(path)
+        cmd.extend([build_ssh_target(user, host), test_cmd])
         
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = proc.communicate()
@@ -200,9 +781,12 @@ def check_remote_directory(user, host, path, port=None, description="Remote dire
         
         if result_returncode == 0:
             if 'DIR_OK' in result_stdout:
-                return True, "Directory exists and is writable"
-            else:
+                if check_writable:
+                    return True, "Directory exists and is writable"
+                return True, "Directory exists"
+            if check_writable:
                 return False, "Directory does not exist or is not writable"
+            return False, "Directory does not exist"
         else:
             return False, "Remote check failed: {0}".format(result_stderr.strip())
     
@@ -555,6 +1139,16 @@ def main():
         default=None,
         help='Path to transfers.tsv file (overrides config file)'
     )
+    parser.add_argument(
+        '--run-tests',
+        action='store_true',
+        help='Generate and execute local script tests from prod toy data without deploying cron'
+    )
+    parser.add_argument(
+        '--keep-test-env',
+        action='store_true',
+        help='Keep the timestamped local script-test workspace instead of removing it'
+    )
     args = parser.parse_args()
     
     # Load configuration from file and/or command line arguments
@@ -562,6 +1156,13 @@ def main():
         config_file=args.config,
         transfers_file=args.transfers
     )
+
+    if args.run_tests:
+        return run_local_script_tests(
+            config_file=args.config,
+            transfers_file=args.transfers,
+            keep_test_env=args.keep_test_env,
+        )
     
     print("{0}{1}".format(Colors.BOLD, Colors.BLUE))
     print("╔══════════════════════════════════════════════════════════════╗")
@@ -626,8 +1227,40 @@ def main():
         transfer_ok = True
         
         # Check source directory
-        if not check_local_directory(transfer['source'], "Source directory"):
-            transfer_ok = False
+        source_user, source_host, source_path = parse_remote_destination(
+            transfer['source']
+        )
+        source_port = transfer.get('source_port', '')
+        source_port = str(source_port) if source_port is not None else ''
+        source_port = (
+            source_port if source_port and source_port != 'nan' and source_port.strip()
+            else None
+        )
+
+        if source_host:
+            ssh_ok, ssh_msg = check_ssh_connection(source_user, source_host, source_port)
+            print_status(
+                "SSH connection to source {0}".format(source_host),
+                "OK" if ssh_ok else "ERROR",
+                ssh_msg,
+            )
+            if ssh_ok:
+                dir_ok, dir_msg = check_remote_directory(
+                    source_user,
+                    source_host,
+                    source_path,
+                    source_port,
+                    "Source directory",
+                    check_writable=False,
+                )
+                print_status("Source directory", "OK" if dir_ok else "ERROR", dir_msg)
+                if not dir_ok:
+                    transfer_ok = False
+            else:
+                transfer_ok = False
+        else:
+            if not check_local_directory(transfer['source'], "Source directory"):
+                transfer_ok = False
         
         # Check destination
         user, host, dest_path = parse_remote_destination(transfer['destination'])
@@ -637,9 +1270,10 @@ def main():
         port = str(port) if port is not None else ''
         port = port if port and port != 'nan' and port.strip() else None
         
-        if user and host:
+        if host:
             # Remote destination
-            print("\n  Remote destination: {0}@{1}:{2}".format(user, host, dest_path))
+            remote_label = build_ssh_target(user, host)
+            print("\n  Remote destination: {0}:{1}".format(remote_label, dest_path))
             if port:
                 print("  Using port: {0}".format(port))
             

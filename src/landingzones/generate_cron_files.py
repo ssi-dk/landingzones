@@ -112,13 +112,6 @@ def normalize_source_path(source):
     return path
 
 
-def source_uses_directory_iteration(source):
-    """Return True when the source should be processed one top-level dir at a time."""
-    _, source_path = split_remote_path(source)
-    value = str(source_path).strip() if source_path is not None else ''
-    return value.endswith('/*') or value.endswith('*')
-
-
 def normalize_io_nice(io_nice):
     """Normalize io_nice input to a shell command prefix or empty string."""
     value = str(io_nice).strip() if io_nice is not None else ''
@@ -166,6 +159,11 @@ def shell_path(value):
     text = str(value)
     escaped = text.replace('\\', '\\\\').replace('"', '\\"')
     return '"{0}"'.format(escaped)
+
+
+def escape_local_shell_vars(value):
+    """Prevent the local shell from expanding variables meant for a remote path."""
+    return str(value).replace('$', '\\$')
 
 
 def build_ssh_command(remote, port=''):
@@ -225,7 +223,7 @@ def build_staging_paths(destination, identifier):
 def build_promote_command(destination_dir, staging_dir, remote=None, port=''):
     """Move staged content into the final destination."""
     move_cmd = (
-        "find {0} -mindepth 1 -maxdepth 1 -exec mv {{}} {1}/ \\;".format(
+        "find {0} -mindepth 1 -maxdepth 1 ! -name '.staging' -exec mv {{}} {1}/ \\;".format(
             shell_quote(staging_dir),
             shell_quote(destination_dir),
         )
@@ -409,12 +407,11 @@ def build_transfer_commands(transfer):
     source_remote, source_path = split_remote_path(find_target)
     find_path = source_path if source_remote else find_target
     find_inner_cmd = "find {0} -mindepth 1 -type d -empty -delete".format(
-        shell_quote(find_path) if source_remote else shell_path(find_path)
+        shell_path(find_path) if source_remote else shell_path(find_path)
     )
     if source_remote:
-        find_cmd = '{0} "{1}"'.format(
-            build_ssh_command(source_remote, source_port),
-            find_inner_cmd,
+        find_cmd = build_remote_shell_command(
+            find_inner_cmd, source_remote, source_port
         )
     else:
         find_cmd = find_inner_cmd
@@ -479,131 +476,7 @@ def build_transfer_command(transfer):
 
 def generate_script_content(transfer):
     """Generate shell script content for a transfer."""
-    if source_uses_directory_iteration(transfer['source']):
-        return generate_iterative_script_content(transfer)
-    commands = build_transfer_commands(transfer)
-    source_exists_cmd, source_root = build_source_exists_command(
-        transfer['source'],
-        transfer.get('source_port', ''),
-    )
-    return """#!/bin/sh
-set -eu
-
-log_file="{0}"
-latest_log_file="{1}"
-mini_log_file="{2}"
-flock_file="{3}"
-run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.rsync.XXXXXX")"
-cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.cleanup.XXXXXX")"
-promote_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.promote.XXXXXX")"
-
-cleanup() {{
-    rm -f "$run_log" "$cleanup_log" "$promote_log"
-}}
-debug_enabled() {{
-    [ -t 1 ] || [ "${{LZ_DEBUG_CLI:-0}}" = "1" ]
-}}
-
-log_status() {{
-    printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" >> "$mini_log_file"
-}}
-
-debug() {{
-    if debug_enabled; then
-        printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" >&2
-    fi
-}}
-
-dump_debug_log() {{
-    label="$1"
-    path="$2"
-    if debug_enabled && [ -s "$path" ]; then
-        debug "$label follows"
-        cat "$path" >&2
-    fi
-}}
-
-on_exit() {{
-    status=$?
-    if [ "$status" -ne 0 ]; then
-        debug "script failed with exit code $status"
-        dump_debug_log "run log" "$run_log"
-        dump_debug_log "promote log" "$promote_log"
-        dump_debug_log "cleanup log" "$cleanup_log"
-    fi
-    cleanup
-    exit "$status"
-}}
-trap on_exit EXIT HUP INT TERM
-
-mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")"
-debug "using lock file $flock_file"
-
-exec 9>"$flock_file"
-if ! {5} -n 9; then
-    debug "lock busy, exiting"
-    exit 0
-fi
-
-if ! {6}; then
-    log_status "{7}"
-    printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "{7}" >> "$log_file"
-    debug "{7}"
-    exit 0
-fi
-
-log_status "{8} initiated"
-debug "{8} initiated"
-{9}
-if {10} >"$run_log" 2>&1; then
-    rsync_status=0
-else
-    rsync_status=$?
-fi
-cat "$run_log" >> "$log_file"
-
-if [ "$rsync_status" -ne 0 ]; then
-    printf '%s\\n' "rsync failed with exit code $rsync_status" >> "$log_file"
-    cat "$run_log" > "$latest_log_file"
-    exit "$rsync_status"
-fi
-
-{11} >"$promote_log" 2>&1
-if [ -s "$promote_log" ]; then
-    cat "$promote_log" >> "$log_file"
-fi
-log_status "{8} completed"
-debug "{8} completed"
-
-{12} >"$cleanup_log" 2>&1
-if [ -s "$cleanup_log" ]; then
-    cat "$cleanup_log" >> "$log_file"
-fi
-
-if sed '/^sending incremental file list$/d; /^sent .* bytes .*$/d; /^total size is .*$/d; /^$/d' "$run_log" | grep -q .; then
-    cat "$run_log" > "$latest_log_file"
-    if [ -s "$promote_log" ]; then
-        cat "$promote_log" >> "$latest_log_file"
-    fi
-    if [ -s "$cleanup_log" ]; then
-        cat "$cleanup_log" >> "$latest_log_file"
-    fi
-fi
-""".format(
-        commands['log_file'],
-        commands['latest_log_file'],
-        commands['mini_log_file'],
-        commands['flock_file'],
-        sanitize_identifier(transfer.get('identifiers', 'transfer')),
-        commands['flock_command'],
-        source_exists_cmd,
-        'source directory missing: {0}'.format(source_root),
-        sanitize_identifier(transfer.get('identifiers', 'transfer')),
-        commands['prepare_cmd'],
-        commands['rsync_cmd'],
-        commands['promote_cmd'],
-        commands['find_cmd'],
-    )
+    return generate_iterative_script_content(transfer)
 
 
 def generate_iterative_script_content(transfer):
@@ -656,14 +529,28 @@ def generate_iterative_script_content(transfer):
         ).format(shell_path(source_root))
         rsync_source = '"$source_dir/"'
 
+    remote_destination_setup = ''
+    runtime_destination_root = destination_root
     if destination_remote:
-        mkdir_cmd = '{0} "mkdir -p \\"{1}/.staging/$dir_name\\""'.format(
+        if '$' in destination_root or destination_root.startswith('~'):
+            runtime_destination_root = '${resolved_destination_root}'
+            remote_destination_setup = (
+                'resolved_destination_root="$({0} \'printf %s "{1}"\')"\n'
+            ).format(
+                build_ssh_command(destination_remote, destination_port),
+                destination_root.replace('"', '\\"'),
+            )
+        if runtime_destination_root == '${resolved_destination_root}':
+            escaped_destination_root = runtime_destination_root
+        else:
+            escaped_destination_root = escape_local_shell_vars(runtime_destination_root)
+        mkdir_cmd = '{0} "mkdir -p \\"{1}\\""'.format(
             build_ssh_command(destination_remote, destination_port),
-            destination_root,
+            "{0}/.staging/$dir_name".format(escaped_destination_root),
         )
         promote_cmd = (
             '{0} "if [ -d \\"{1}/$dir_name\\" ]; then '
-            'find \\"{1}/.staging/$dir_name\\" -mindepth 1 -maxdepth 1 -exec mv {{}} \\"{1}/$dir_name/\\" \\; && '
+            'find \\"{1}/.staging/$dir_name\\" -mindepth 1 -maxdepth 1 ! -name \\".staging\\" -exec mv {{}} \\"{1}/$dir_name/\\" \\; && '
             'rmdir \\"{1}/.staging/$dir_name\\" 2>/dev/null || true; '
             'else '
             'mv \\"{1}/.staging/$dir_name\\" \\"{1}/$dir_name\\"; '
@@ -671,17 +558,17 @@ def generate_iterative_script_content(transfer):
             'rmdir \\"{1}/.staging\\" 2>/dev/null || true"'
         ).format(
             build_ssh_command(destination_remote, destination_port),
-            destination_root,
+            escaped_destination_root,
         )
         rsync_destination = '"{0}:{1}/.staging/$dir_name/"'.format(
             destination_remote,
-            destination_root,
+            escaped_destination_root,
         )
     else:
         mkdir_cmd = 'mkdir -p "{0}/.staging/$dir_name"'.format(destination_root)
         promote_cmd = (
             'if [ -d "{0}/$dir_name" ]; then '
-            'find "{0}/.staging/$dir_name" -mindepth 1 -maxdepth 1 -exec mv {{}} "{0}/$dir_name"/ \\; && '
+            'find "{0}/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {{}} "{0}/$dir_name"/ \\; && '
             'rmdir "{0}/.staging/$dir_name" 2>/dev/null || true; '
             'else '
             'mv "{0}/.staging/$dir_name" "{0}/$dir_name"; '
@@ -742,7 +629,7 @@ trap on_exit EXIT HUP INT TERM
 
 mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")"
 debug "using lock file $flock_file"
-
+{15} 
 exec 9>"$flock_file"
 if ! {5} -n 9; then
     debug "lock busy, exiting"
@@ -806,6 +693,7 @@ fi
         rsync_destination,
         promote_cmd,
         commands['find_cmd'],
+        remote_destination_setup.rstrip(),
     )
 
 
@@ -827,6 +715,20 @@ def get_deployed_script_path(system, script_name):
     """Return the configured deployed script path for a system."""
     script_dir = config.get_rit_managed_path(system, 'sh_output')
     return os.path.join(script_dir, script_name)
+
+
+def remove_stale_generated_scripts(scripts_dir, expected_script_names):
+    """Delete orphaned generated shell scripts from the output directory."""
+    if not os.path.isdir(scripts_dir):
+        return
+
+    expected = set(expected_script_names)
+    for entry in os.listdir(scripts_dir):
+        if not entry.endswith('.sh'):
+            continue
+        if entry in expected:
+            continue
+        os.remove(os.path.join(scripts_dir, entry))
 
 
 def generate_cron_file(system_user, transfers_df, scripts_dir):
@@ -934,6 +836,11 @@ def main():
         print("Consider adjusting your transfers.tsv to avoid conflicts.")
         print("Continuing with generation...\n")
     
+    remove_stale_generated_scripts(
+        scripts_dir,
+        transfers_df['script_name'].dropna().tolist(),
+    )
+
     # Group by system_user and generate cron files
     grouped = transfers_df.groupby('system_user')
 
