@@ -570,6 +570,12 @@ class TestGenerateRsyncCommand:
         assert 'cat "$run_log" >> "$log_file"' in script
         assert 'mini_log_file="/tmp/test.log.mini"' in script
         assert "printf '%s %s\\n'" in script
+        assert 'common_status_log_file="output/log/Landing_Zone_server1.transfers.tsv"' in script
+        assert 'common_status_lock_file="output/flock/Landing_Zone_server1.transfers.lock"' in script
+        assert "printf 'datetime\\tidentifier\\tdirectory\\tsource\\tdestination\\tstatus\\n'" in script
+        assert 'append_common_status "initiated" "$dir_name" "$current_run_source" "$current_run_destination"' in script
+        assert 'append_common_status "completed" "$dir_name" "$current_run_source" "$current_run_destination"' in script
+        assert 'append_common_status "error" "$current_run" "$current_run_source" "$current_run_destination"' in script
         assert 'mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")"' in script
         assert 'dump_debug_log "run log" "$run_log"' in script
         assert 'dump_debug_log "promote log" "$promote_log"' in script
@@ -581,6 +587,7 @@ class TestGenerateRsyncCommand:
         assert 'log_status "$dir_name completed"' in script
         assert 'if ! [ -d "/source" ]; then' in script
         assert 'source directory missing: /source' in script
+        assert 'append_common_status "error" "" "/source" "/dest"' in script
         assert 'latest_log_file="/tmp/test.log.latest"' in script
         assert 'cat "$run_log" > "$latest_log_file"' in script
 
@@ -640,6 +647,8 @@ class TestGenerateRsyncCommand:
         assert 'rsync -av --remove-source-files "$source_dir/" "output/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'mv "output/.staging/$dir_name" "output/$dir_name"' in script
         assert 'find "output/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {} "output/$dir_name"/ \\;' in script
+        assert 'current_run_source="$source_dir"' in script
+        assert 'current_run_destination="output/$dir_name"' in script
         assert 'log_status "$dir_name initiated"' in script
         assert 'log_status "$dir_name completed"' in script
         assert 'find "input" -mindepth 1 -type d -empty -delete >"$cleanup_log" 2>&1' in script
@@ -674,6 +683,7 @@ class TestGenerateRsyncCommand:
         assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' "$source_dir/" "user@host:/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'ssh -p 2222 user@host "if [ -d \\"/dest/$dir_name\\" ]; then ' in script
         assert 'find \\"/dest/.staging/$dir_name\\" -mindepth 1 -maxdepth 1 ! -name \\".staging\\" -exec mv {} \\"/dest/$dir_name/\\" \\;' in script
+        assert 'current_run_destination="user@host:/dest/$dir_name"' in script
         assert 'if ! [ -d "/source" ]; then' in script
         assert 'source directory missing: /source' in script
 
@@ -702,6 +712,8 @@ class TestGenerateRsyncCommand:
 
         assert "ssh -p 2200 user@remote 'find \"/source\" -mindepth 1 -maxdepth 1 -type d ! -name \".*\" -print' | while IFS= read -r source_dir; do" in script
         assert 'rsync -av --remove-source-files -e \'ssh -p 2200\' "user@remote:$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
+        assert 'current_run_source="user@remote:$source_dir"' in script
+        assert 'current_run_destination="/dest/$dir_name"' in script
         assert 'if ! ssh -p 2200 user@remote \'[ -d "/source" ]\'; then' in script
         assert 'source directory missing: /source' in script
 

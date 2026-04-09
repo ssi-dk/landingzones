@@ -301,6 +301,20 @@ def resolve_transfer_file_paths(df):
     return df
 
 
+def get_common_status_log_file(system):
+    """Return the shared per-system TSV status log path."""
+    safe_system = sanitize_identifier(system) or 'system'
+    filename = "Landing_Zone_{0}.transfers.tsv".format(safe_system)
+    return config.resolve_managed_file_path(system, filename, 'log')
+
+
+def get_common_status_lock_file(system):
+    """Return the shared per-system lock path used for TSV appends."""
+    safe_system = sanitize_identifier(system) or 'system'
+    filename = "Landing_Zone_{0}.transfers.lock".format(safe_system)
+    return config.resolve_managed_file_path(system, filename, 'flock')
+
+
 def check_overlapping_sources(df):
     """Check for overlapping source paths that could cause conflicts.
     
@@ -477,6 +491,8 @@ def build_transfer_commands(transfer):
     latest_log_file = "{0}.latest".format(log_file) if log_file else ''
     mini_log_file = "{0}.mini".format(log_file) if log_file else ''
     flock_command = config.get_flock_path(transfer['system'])
+    common_status_log_file = get_common_status_log_file(transfer['system'])
+    common_status_lock_file = get_common_status_lock_file(transfer['system'])
 
     return {
         'prepare_cmd': prepare_cmd,
@@ -488,6 +504,8 @@ def build_transfer_commands(transfer):
         'mini_log_file': mini_log_file,
         'flock_file': flock_file,
         'flock_command': flock_command,
+        'common_status_log_file': common_status_log_file,
+        'common_status_lock_file': common_status_lock_file,
     }
 
 
@@ -524,6 +542,7 @@ def generate_iterative_script_content(transfer):
     """Generate shell script content that scans source dirs and stages each one."""
     source = transfer['source']
     destination = transfer['destination']
+    identifier = str(transfer.get('identifiers', 'transfer') or 'transfer')
     source_remote, source_path = split_remote_path(source)
     destination_remote, destination_path = split_remote_path(destination)
     commands = build_transfer_commands(transfer)
@@ -618,16 +637,43 @@ def generate_iterative_script_content(transfer):
         ).format(destination_root)
         rsync_destination = '"{0}/.staging/$dir_name/"'.format(destination_root)
 
+    if source_remote:
+        run_source_expr = '"{0}:$source_dir"'.format(source_remote)
+        transfer_source_label = "{0}:{1}".format(source_remote, source_root)
+    else:
+        run_source_expr = '"$source_dir"'
+        transfer_source_label = source_root
+
+    if destination_remote:
+        run_destination_expr = '"{0}:{1}/$dir_name"'.format(
+            destination_remote,
+            escaped_destination_root,
+        )
+        transfer_destination_label = "{0}:{1}".format(
+            destination_remote,
+            runtime_destination_root,
+        )
+    else:
+        run_destination_expr = '"{0}/$dir_name"'.format(destination_root)
+        transfer_destination_label = destination_root
+
     return """#!/bin/sh
 set -eu
 
-log_file="{0}"
-latest_log_file="{1}"
-mini_log_file="{2}"
-flock_file="{3}"
-run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.rsync.XXXXXX")"
-cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.cleanup.XXXXXX")"
-promote_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{4}.promote.XXXXXX")"
+log_file="{log_file}"
+latest_log_file="{latest_log_file}"
+mini_log_file="{mini_log_file}"
+flock_file="{flock_file}"
+common_status_log_file="{common_status_log_file}"
+common_status_lock_file="{common_status_lock_file}"
+transfer_identifier="{transfer_identifier}"
+run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.rsync.XXXXXX")"
+cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.cleanup.XXXXXX")"
+promote_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.promote.XXXXXX")"
+current_run=""
+current_run_source=""
+current_run_destination=""
+current_run_completed=0
 
 cleanup() {{
     rm -f "$run_log" "$cleanup_log" "$promote_log"
@@ -638,6 +684,32 @@ debug_enabled() {{
 
 log_status() {{
     printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" >> "$mini_log_file"
+}}
+
+sanitize_tsv_field() {{
+    printf '%s' "$1" | tr '\\t\\r\\n' '   '
+}}
+
+append_common_status() {{
+    event_status="$1"
+    event_directory="${{2:-}}"
+    event_source="${{3:-}}"
+    event_destination="${{4:-}}"
+    event_timestamp="$(date '+%Y-%m-%d %H:%M:%S%z')"
+    (
+        exec 8>>"$common_status_lock_file"
+        {flock_command} 8
+        if [ ! -s "$common_status_log_file" ]; then
+            printf 'datetime\\tidentifier\\tdirectory\\tsource\\tdestination\\tstatus\\n' >> "$common_status_log_file"
+        fi
+        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \\
+            "$(sanitize_tsv_field "$event_timestamp")" \\
+            "$(sanitize_tsv_field "$transfer_identifier")" \\
+            "$(sanitize_tsv_field "$event_directory")" \\
+            "$(sanitize_tsv_field "$event_source")" \\
+            "$(sanitize_tsv_field "$event_destination")" \\
+            "$(sanitize_tsv_field "$event_status")" >> "$common_status_log_file"
+    ) || debug "unable to append common status row"
 }}
 
 debug() {{
@@ -658,6 +730,12 @@ dump_debug_log() {{
 on_exit() {{
     status=$?
     if [ "$status" -ne 0 ]; then
+        if [ -n "$current_run" ] && [ "$current_run_completed" -eq 0 ]; then
+            log_status "$current_run error"
+            append_common_status "error" "$current_run" "$current_run_source" "$current_run_destination"
+        else
+            append_common_status "error" "" "{transfer_source_label}" "{transfer_destination_label}"
+        fi
         debug "script failed with exit code $status"
         dump_debug_log "run log" "$run_log"
         dump_debug_log "promote log" "$promote_log"
@@ -668,34 +746,45 @@ on_exit() {{
 }}
 trap on_exit EXIT HUP INT TERM
 
-mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")"
+mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")" "$(dirname "$common_status_log_file")" "$(dirname "$common_status_lock_file")"
 debug "using lock file $flock_file"
-{15} 
+{remote_destination_setup}
 exec 9>"$flock_file"
-if ! {5} -n 9; then
+if ! {flock_command} -n 9; then
     debug "lock busy, exiting"
     exit 0
 fi
 
-if ! {6}; then
-    log_status "{7}"
-    printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "{7}" >> "$log_file"
-    debug "{7}"
+if ! {source_exists_cmd}; then
+    log_status "{missing_source_message}"
+    append_common_status "error" "" "{transfer_source_label}" "{transfer_destination_label}"
+    printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "{missing_source_message}" >> "$log_file"
+    debug "{missing_source_message}"
     exit 0
 fi
 
 : >"$run_log"
 : >"$promote_log"
-{8}
+{source_loop}
     [ -n "$source_dir" ] || continue
     dir_name=$(basename "$source_dir")
+    current_run="$dir_name"
+    current_run_source={run_source_expr}
+    current_run_destination={run_destination_expr}
+    current_run_completed=0
     log_status "$dir_name initiated"
+    append_common_status "initiated" "$dir_name" "$current_run_source" "$current_run_destination"
     debug "$dir_name initiated"
-    {9} </dev/null >>"$promote_log" 2>&1
-    {10} {11} {12} </dev/null >>"$run_log" 2>&1
-    {13} </dev/null >>"$promote_log" 2>&1
+    {mkdir_cmd} </dev/null >>"$promote_log" 2>&1
+    {rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$run_log" 2>&1
+    {promote_cmd} </dev/null >>"$promote_log" 2>&1
     log_status "$dir_name completed"
+    append_common_status "completed" "$dir_name" "$current_run_source" "$current_run_destination"
     debug "$dir_name completed"
+    current_run_completed=1
+    current_run=""
+    current_run_source=""
+    current_run_destination=""
 done
 if [ -s "$run_log" ]; then
     cat "$run_log" >> "$log_file"
@@ -704,7 +793,7 @@ if [ -s "$promote_log" ]; then
     cat "$promote_log" >> "$log_file"
 fi
 
-{14} >"$cleanup_log" 2>&1
+{find_cmd} >"$cleanup_log" 2>&1
 if [ -s "$cleanup_log" ]; then
     cat "$cleanup_log" >> "$log_file"
 fi
@@ -719,22 +808,29 @@ if sed '/^sending incremental file list$/d; /^sent .* bytes .*$/d; /^total size 
     fi
 fi
 """.format(
-        commands['log_file'],
-        commands['latest_log_file'],
-        commands['mini_log_file'],
-        commands['flock_file'],
-        sanitize_identifier(transfer.get('identifiers', 'transfer')),
-        commands['flock_command'],
-        source_exists_cmd,
-        'source directory missing: {0}'.format(source_root),
-        source_loop,
-        mkdir_cmd,
-        rsync_cmd,
-        rsync_source,
-        rsync_destination,
-        promote_cmd,
-        commands['find_cmd'],
-        remote_destination_setup.rstrip(),
+        log_file=commands['log_file'],
+        latest_log_file=commands['latest_log_file'],
+        mini_log_file=commands['mini_log_file'],
+        flock_file=commands['flock_file'],
+        common_status_log_file=commands['common_status_log_file'],
+        common_status_lock_file=commands['common_status_lock_file'],
+        transfer_identifier=identifier.replace('"', '\\"'),
+        script_stem=sanitize_identifier(identifier),
+        flock_command=commands['flock_command'],
+        source_exists_cmd=source_exists_cmd,
+        missing_source_message='source directory missing: {0}'.format(source_root),
+        source_loop=source_loop,
+        run_source_expr=run_source_expr,
+        run_destination_expr=run_destination_expr,
+        mkdir_cmd=mkdir_cmd,
+        rsync_cmd=rsync_cmd,
+        rsync_source=rsync_source,
+        rsync_destination=rsync_destination,
+        promote_cmd=promote_cmd,
+        find_cmd=commands['find_cmd'],
+        transfer_source_label=transfer_source_label.replace('"', '\\"'),
+        transfer_destination_label=transfer_destination_label.replace('"', '\\"'),
+        remote_destination_setup=remote_destination_setup.rstrip(),
     )
 
 

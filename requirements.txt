@@ -1,6 +1,7 @@
 # Requirements for Landing Zone
 
 # Core
+matplotlib>=3.5.0
 pandas>=1.0.0
 
 # Testing
