@@ -34,7 +34,7 @@ def make_log_df():
         ("2026-04-10 07:20:00+0200", "promote_calc", "beta", "/flow/stage/beta", "/flow/final/beta", "error"),
         ("2026-04-10 08:00:00+0200", "stage_lab", "gamma", "/source/inbox/gamma", "/flow/stage/gamma", "initiated"),
         ("2026-04-10 09:15:00+0200", "promote_calc", "gamma", "/flow/stage/gamma", "/flow/final/gamma", "completed"),
-        ("2026-04-10 08:30:00+0200", "stage_lab", "delta", "/source/inbox/delta", "/flow/stage/delta", "initiated"),
+        ("2026-04-10 07:30:00+0200", "stage_lab", "delta", "/source/inbox/delta", "/flow/stage/delta", "initiated"),
         ("2026-04-10 09:30:00+0200", "stage_lab", "epsilon", "/source/inbox/epsilon", "/flow/stage/epsilon", "initiated"),
         ("2026-04-10 09:35:00+0200", "promote_calc", "epsilon", "/flow/stage/epsilon", "/flow/final/epsilon", "error"),
         ("2026-04-10 09:45:00+0200", "pullback", "epsilon", "/flow/final/epsilon", "/flow/archive/epsilon", "completed"),
@@ -172,7 +172,7 @@ def test_render_dashboard_includes_tables_truncation_and_anchor_time(tmp_path):
     assert "Anchor time: 2026-04-10 09:45:00+0200" in html_output
     assert "Unfinished Runs (Last 7 days)" in html_output
     assert "Recent Successes (Last 7 days)" in html_output
-    assert "Showing 10 most recent unfinished runs; and 4 more." in html_output
+    assert "Showing 10 most recent unfinished runs; and 5 more." in html_output
     assert "Showing 10 most recent successes; and 4 more." in html_output
     assert "warning" in html_output
     assert "in progress" in html_output
