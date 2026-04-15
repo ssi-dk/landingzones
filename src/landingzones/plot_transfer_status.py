@@ -70,11 +70,34 @@ def load_transfer_log(path):
     if df.empty:
         return df
     df = df.copy()
-    df["datetime"] = pd.to_datetime(df["datetime"], format="%Y-%m-%d %H:%M:%S%z")
+    column_aliases = {
+        "event_time_utc": "datetime",
+        "transfer_identifier": "identifier",
+        "source_path": "source",
+        "destination_path": "destination",
+    }
+    for source_column, target_column in column_aliases.items():
+        if source_column in df.columns and target_column not in df.columns:
+            df[target_column] = df[source_column]
+    if "directory" not in df.columns and "run_name" in df.columns:
+        df["directory"] = df["run_name"]
+
+    df["datetime"] = pd.to_datetime(df["datetime"])
     for column in ("identifier", "directory", "source", "destination", "status"):
         if column in df.columns:
             df[column] = df[column].fillna("").astype(str).str.strip()
+    if "run_id" in df.columns:
+        df["run_id"] = df["run_id"].fillna("").astype(str).str.strip()
+    else:
+        df["run_id"] = ""
+    if "run_name" in df.columns:
+        df["run_name"] = df["run_name"].fillna("").astype(str).str.strip()
+    else:
+        df["run_name"] = df["directory"]
     df["directory_suffix"] = df["directory"].apply(normalize_directory_suffix)
+    df["run_group"] = df["run_id"]
+    empty_run_group = df["run_group"] == ""
+    df.loc[empty_run_group, "run_group"] = df.loc[empty_run_group, "directory_suffix"]
     df = df.sort_values(["datetime", "identifier", "directory"]).reset_index(drop=True)
     return df
 
@@ -184,10 +207,23 @@ def aggregate_runs(log_df, terminal_identifiers, anchor_time=None, warning_hours
     """Aggregate event rows into run-level health records."""
     if log_df.empty:
         return pd.DataFrame()
+    log_df = log_df.copy()
+    if "run_id" not in log_df.columns:
+        log_df["run_id"] = ""
+    if "run_name" not in log_df.columns:
+        log_df["run_name"] = log_df.get("directory", "")
+    if "directory_suffix" not in log_df.columns:
+        log_df["directory_suffix"] = log_df["directory"].apply(normalize_directory_suffix)
+    if "run_group" not in log_df.columns:
+        log_df["run_group"] = log_df["run_id"].fillna("").astype(str).str.strip()
+        empty_run_group = log_df["run_group"] == ""
+        log_df.loc[empty_run_group, "run_group"] = log_df.loc[
+            empty_run_group, "directory_suffix"
+        ]
     anchor = anchor_time or log_df["datetime"].max()
     records = []
 
-    for directory_suffix, run_rows in log_df.groupby("directory_suffix", sort=False):
+    for run_group, run_rows in log_df.groupby("run_group", sort=False):
         rows = run_rows.sort_values("datetime").reset_index(drop=True)
         initiated_rows = rows[rows["status"] == "initiated"].sort_values("datetime")
         started_at = (
@@ -209,7 +245,9 @@ def aggregate_runs(log_df, terminal_identifiers, anchor_time=None, warning_hours
         )
         records.append(
             {
-                "run": directory_suffix,
+                "run": rows.iloc[-1].get("run_name") or rows.iloc[-1]["directory_suffix"],
+                "run_group": run_group,
+                "run_id": rows.iloc[-1].get("run_id", ""),
                 "started_at": started_at,
                 "latest_start": latest_start,
                 "last_event_time": latest_row["datetime"],
@@ -662,12 +700,25 @@ def load_transfers_for_reporting(config_file=None, transfers_file=None):
     return load_transfer_metadata(config.transfers_file)
 
 
-def main():
+def resolve_report_input_path(input_path=None, config_file=None, transfers_file=None):
+    """Resolve the shared transfer TSV path from CLI input or config."""
+    if input_path:
+        return input_path
+    config.load_config(config_file=config_file, transfers_file=transfers_file)
+    return config.transfer_log_file
+
+
+def main(argv=None):
     """CLI entrypoint."""
     parser = argparse.ArgumentParser(
         description="Generate a transfer health dashboard from a shared TSV log",
     )
-    parser.add_argument("input", help="Path to the shared transfer TSV log")
+    parser.add_argument(
+        "input",
+        nargs="?",
+        default=None,
+        help="Path to the shared transfer TSV log (defaults to transfer_log_file from config)",
+    )
     parser.add_argument(
         "--output",
         "-o",
@@ -708,11 +759,21 @@ def main():
         default=None,
         help="Optional dashboard title override",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    system = args.system or infer_system_from_log_path(args.input)
-    output_path = args.output or build_default_output_path(args.input)
-    log_df = load_transfer_log(args.input)
+    input_path = resolve_report_input_path(
+        input_path=args.input,
+        config_file=args.config,
+        transfers_file=args.transfers_file,
+    )
+    if not input_path:
+        parser.error(
+            "missing transfer log path: pass INPUT or set transfer_log_file in config"
+        )
+
+    system = args.system or infer_system_from_log_path(input_path)
+    output_path = args.output or build_default_output_path(input_path)
+    log_df = load_transfer_log(input_path)
     transfers_df = load_transfers_for_reporting(
         config_file=args.config,
         transfers_file=args.transfers_file,

@@ -160,6 +160,18 @@ def unique_transfer_endpoints(transfers_df, column, port_column):
     return endpoints
 
 
+def parse_test_fixture_names(value):
+    """Parse an optional comma-separated fixture-name list."""
+    text = str(value).strip() if value is not None else ''
+    if not text or text == 'nan':
+        return []
+    return [
+        item.strip()
+        for item in text.split(',')
+        if item.strip()
+    ]
+
+
 def build_run_test_plan(transfers_df):
     """Build source/destination relationships for the real-transfer smoke test."""
     source_keys = {
@@ -169,24 +181,42 @@ def build_run_test_plan(transfers_df):
         endpoint_key(transfer['destination']) for _, transfer in transfers_df.iterrows()
     }
 
-    initial_sources = []
+    initial_source_map = {}
     terminal_destinations = []
     for _, transfer in transfers_df.iterrows():
         source_info = {
             'value': transfer['source'],
             'port': str(transfer.get('source_port', '') or '').strip(),
+            'test_fixture_names': parse_test_fixture_names(
+                transfer.get('test_fixture_names', '')
+            ),
         }
         destination_info = {
             'value': transfer['destination'],
             'port': str(transfer.get('destination_port', '') or '').strip(),
         }
         if endpoint_key(transfer['source']) not in destination_keys:
-            initial_sources.append(source_info)
+            source_key = endpoint_key(transfer['source'])
+            existing = initial_source_map.get(source_key)
+            if existing is None:
+                initial_source_map[source_key] = source_info
+            else:
+                merged_fixtures = []
+                seen_fixtures = set()
+                for fixture_name in (
+                    existing.get('test_fixture_names', []) +
+                    source_info.get('test_fixture_names', [])
+                ):
+                    if fixture_name in seen_fixtures:
+                        continue
+                    seen_fixtures.add(fixture_name)
+                    merged_fixtures.append(fixture_name)
+                existing['test_fixture_names'] = merged_fixtures
         if endpoint_key(transfer['destination']) not in source_keys:
             terminal_destinations.append(destination_info)
 
     return {
-        'initial_sources': dedupe_test_endpoints(initial_sources),
+        'initial_sources': list(initial_source_map.values()),
         'all_sources': dedupe_test_endpoints([
             {
                 'value': transfer['source'],
@@ -332,7 +362,24 @@ def build_test_with_data_seed_plan(test_plan, toy_data_root, test_tree_root):
         toy_data_dir = resolve_test_data_dir(
             endpoint, toy_data_root, test_tree_root
         )
-        entry_names = list_visible_directories(toy_data_dir)
+        fixture_names = endpoint.get('test_fixture_names', [])
+        if fixture_names:
+            entry_names = []
+            missing_fixtures = []
+            available_dirs = set(list_visible_directories(toy_data_dir))
+            for fixture_name in fixture_names:
+                if fixture_name in available_dirs:
+                    entry_names.append(fixture_name)
+                else:
+                    missing_fixtures.append(fixture_name)
+            if missing_fixtures:
+                raise ValueError(
+                    "Toy data directory missing configured fixture(s) for source root '{0}': {1}".format(
+                        get_endpoint_root(endpoint), ', '.join(missing_fixtures)
+                    )
+                )
+        else:
+            entry_names = list_visible_directories(toy_data_dir)
         if not entry_names:
             raise ValueError(
                 "Toy data directory contains no visible directories: {0}".format(
@@ -450,15 +497,18 @@ def load_test_with_data_transfers(
     return df
 
 
-def generate_test_scripts(transfers_df, scripts_dir, crontab_dir):
+def generate_test_scripts(transfers_df, scripts_dir, crontab_dir, validation_scripts_dir):
     """Generate shell scripts and cron files for the current transfer subset."""
     from landingzones import generate_cron_files as gcf
 
     os.makedirs(crontab_dir, exist_ok=True)
     os.makedirs(scripts_dir, exist_ok=True)
+    os.makedirs(validation_scripts_dir, exist_ok=True)
     gcf.remove_stale_generated_scripts(
         scripts_dir, transfers_df['script_name'].dropna().tolist()
     )
+    gcf.remove_stale_validation_scripts(validation_scripts_dir, transfers_df)
+    gcf.write_validation_scripts(validation_scripts_dir, transfers_df)
 
     grouped = transfers_df.groupby('system_user')
     for system_user, group_df in grouped:
@@ -478,7 +528,70 @@ def generate_test_scripts(transfers_df, scripts_dir, crontab_dir):
     return transfers_df
 
 
-def run_generated_scripts(transfers_df, scripts_dir, runtime_root=None):
+def read_log_excerpt(log_file, max_lines=10):
+    """Return a short trailing excerpt from a log file when it exists."""
+    if not log_file or log_file == 'nan' or not os.path.exists(log_file):
+        return ''
+
+    with open(log_file, 'r') as handle:
+        lines = handle.read().splitlines()
+
+    if not lines:
+        return ''
+    return '\n'.join(lines[-max_lines:])
+
+
+def format_script_result_summary(result):
+    """Format a compact execution summary for a generated test script."""
+    details = [
+        "Script: {0}".format(result['script_path']),
+        "Exit code: {0}".format(result['returncode']),
+    ]
+
+    stdout = result['stdout'].strip()
+    stderr = result['stderr'].strip()
+    log_excerpt = read_log_excerpt(result.get('log_file', ''))
+
+    if stdout:
+        details.append("stdout:\n{0}".format(stdout))
+    if stderr:
+        details.append("stderr:\n{0}".format(stderr))
+    if log_excerpt:
+        details.append("log tail:\n{0}".format(log_excerpt))
+
+    return '\n'.join(details)
+
+
+def prompt_to_continue(prompt_text):
+    """Pause until the operator confirms the next slow-mode step should run."""
+    prompt = "\n{0}{1}{2}".format(Colors.YELLOW, prompt_text, Colors.END)
+    print(prompt, end="")
+    try:
+        input()
+    except EOFError:
+        return
+    except KeyboardInterrupt:
+        print("\n{0}Slow integration run cancelled.{1}".format(
+            Colors.YELLOW, Colors.END
+        ))
+        raise SystemExit(130)
+
+
+def print_slow_step_summary(result, step_number, total_steps):
+    """Print a human-readable summary of the most recent integration step."""
+    print_header(
+        "Integration Step {0}/{1}: {2}".format(
+            step_number, total_steps, result['identifier']
+        )
+    )
+    print_status(
+        "Last step",
+        "OK" if result['returncode'] == 0 else "ERROR",
+        format_script_result_summary(result),
+    )
+
+
+def run_generated_scripts(transfers_df, scripts_dir, runtime_root=None, slow=False):
     """Execute generated scripts in transfer order."""
     env = os.environ.copy()
     env['LZ_DEBUG_CLI'] = '1'
@@ -489,7 +602,8 @@ def run_generated_scripts(transfers_df, scripts_dir, runtime_root=None):
         env.pop('LZ_TEST_ROOT', None)
     results = []
 
-    for _, transfer in transfers_df.iterrows():
+    total_steps = len(transfers_df)
+    for step_number, (_, transfer) in enumerate(transfers_df.iterrows(), start=1):
         script_path = os.path.join(scripts_dir, transfer['script_name'])
         proc = subprocess.Popen(
             ['/bin/sh', script_path],
@@ -499,14 +613,25 @@ def run_generated_scripts(transfers_df, scripts_dir, runtime_root=None):
             cwd=runtime_root or os.getcwd(),
         )
         stdout, stderr = proc.communicate()
-        results.append({
+        result = {
             'identifier': transfer['identifiers'],
             'script_path': script_path,
             'log_file': transfer.get('log_file', ''),
             'returncode': proc.returncode,
             'stdout': stdout.decode('utf-8'),
             'stderr': stderr.decode('utf-8'),
-        })
+        }
+        results.append(result)
+
+        if slow:
+            print_slow_step_summary(result, step_number, total_steps)
+            if step_number < total_steps:
+                next_identifier = transfers_df.iloc[step_number]['identifiers']
+                prompt_to_continue(
+                    "Press Enter to continue to the next step ({0})... ".format(
+                        next_identifier
+                    )
+                )
     return results
 
 
@@ -572,7 +697,7 @@ def ask_yes_no(prompt_text):
         return False
 
 
-def run_test_with_data(config_file=None, transfers_file=None):
+def run_test_with_data(config_file=None, transfers_file=None, slow=False):
     """Run generated scripts against seeded toy-data in the real test tree."""
     print_header("Transfer Test With Data")
     snapshot = _snapshot_config_state()
@@ -632,7 +757,10 @@ def run_test_with_data(config_file=None, transfers_file=None):
             )
         scripts_dir = config.get_rit_managed_path(current_system, 'sh_output')
         crontab_dir = config.get_rit_managed_path(current_system, 'crontabs')
-        generate_test_scripts(transfers_df, scripts_dir, crontab_dir)
+        validation_scripts_dir = config.validation_scripts_dir
+        generate_test_scripts(
+            transfers_df, scripts_dir, crontab_dir, validation_scripts_dir
+        )
 
         print_status(
             "Generated test scripts",
@@ -643,7 +771,9 @@ def run_test_with_data(config_file=None, transfers_file=None):
         expected_contents = build_test_with_data_expectations(
             transfers_df, seed_plan
         )
-        run_results = run_generated_scripts(transfers_df, scripts_dir)
+        run_results = run_generated_scripts(
+            transfers_df, scripts_dir, slow=slow
+        )
         failed_runs = [result for result in run_results if result['returncode'] != 0]
         if failed_runs:
             first_failure = failed_runs[0]
@@ -1197,8 +1327,8 @@ def deploy_cron_files(current_system, current_user=None):
         return False
 
 
-def main():
-    """Main verification function"""
+def main(argv=None):
+    """Main verification function."""
     # Parse command line arguments
     parser = argparse.ArgumentParser(
         description='Check deployment readiness for Landing Zone cron jobs'
@@ -1218,18 +1348,30 @@ def main():
         action='store_true',
         help='Seed toy data from config.test_data into the real test tree and execute the generated transfer scripts'
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        '--slow',
+        action='store_true',
+        help='With --test-with-data, print each completed step and wait for Enter before continuing'
+    )
+    parser.add_argument(
+        '--validation-scripts-dir',
+        default=None,
+        help='Directory containing generated validation wrappers (overrides config)'
+    )
+    args = parser.parse_args(argv)
     
     # Load configuration from file and/or command line arguments
     config.load_config(
         config_file=args.config,
-        transfers_file=args.transfers
+        transfers_file=args.transfers,
+        validation_scripts_dir=args.validation_scripts_dir,
     )
 
     if args.test_with_data:
         return run_test_with_data(
             config_file=args.config,
             transfers_file=args.transfers,
+            slow=args.slow,
         )
     
     print("{0}{1}".format(Colors.BOLD, Colors.BLUE))

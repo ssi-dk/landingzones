@@ -52,6 +52,88 @@ def test_normalize_directory_suffix_handles_paths_and_remote_prefixes():
     assert pts.normalize_directory_suffix("calck:/home/kimn/Landing_Zone/Illumina_TransferTest") == "Illumina_TransferTest"
 
 
+def test_load_transfer_log_supports_rich_event_schema(tmp_path):
+    path = tmp_path / "Landing_Zone_test_local.transfers.tsv"
+    path.write_text(
+        "\n".join([
+            "event_time_utc\ttransfer_identifier\tsystem\trun_id\trun_name\tflow_group\torigin_system\tentry_transfer_identifier\tcreated_at_utc\tdirectory\tsource_path\tdestination_path\tstatus\tmessage",
+            "2026-04-10T07:00:00Z\tstage_lab\ttest_local\trun-123\talpha\tflow_a\tseqbox01\tstage_lab\t2026-04-10T06:55:00Z\talpha\t/source/inbox/alpha\t/flow/stage/alpha\tinitiated\t",
+            "",
+        ])
+    )
+
+    df = pts.load_transfer_log(str(path))
+
+    assert df.loc[0, "identifier"] == "stage_lab"
+    assert df.loc[0, "source"] == "/source/inbox/alpha"
+    assert df.loc[0, "destination"] == "/flow/stage/alpha"
+    assert df.loc[0, "run_id"] == "run-123"
+    assert df.loc[0, "run_group"] == "run-123"
+    assert df.loc[0, "directory_suffix"] == "alpha"
+
+
+def test_main_uses_configured_transfer_log_file_when_input_omitted(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.yaml"
+    log_path = tmp_path / "Landing_Zone_test_local.transfers.tsv"
+    config_file.write_text(
+        "transfers_file: /tmp/transfers.tsv\n"
+        "transfer_log_file: {0}\n".format(log_path)
+    )
+
+    captured = {}
+
+    def fake_load_transfer_log(path):
+        captured["log_path"] = path
+        return pd.DataFrame(
+            [
+                {
+                    "datetime": pd.Timestamp("2026-04-10T07:00:00Z"),
+                    "identifier": "stage_lab",
+                    "directory": "alpha",
+                    "source": "/source/inbox/alpha",
+                    "destination": "/flow/stage/alpha",
+                    "status": "initiated",
+                    "run_id": "run-123",
+                    "run_name": "alpha",
+                    "directory_suffix": "alpha",
+                    "run_group": "run-123",
+                }
+            ]
+        )
+
+    def fake_load_transfers_for_reporting(config_file=None, transfers_file=None):
+        captured["config_file"] = config_file
+        captured["transfers_file"] = transfers_file
+        return pd.DataFrame(
+            [
+                {
+                    "identifiers": "stage_lab",
+                    "system": "test_local",
+                    "source": "/source/inbox/*",
+                    "destination": "/flow/stage/",
+                }
+            ]
+        )
+
+    def fake_create_transfer_dashboard(log_df, transfers_df, system, output_path, **kwargs):
+        captured["system"] = system
+        captured["output_path"] = output_path
+        return output_path
+
+    monkeypatch.setattr(pts, "load_transfer_log", fake_load_transfer_log)
+    monkeypatch.setattr(pts, "load_transfers_for_reporting", fake_load_transfers_for_reporting)
+    monkeypatch.setattr(pts, "create_transfer_dashboard", fake_create_transfer_dashboard)
+
+    rc = pts.main(["--config", str(config_file), "--system", "test_local"])
+
+    assert rc == 0
+    assert captured["log_path"] == str(log_path)
+    assert captured["config_file"] == str(config_file)
+    assert captured["transfers_file"] is None
+    assert captured["system"] == "test_local"
+    assert captured["output_path"] == str(tmp_path / "Landing_Zone_test_local.transfers.health_dashboard.html")
+
+
 def test_build_flow_graph_identifies_terminal_identifier(tmp_path):
     transfers_df = pts.load_transfer_metadata(str(make_transfers_tsv(tmp_path)))
 

@@ -13,6 +13,7 @@ Configuration priority (highest to lowest):
 
 Example config.yaml:
     transfers_file: config/transfers.tsv
+    transfer_log_file: output/log/Landing_Zone_test_local.transfers.tsv
     log_dir: log
     output_dir: output
     crontab_dir: output/crontab.d
@@ -28,6 +29,7 @@ Example config.yaml:
     input_dir: input
     default_lock_file: /tmp/landingzones.lock
     default_cron_frequency: "*/15 * * * *"
+    validation_scripts_dir: output/validation_scripts
 """
 
 import os
@@ -105,11 +107,13 @@ class Config:
         - LZ_CONFIG_FILE: Path to config.yaml file
         - LZ_TRANSFERS_FILE: Path to transfers.tsv
         - LZ_TEST_DATA: Path to toy test data for --test-with-data
+        - LZ_TRANSFER_LOG_FILE: Path to the shared/common transfer TSV for reporting
         - LZ_LOCK_FILE: Path to default lock file
         - LZ_LOG_DIR: Default log directory
         - LZ_OUTPUT_DIR: Default output directory
         - LZ_INPUT_DIR: Default input directory
         - LZ_CRONTAB_DIR: Default crontab output directory
+        - LZ_VALIDATION_SCRIPTS_DIR: Default validation wrapper output directory
         - LZ_CRON_FREQUENCY: Default cron schedule expression
     """
     
@@ -140,6 +144,7 @@ class Config:
                 - log_dir
                 - output_dir
                 - crontab_dir
+                - validation_scripts_dir
                 - rit_managed_locations
                 - flock_paths
                 - rit_managed_folder_structure
@@ -189,6 +194,11 @@ class Config:
     def transfers_file(self):
         """Path to the transfers.tsv configuration file"""
         return self._get_value('transfers_file', 'LZ_TRANSFERS_FILE', 'config/transfers.tsv')
+
+    @property
+    def transfer_log_file(self):
+        """Path to the shared/common transfer TSV used for reporting."""
+        return self._get_value('transfer_log_file', 'LZ_TRANSFER_LOG_FILE', '')
     
     @property
     def default_lock_file(self):
@@ -221,6 +231,16 @@ class Config:
         # Special case: crontab_dir defaults to output_dir/crontab.d
         default = os.path.join(self.output_dir, 'crontab.d')
         return self._get_value('crontab_dir', 'LZ_CRONTAB_DIR', default)
+
+    @property
+    def validation_scripts_dir(self):
+        """Default output directory for generated validation wrapper scripts."""
+        default = os.path.join(self.output_dir, 'validation_scripts')
+        return self._get_value(
+            'validation_scripts_dir',
+            'LZ_VALIDATION_SCRIPTS_DIR',
+            default,
+        )
 
     @property
     def rit_managed_locations(self):
@@ -317,6 +337,7 @@ class Config:
             'output_dir': self.output_dir,
             'input_dir': self.input_dir,
             'crontab_dir': self.crontab_dir,
+            'validation_scripts_dir': self.validation_scripts_dir,
             'rit_managed_locations': self.rit_managed_locations,
             'flock_paths': self.flock_paths,
             'rit_managed_folder_structure': self.rit_managed_folder_structure,

@@ -8,15 +8,20 @@ Automated data transfer system using rsync with cron job generation.
 # Install
 pip install -e .
 
-# Generate cron files
-lz-generate-cron --help
-lz-generate-cron
+# Generate cron files, transfer scripts, and validation wrappers
+landingzones --help
+landingzones --config config/config.yaml build
+landingzones build
 
 # Check deployment readiness
-lz-check-deployment
+landingzones validate deployment
+
+# Run a hop-local validation
+landingzones validate hop <flow_group> preflight
+landingzones validate hop <flow_group>
 
 # Run toy data through the configured flows
-lz-check-deployment --test-with-data
+landingzones validate integration
 ```
 
 ## Project Structure
@@ -24,16 +29,20 @@ lz-check-deployment --test-with-data
 ```
 landingzones/
 ├── src/landingzones/           # Main package
+│   ├── cli.py                  # Top-level operator CLI
 │   ├── generate_cron_files.py  # Cron generation tool
 │   ├── check_deployment_readiness.py
+│   ├── plot_transfer_status.py
 │   └── config/transfers.tsv    # Default config
 ├── input/                      # Default input directory
 ├── output/                     # Default output directory
-│   └── crontab.d/             # Generated cron files
+│   ├── crontab.d/              # Generated cron files
+│   ├── scripts/                # Generated transfer scripts
+│   └── validation_scripts/     # Generated validation wrappers
 ├── log/                        # Default log directory
 ├── tests/                      # Test suite
-├── setup.py                    # Package config
-└── requirements.txt            # Dependencies
+├── pyproject.toml              # Package config
+└── README.md
 ```
 
 ## Configuration
@@ -65,13 +74,19 @@ local_copy	localhost	testuser	input/*		output/				transfers.log	landingzones.loc
 
 ```bash
 # Generate cron files with defaults
-lz-generate-cron
+landingzones build
 
 # Check deployment readiness
-lz-check-deployment
+landingzones validate deployment
+
+# Run a hop-local validation wrapper through the CLI
+landingzones validate hop <flow_group>
 
 # Seed toy data and run the real scripts/logs/locks
-lz-check-deployment --test-with-data
+landingzones validate integration
+
+# Generate an HTML health dashboard from a shared transfer TSV log
+landingzones report transfers output/log/Landing_Zone_calc.transfers.tsv
 ```
 
 ### Generated Cron Format
@@ -109,15 +124,65 @@ pytest --cov=landingzones --cov-report=html
 pytest tests/test_generate_cron_files.py::TestClassName::test_method
 ```
 
-### Test With Data
+### Validation Modes
 
-`--test-with-data` is the integration-style test mode. It copies toy data into the configured starting locations, generates the real shell scripts, and runs the transfers using the normal log and flock paths. After a successful run the data should be visible in the terminal destinations unless you choose cleanup at the prompt.
+The operator-facing validation surface has three modes:
+
+- `landingzones validate deployment`
+- `landingzones validate hop <flow_group> [preflight|run]`
+- `landingzones validate integration`
+
+`landingzones validate integration` is the heavier integration-style test mode. It copies toy data into the configured starting locations, generates the real shell scripts, and runs the transfers using the normal log and flock paths.
+Use `landingzones validate integration --slow` when you want the harness to print the result of each completed step and wait for Enter before running the next one.
+
+### Generated Validation Wrappers
+
+Each `flow_group` with exactly one `is_entry_point=TRUE` row gets a generated wrapper in the configured validation-scripts directory:
+
+```text
+output/validation_scripts/lz_run_validation_<flow_group>.sh
+```
+
+Use `landingzones validate hop <flow_group>` as the main interface. The generated wrapper remains available directly and bakes in:
+
+- the entry directory for that flow
+- the immediate next hop for preflight checks
+- the default fixture directory under `test_data`
+- the `flow_group` and producer labels used in the `LZTEST_...` folder name
+
+Typical usage:
+
+```bash
+# Regenerate scripts after changing config/transfers
+landingzones --config config/config.yaml build
+
+# Check only the current hop structure and immediate next-hop access
+landingzones validate hop local_labnet_to_calc_seqdata preflight
+
+# Inject a validation run with the baked-in defaults
+landingzones validate hop local_labnet_to_calc_seqdata
+
+# Inject a validation run with an explicit token suffix
+landingzones validate hop local_labnet_to_calc_seqdata --token ABCD
+
+# Direct wrapper execution still works if needed
+./output/validation_scripts/lz_run_validation_local_labnet_to_calc_seqdata.sh
+```
+
+Wrapper/CLI behavior:
+
+- no action defaults to `run`
+- `preflight` checks only the current hop plus its immediate next hop
+- options-only invocation such as `--token ABCD` also defaults to `run`
+
+Use `landingzones validate hop` for lightweight producer-side validation. Use `landingzones validate integration` when you want the heavier integration test that seeds toy data and executes the full generated transfer chain.
 
 Required config in your deployment `config.yaml`:
 
 ```yaml
 transfers_file: input/transfers.tsv
 test_data: tests/toy_data/
+validation_scripts_dir: output/validation_scripts/
 rit_managed_locations:
   test_local: tests/test_local
 flock_paths:
@@ -145,8 +210,11 @@ How to run it:
 # Run from the deployment root that owns config/, input/, and tests/
 cd deploy/local
 
-# Generate and execute the transfer scripts with toy data
-lz-check-deployment --config config/config.yaml --test-with-data
+# Generate deployment artifacts
+landingzones build --config config/config.yaml
+
+# Run the heavier integration test
+landingzones --config config/config.yaml validate integration
 ```
 
 What it does:
@@ -163,7 +231,7 @@ After a successful run it asks whether you want cleanup. Answer `y` to remove th
 ## Deployment
 
 1. Configure `transfers.tsv` with your routes
-2. Generate cron files: `lz-generate-cron`
+2. Generate cron files: `landingzones build`
 3. Deploy:
    ```bash
    cp output/crontab.d/*.cron ~/crontab.d/
@@ -172,7 +240,7 @@ After a successful run it asks whether you want cleanup. Answer `y` to remove th
 
 Or use automated deployment:
 ```bash
-lz-check-deployment
+landingzones validate deployment
 ```
 
 ## Development
@@ -183,7 +251,7 @@ lz-check-deployment
 pytest
 
 # Test CLI
-lz-generate-cron --help
+landingzones --help
 ```
 
 ## Requirements

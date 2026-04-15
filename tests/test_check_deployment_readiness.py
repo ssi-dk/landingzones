@@ -500,6 +500,7 @@ class TestTestWithData:
                 'source_port': '',
                 'destination': str(tmp_path / 'mid') + '/',
                 'destination_port': '',
+                'test_fixture_names': 'fixture_one',
             },
             {
                 'identifiers': 'step2',
@@ -515,6 +516,7 @@ class TestTestWithData:
         assert [cdr.get_endpoint_root(item) for item in plan['initial_sources']] == [
             str(tmp_path / 'source')
         ]
+        assert plan['initial_sources'][0]['test_fixture_names'] == ['fixture_one']
         assert [cdr.get_endpoint_root(item) for item in plan['terminal_destinations']] == [
             str(tmp_path / 'final')
         ]
@@ -560,6 +562,34 @@ class TestTestWithData:
         assert seed_plan[0]['toy_data_dir'] == str(toy_data_root)
         assert seed_plan[0]['entry_names'] == ['flow_one']
 
+    def test_build_test_with_data_seed_plan_filters_configured_fixtures(
+        self, tmp_path
+    ):
+        """Configured fixture names should restrict which toy-data runs get seeded."""
+        toy_data_root = tmp_path / 'tests' / 'toy_data' / 'shared_seed'
+        toy_data_root.mkdir(parents=True)
+        (toy_data_root / 'Illumina_TransferTest').mkdir()
+        (toy_data_root / 'Nanopore_TransferTest').mkdir()
+
+        test_plan = {
+            'initial_sources': [
+                {
+                    'value': str(tmp_path / 'somewhere' / 'source_root') + '/',
+                    'port': '',
+                    'test_fixture_names': ['Nanopore_TransferTest'],
+                }
+            ]
+        }
+
+        seed_plan = cdr.build_test_with_data_seed_plan(
+            test_plan,
+            str(tmp_path / 'tests' / 'toy_data'),
+            str(tmp_path),
+        )
+
+        assert seed_plan[0]['toy_data_dir'] == str(toy_data_root)
+        assert seed_plan[0]['entry_names'] == ['Nanopore_TransferTest']
+
     def test_run_generated_scripts_enables_debug_cli(self, tmp_path, monkeypatch):
         """Generated scripts should run with debug logging enabled in test-with-data."""
         script = tmp_path / 'sample.sh'
@@ -596,6 +626,96 @@ class TestTestWithData:
 
         assert results[0]['returncode'] == 0
         assert captured['env']['LZ_DEBUG_CLI'] == '1'
+
+    def test_run_generated_scripts_slow_mode_pauses_between_steps(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Slow mode should print a step summary and wait before the next script."""
+        for name in ('first.sh', 'second.sh'):
+            script = tmp_path / name
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+
+        first_log = tmp_path / 'first.log'
+        first_log.write_text("line one\nline two\n")
+
+        transfers_df = pd.DataFrame([
+            {
+                'identifiers': 'first',
+                'script_name': 'first.sh',
+                'log_file': str(first_log),
+            },
+            {
+                'identifiers': 'second',
+                'script_name': 'second.sh',
+                'log_file': str(tmp_path / 'second.log'),
+            },
+        ])
+
+        process_calls = []
+        prompts = []
+
+        class DummyProcess:
+            def __init__(self, args, stdout=None, stderr=None, env=None, cwd=None):
+                process_calls.append(args[1])
+                self.returncode = 0
+
+            def communicate(self):
+                script_name = os.path.basename(process_calls[-1])
+                return (
+                    "stdout from {0}\n".format(script_name).encode('utf-8'),
+                    b'',
+                )
+
+        monkeypatch.setattr(cdr.subprocess, 'Popen', DummyProcess)
+        monkeypatch.setattr(
+            'builtins.input',
+            lambda: prompts.append('continue') or '',
+        )
+
+        results = cdr.run_generated_scripts(
+            transfers_df,
+            str(tmp_path),
+            slow=True,
+        )
+        captured = capsys.readouterr()
+
+        assert [result['identifier'] for result in results] == ['first', 'second']
+        assert prompts == ['continue']
+        assert "Integration Step 1/2: first" in captured.out
+        assert "stdout from first.sh" in captured.out
+        assert "log tail:" in captured.out
+        assert "Press Enter to continue to the next step (second)" in captured.out
+
+    def test_main_passes_slow_flag_to_test_with_data(self, monkeypatch):
+        """The readiness CLI should forward --slow to test-with-data execution."""
+        captured = {}
+
+        monkeypatch.setattr(cdr.config, 'load_config', lambda **kwargs: None)
+
+        def fake_run_test_with_data(
+            config_file=None, transfers_file=None, slow=False
+        ):
+            captured['config_file'] = config_file
+            captured['transfers_file'] = transfers_file
+            captured['slow'] = slow
+            return True
+
+        monkeypatch.setattr(cdr, 'run_test_with_data', fake_run_test_with_data)
+
+        result = cdr.main([
+            '--config', 'config.yaml',
+            '--transfers', 'transfers.tsv',
+            '--test-with-data',
+            '--slow',
+        ])
+
+        assert result is True
+        assert captured == {
+            'config_file': 'config.yaml',
+            'transfers_file': 'transfers.tsv',
+            'slow': True,
+        }
 
 
 if __name__ == '__main__':
