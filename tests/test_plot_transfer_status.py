@@ -72,12 +72,12 @@ def test_load_transfer_log_supports_rich_event_schema(tmp_path):
     assert df.loc[0, "directory_suffix"] == "alpha"
 
 
-def test_main_uses_configured_transfer_log_file_when_input_omitted(tmp_path, monkeypatch):
+def test_main_uses_configured_report_transfer_log_file_when_input_omitted(tmp_path, monkeypatch):
     config_file = tmp_path / "config.yaml"
     log_path = tmp_path / "Landing_Zone_test_local.transfers.tsv"
     config_file.write_text(
         "transfers_file: /tmp/transfers.tsv\n"
-        "transfer_log_file: {0}\n".format(log_path)
+        "report_transfer_log_file: {0}\n".format(log_path)
     )
 
     captured = {}

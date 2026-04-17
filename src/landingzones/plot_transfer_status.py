@@ -742,11 +742,11 @@ def load_transfers_for_reporting(config_file=None, transfers_file=None):
 
 
 def resolve_report_input_path(input_path=None, config_file=None, transfers_file=None):
-    """Resolve the shared transfer TSV path from CLI input or config."""
+    """Resolve the default report TSV path from CLI input or config."""
     if input_path:
         return input_path
     config.load_config(config_file=config_file, transfers_file=transfers_file)
-    return config.transfer_log_file
+    return config.report_transfer_log_file
 
 
 def main(argv=None):
@@ -758,7 +758,7 @@ def main(argv=None):
         "input",
         nargs="?",
         default=None,
-        help="Path to the shared transfer TSV log (defaults to transfer_log_file from config)",
+        help="Path to the transfer TSV report input (defaults to report_transfer_log_file from config)",
     )
     parser.add_argument(
         "--output",
@@ -809,7 +809,7 @@ def main(argv=None):
     )
     if not input_path:
         parser.error(
-            "missing transfer log path: pass INPUT or set transfer_log_file in config"
+            "missing transfer log path: pass INPUT or set report_transfer_log_file in config"
         )
 
     system = args.system or infer_system_from_log_path(input_path)

@@ -13,7 +13,7 @@ Configuration priority (highest to lowest):
 
 Example config.yaml:
     transfers_file: config/transfers.tsv
-    transfer_log_file: output/log/Landing_Zone_test_local.transfers.tsv
+    report_transfer_log_file: output/log/Landing_Zone_test_local.transfers.tsv
     log_dir: log
     output_dir: output
     crontab_dir: output/crontab.d
@@ -107,7 +107,7 @@ class Config:
         - LZ_CONFIG_FILE: Path to config.yaml file
         - LZ_TRANSFERS_FILE: Path to transfers.tsv
         - LZ_TEST_DATA: Path to toy test data for --test-with-data
-        - LZ_TRANSFER_LOG_FILE: Path to the shared/common transfer TSV for reporting
+        - LZ_REPORT_TRANSFER_LOG_FILE: Path to the default transfer TSV used for reporting
         - LZ_LOCK_FILE: Path to default lock file
         - LZ_LOG_DIR: Default log directory
         - LZ_OUTPUT_DIR: Default output directory
@@ -210,9 +210,13 @@ class Config:
         return self._get_value('transfers_file', 'LZ_TRANSFERS_FILE', 'config/transfers.tsv')
 
     @property
-    def transfer_log_file(self):
-        """Path to the shared/common transfer TSV used for reporting."""
-        return self._get_value('transfer_log_file', 'LZ_TRANSFER_LOG_FILE', '')
+    def report_transfer_log_file(self):
+        """Path to the default transfer TSV input used for reporting commands."""
+        return self._get_value(
+            'report_transfer_log_file',
+            'LZ_REPORT_TRANSFER_LOG_FILE',
+            '',
+        )
     
     @property
     def default_lock_file(self):
@@ -362,6 +366,7 @@ class Config:
         return {
             'config_file': self.config_file,
             'transfers_file': self.transfers_file,
+            'report_transfer_log_file': self.report_transfer_log_file,
             'test_data': self.test_data,
             'default_lock_file': self.default_lock_file,
             'log_dir': self.log_dir,

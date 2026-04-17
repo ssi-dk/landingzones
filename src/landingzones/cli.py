@@ -129,7 +129,7 @@ def build_cli_parser():
         'input',
         nargs='?',
         default=None,
-        help='Optional path to the shared transfer TSV log; defaults to transfer_log_file from config',
+        help='Optional path to the transfer TSV report input; defaults to report_transfer_log_file from config',
     )
     report_transfers_parser.add_argument('--output', '-o', default=None)
     report_transfers_parser.add_argument('--config', '-c', default=None)

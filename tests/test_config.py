@@ -169,7 +169,7 @@ class TestConfigClass:
         """Test that Config loads values from config.yaml"""
         config_file = tmp_path / "config.yaml"
         config_file.write_text(
-            "transfer_log_file: shared/transfers.tsv\n"
+            "report_transfer_log_file: shared/transfers.tsv\n"
             "log_dir: custom_log\n"
             "output_dir: custom_output\n"
             "validation_scripts_dir: custom_validation\n"
@@ -184,7 +184,7 @@ class TestConfigClass:
         
         assert cfg.log_dir == 'custom_log'
         assert cfg.output_dir == 'custom_output'
-        assert cfg.transfer_log_file == 'shared/transfers.tsv'
+        assert cfg.report_transfer_log_file == 'shared/transfers.tsv'
         assert cfg.validation_scripts_dir == 'custom_validation'
         assert cfg.get_rit_managed_location('calc') == '/srv/rit_managed'
         assert cfg.get_rit_managed_location('unknown') == 'custom_output'
