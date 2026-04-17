@@ -215,6 +215,30 @@ class TestConfigClass:
         
         assert cfg.log_dir == 'from_env'
 
+    def test_path_variables_merge_env_yaml_and_runtime(self, tmp_path, monkeypatch):
+        """Config path variables should merge env, YAML, and runtime values."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "path_variables:\n"
+            "  YAML_ONLY: /yaml/root\n"
+            "  SHARED_ROOT: /yaml/shared\n"
+        )
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ENV_ONLY", "/env/root")
+        monkeypatch.setenv("SHARED_ROOT", "/env/shared")
+
+        cfg = config.Config()
+        cfg.load_config(path_variables={
+            'RUNTIME_ONLY': '/runtime/root',
+            'SHARED_ROOT': '/runtime/shared',
+        })
+
+        assert cfg.path_variables['ENV_ONLY'] == '/env/root'
+        assert cfg.path_variables['YAML_ONLY'] == '/yaml/root'
+        assert cfg.path_variables['RUNTIME_ONLY'] == '/runtime/root'
+        assert cfg.path_variables['SHARED_ROOT'] == '/runtime/shared'
+
     def test_rit_managed_paths_preserve_configured_paths(self, tmp_path, monkeypatch):
         """Test that rit_managed config values are preserved verbatim."""
         config_file = tmp_path / "config.yaml"
@@ -295,3 +319,24 @@ class TestLoadConfig:
         cfg.load_config(log_dir='override_log')
         
         assert cfg.log_dir == 'override_log'
+
+    def test_snapshot_and_restore_state(self, tmp_path, monkeypatch):
+        """Snapshots should restore YAML-backed and runtime config state."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "log_dir: from_yaml\n"
+            "output_dir: from_yaml_output\n"
+        )
+
+        monkeypatch.chdir(tmp_path)
+
+        cfg = config.Config()
+        snapshot = cfg.snapshot_state()
+
+        cfg.load_config(log_dir='override_log', output_dir='override_output')
+        assert cfg.log_dir == 'override_log'
+        assert cfg.output_dir == 'override_output'
+
+        cfg.restore_state(snapshot)
+        assert cfg.log_dir == 'from_yaml'
+        assert cfg.output_dir == 'from_yaml_output'

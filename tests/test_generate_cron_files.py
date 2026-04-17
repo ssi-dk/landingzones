@@ -214,6 +214,71 @@ server1_main\tserver1\tuser1\t/src/\tremotealias:$HOME/Landing_Zone/\t\t\t\t/tmp
         assert len(df) == 1
         assert df.iloc[0]['destination'] == 'remotealias:$HOME/Landing_Zone/'
 
+    def test_parse_expands_local_path_variables_from_config(self, tmp_path):
+        """Local source and destination paths should expand ${VAR} placeholders."""
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\tserver1\tuser1\t${SRC_ROOT}/input/\t${DST_ROOT}/output/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        snapshot = gcf.config.snapshot_state()
+        gcf.config.load_config(path_variables={
+            'SRC_ROOT': '/srv/dev/source',
+            'DST_ROOT': '/srv/dev/destination',
+        })
+        try:
+            df = gcf.parse_transfers_file(str(test_file))
+        finally:
+            gcf.config.restore_state(snapshot)
+
+        assert df.iloc[0]['source'] == '/srv/dev/source/input/'
+        assert df.iloc[0]['destination'] == '/srv/dev/destination/output/'
+
+    def test_parse_expands_remote_path_variables_without_touching_remote_shell_vars(self, tmp_path):
+        """Only the filesystem path segment of remote endpoints should expand."""
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\tserver1\tuser1\t${SRC_ROOT}/input/\tremotealias:${REMOTE_ROOT}/output/$HOME/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        snapshot = gcf.config.snapshot_state()
+        gcf.config.load_config(path_variables={
+            'SRC_ROOT': '/srv/dev/source',
+            'REMOTE_ROOT': '/srv/remote/root',
+        })
+        try:
+            df = gcf.parse_transfers_file(str(test_file))
+        finally:
+            gcf.config.restore_state(snapshot)
+
+        assert df.iloc[0]['source'] == '/srv/dev/source/input/'
+        assert df.iloc[0]['destination'] == 'remotealias:/srv/remote/root/output/$HOME/'
+
+    def test_parse_rejects_unresolved_path_variables(self, tmp_path):
+        """Unresolved ${VAR} placeholders should fail fast."""
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\tserver1\tuser1\t${SRC_ROOT}/input/\t${MISSING_ROOT}/output/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        snapshot = gcf.config.snapshot_state()
+        gcf.config.load_config(path_variables={
+            'SRC_ROOT': '/srv/dev/source',
+        })
+        try:
+            with pytest.raises(ValueError) as exc_info:
+                gcf.parse_transfers_file(str(test_file))
+        finally:
+            gcf.config.restore_state(snapshot)
+
+        message = str(exc_info.value)
+        assert "server1_main" in message
+        assert "destination" in message
+        assert "MISSING_ROOT" in message
+
     def test_parse_records_shared_file_pair_warnings(self, tmp_path):
         """Duplicate log/flock pairs should be surfaced as warnings."""
         tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
@@ -231,6 +296,25 @@ second\tserver1\tuser1\t/src2/\t/dest2/\t\t\t\t/tmp/shared.log\t/tmp/shared.lock
         assert "shared.lock" in warnings[0]
         assert "first" in warnings[0]
         assert "second" in warnings[0]
+
+    def test_parse_reporting_mode_allows_minimal_transfer_metadata(self, tmp_path):
+        """Reporting/analysis mode should not require runtime log fields."""
+        tsv_content = """identifiers\tenabled\tsystem\tusers\tsource\tdestination
+stage_lab\tTRUE\ttest_local\tlocal\t/source/inbox/*\t/flow/stage/
+promote_calc\tTRUE\ttest_local\tlocal\t/flow/stage/\t/flow/final/
+"""
+        test_file = tmp_path / "minimal_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        df = gcf.parse_transfers_file(
+            str(test_file),
+            require_runtime_files=False,
+        )
+
+        assert len(df) == 2
+        assert list(df["identifiers"]) == ["stage_lab", "promote_calc"]
+        assert (df["log_file"] == "").all()
+        assert (df["flock_file"] == "").all()
 
 
 class TestGenerateRsyncCommand:

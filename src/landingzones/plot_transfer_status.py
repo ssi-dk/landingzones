@@ -10,6 +10,13 @@ import re
 import pandas as pd
 
 from landingzones.config import config
+from landingzones.transfer_loading import (
+    definitions_for_system,
+    load_reporting_transfers,
+)
+from landingzones.transfer_definitions import (
+    normalize_transfer_path,
+)
 
 
 WINDOW_SPECS = (
@@ -31,25 +38,6 @@ def normalize_directory_suffix(value):
     if "/" in text:
         return text.rsplit("/", 1)[-1]
     return text
-
-
-def normalize_transfer_path(path, strip_wildcard=False):
-    """Normalize a source or destination path for graph matching."""
-    value = str(path).strip() if path is not None else ""
-    if not value or value == "nan":
-        return ""
-    remote = ""
-    inner = value
-    if ":" in value:
-        remote, inner = value.split(":", 1)
-    if strip_wildcard and inner.endswith("/*"):
-        inner = inner[:-2]
-    elif strip_wildcard and inner.endswith("*"):
-        inner = inner[:-1]
-    inner = inner.rstrip("/")
-    if remote:
-        return "{0}:{1}".format(remote, inner)
-    return inner
 
 
 def parse_window_spec(window, anchor_time):
@@ -103,18 +91,8 @@ def load_transfer_log(path):
 
 
 def load_transfer_metadata(transfers_file):
-    """Load transfer definitions needed to infer the flow graph."""
-    df = pd.read_csv(transfers_file, sep="\t")
-    df = df.copy()
-    if "system" in df.columns:
-        df = df[~df["system"].astype(str).str.startswith("#")]
-    if "enabled" in df.columns:
-        df["enabled"] = df["enabled"].fillna("").astype(str).str.strip().str.upper()
-        df = df[df["enabled"] == "TRUE"]
-    for column in ("identifiers", "system", "source", "destination"):
-        if column in df.columns:
-            df[column] = df[column].fillna("").astype(str).str.strip()
-    return df
+    """Load shared transfer definitions through the main parser pipeline."""
+    return load_reporting_transfers(transfers_file=transfers_file)
 
 
 def infer_system_from_log_path(path):
@@ -132,25 +110,28 @@ def build_flow_graph(transfers_df, system):
     system_df = transfers_df[transfers_df["system"] == system].copy()
     if system_df.empty:
         raise ValueError(
-            "No enabled transfers found for system '{0}' in {1}".format(
-                system,
-                config.transfers_file,
-            )
+            "No enabled transfers found for system '{0}'".format(system)
         )
-    system_df["source_root"] = system_df["source"].apply(
-        lambda value: normalize_transfer_path(value, strip_wildcard=True)
-    )
-    system_df["destination_root"] = system_df["destination"].apply(
-        lambda value: normalize_transfer_path(value, strip_wildcard=False)
-    )
-
-    edges = {identifier: set() for identifier in system_df["identifiers"]}
-    for _, upstream in system_df.iterrows():
-        for _, downstream in system_df.iterrows():
-            if upstream["identifiers"] == downstream["identifiers"]:
+    system_definitions = definitions_for_system(transfers_df, system)
+    edges = {
+        definition.identifier: set() for definition in system_definitions
+    }
+    for upstream in system_definitions:
+        upstream_destination = normalize_transfer_path(
+            upstream.destination,
+            strip_wildcard=False,
+        )
+        if not upstream_destination:
+            continue
+        for downstream in system_definitions:
+            if upstream.identifier == downstream.identifier:
                 continue
-            if upstream["destination_root"] and upstream["destination_root"] == downstream["source_root"]:
-                edges[upstream["identifiers"]].add(downstream["identifiers"])
+            downstream_source = normalize_transfer_path(
+                downstream.source,
+                strip_wildcard=True,
+            )
+            if upstream_destination == downstream_source:
+                edges[upstream.identifier].add(downstream.identifier)
 
     terminal_identifiers = sorted(
         identifier for identifier, children in edges.items() if not children
@@ -173,6 +154,54 @@ def format_timedelta(delta):
         parts.append("{0}h".format(hours))
     parts.append("{0}m".format(minutes))
     return " ".join(parts)
+
+
+def describe_state_logic(state, warning_hours):
+    """Return a human-readable explanation of the dashboard state heuristic."""
+    threshold_text = "{0:g}h".format(warning_hours)
+    descriptions = {
+        "success": (
+            "Success: a completed event exists on a terminal transfer and is "
+            "newer than any error event."
+        ),
+        "failed": "Failed: the most recent decisive event is an error event.",
+        "warning": (
+            "Warning: no newer terminal success or error exists, and the latest "
+            "initiated event is older than the {0} threshold."
+        ).format(threshold_text),
+        "in_progress": (
+            "In progress: no newer terminal success or error exists, and the "
+            "latest initiated event is within the {0} threshold."
+        ).format(threshold_text),
+    }
+    return descriptions.get(
+        state,
+        "State is derived from recent initiated, completed, and error events.",
+    )
+
+
+def render_status_badge(state, warning_hours):
+    """Render a status badge with hover text describing the classification."""
+    return (
+        '<span class="status {state}" title="{title}">{label}</span>'.format(
+            state=html.escape(str(state)),
+            title=html.escape(describe_state_logic(state, warning_hours)),
+            label=html.escape(str(state).replace("_", " ")),
+        )
+    )
+
+
+def render_metric_label(label, warning_hours):
+    """Render a metric label, including hover text for state-based metrics."""
+    normalized = str(label).strip().lower().replace(" ", "_")
+    if normalized in {"success", "failed", "warning", "in_progress"}:
+        return (
+            '<span title="{0}">{1}</span>'.format(
+                html.escape(describe_state_logic(normalized, warning_hours)),
+                html.escape(label),
+            )
+        )
+    return "<span>{0}</span>".format(html.escape(label))
 
 
 def _select_state_row(rows, terminal_identifiers, latest_start, anchor_time, warning_hours):
@@ -357,7 +386,7 @@ def dashboard_context(log_df, transfers_df, system, warning_hours=2, max_runs=10
     }
 
 
-def render_run_table(rows_df, empty_message):
+def render_run_table(rows_df, empty_message, warning_hours):
     """Render a run table as HTML."""
     if rows_df.empty:
         return '<p class="empty">{0}</p>'.format(html.escape(empty_message))
@@ -373,7 +402,7 @@ def render_run_table(rows_df, empty_message):
         body_rows.append(
             "<tr>"
             "<td>{run}</td>"
-            "<td><span class=\"status {state}\">{state_label}</span></td>"
+            "<td>{status_badge}</td>"
             "<td>{identifier}</td>"
             "<td>{last_event}</td>"
             "<td>{age}</td>"
@@ -381,8 +410,7 @@ def render_run_table(rows_df, empty_message):
             "<td class=\"path\">{destination}</td>"
             "</tr>".format(
                 run=html.escape(str(row["run"])),
-                state=html.escape(str(row["state"])),
-                state_label=html.escape(str(row["state"]).replace("_", " ")),
+                status_badge=render_status_badge(row["state"], warning_hours),
                 identifier=html.escape(str(row["last_identifier"])),
                 last_event=html.escape(
                     row["last_event_time"].strftime("%Y-%m-%d %H:%M:%S%z")
@@ -407,19 +435,27 @@ def render_dashboard(context, output_path, title=None):
             <section class="metric-card">
               <h3>{label}</h3>
               <div class="metric-grid">
-                <div><span>Total</span><strong>{total}</strong></div>
-                <div><span>Success</span><strong>{success}</strong></div>
-                <div><span>Failed</span><strong>{failed}</strong></div>
-                <div><span>Warning</span><strong>{warning}</strong></div>
-                <div><span>In progress</span><strong>{in_progress}</strong></div>
+                <div>{total_label}<strong>{total}</strong></div>
+                <div>{success_label}<strong>{success}</strong></div>
+                <div>{failed_label}<strong>{failed}</strong></div>
+                <div>{warning_label}<strong>{warning}</strong></div>
+                <div>{in_progress_label}<strong>{in_progress}</strong></div>
               </div>
             </section>
             """.format(
                 label=html.escape(card["label"]),
+                total_label=render_metric_label("Total", context["warning_hours"]),
                 total=card["total"],
+                success_label=render_metric_label("Success", context["warning_hours"]),
                 success=card["success"],
+                failed_label=render_metric_label("Failed", context["warning_hours"]),
                 failed=card["failed"],
+                warning_label=render_metric_label("Warning", context["warning_hours"]),
                 warning=card["warning"],
+                in_progress_label=render_metric_label(
+                    "In progress",
+                    context["warning_hours"],
+                ),
                 in_progress=card["in_progress"],
             )
         )
@@ -609,6 +645,7 @@ def render_dashboard(context, output_path, title=None):
         <span>System: {system}</span>
         <span>Terminal identifiers: {terminal_ids}</span>
         <span>Warning threshold: {warning_hours}h</span>
+        <span>Hover a status label for classification logic</span>
       </div>
     </section>
     <section class="section">
@@ -648,12 +685,14 @@ def render_dashboard(context, output_path, title=None):
         unfinished_table=render_run_table(
             context["unfinished_runs"],
             "No unfinished runs in this window.",
+            context["warning_hours"],
         ),
         unfinished_more=unfinished_more,
         success_label=html.escape(context["success_label"]),
         success_table=render_run_table(
             context["success_runs"],
             "No successful runs in this window.",
+            context["warning_hours"],
         ),
         success_more=success_more,
     )
@@ -696,8 +735,10 @@ def build_default_output_path(input_path):
 
 def load_transfers_for_reporting(config_file=None, transfers_file=None):
     """Load enabled transfers after resolving config defaults."""
-    config.load_config(config_file=config_file, transfers_file=transfers_file)
-    return load_transfer_metadata(config.transfers_file)
+    return load_reporting_transfers(
+        config_file=config_file,
+        transfers_file=transfers_file,
+    )
 
 
 def resolve_report_input_path(input_path=None, config_file=None, transfers_file=None):

@@ -13,12 +13,8 @@ Checks all prerequisites before deploying cron files:
 import os
 import sys
 import subprocess
-import socket
 import shutil
-import glob
-import errno
 import argparse
-from io import StringIO
 
 import pandas as pd
 
@@ -29,16 +25,28 @@ from landingzones.generate_cron_files import (
     split_remote_path,
     shell_path,
 )
-
-
-class Colors:
-    """ANSI color codes for console output"""
-    GREEN = '\033[92m'
-    RED = '\033[91m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    BOLD = '\033[1m'
-    END = '\033[0m'
+from landingzones.readiness_ops import (
+    Colors,
+    build_ssh_target,
+    check_flock_command,
+    check_local_directory,
+    check_log_directory,
+    check_remote_directory,
+    check_required_tools,
+    check_ssh_connection,
+    deploy_cron_files,
+    generate_cron_files,
+    get_current_system,
+    get_current_user,
+    parse_remote_destination,
+    print_header,
+    print_status,
+    setup_crontab_directory,
+)
+from landingzones.transfer_loading import (
+    filter_transfers_by_system_user,
+    load_runtime_transfers,
+)
 
 
 def get_test_flock_path():
@@ -49,45 +57,14 @@ def get_test_flock_path():
     return '/usr/bin/true'
 
 
-def print_status(message, status, details=None):
-    """Print formatted status message"""
-    if status == "OK":
-        icon = "{0}✓{1}".format(Colors.GREEN, Colors.END)
-        status_text = "{0}OK{1}".format(Colors.GREEN, Colors.END)
-    elif status == "WARN":
-        icon = "{0}⚠{1}".format(Colors.YELLOW, Colors.END)
-        status_text = "{0}WARNING{1}".format(Colors.YELLOW, Colors.END)
-    elif status == "INFO" or status == "...":
-        icon = "{0}ℹ{1}".format(Colors.BLUE, Colors.END)
-        status_text = "{0}INFO{1}".format(Colors.BLUE, Colors.END)
-    else:  # ERROR
-        icon = "{0}✗{1}".format(Colors.RED, Colors.END)
-        status_text = "{0}ERROR{1}".format(Colors.RED, Colors.END)
-    
-    print("{0} {1}: {2}".format(icon, message, status_text))
-    if details:
-        print("   {0}".format(details))
-
-
-def print_header(title):
-    """Print section header"""
-    print("\n{0}{1}=== {2} ==={3}".format(Colors.BOLD, Colors.BLUE, title, Colors.END))
-
-
 def _snapshot_config_state():
     """Capture config state so temporary overrides can be restored."""
-    return {
-        'yaml_config': dict(config._yaml_config),
-        'runtime_config': dict(config._runtime_config),
-        'config_file': config._config_file,
-    }
+    return config.snapshot_state()
 
 
 def _restore_config_state(snapshot):
     """Restore config state after temporary overrides."""
-    config._yaml_config = snapshot['yaml_config']
-    config._runtime_config = snapshot['runtime_config']
-    config._config_file = snapshot['config_file']
+    config.restore_state(snapshot)
 
 
 def get_repo_root():
@@ -483,7 +460,7 @@ def load_test_with_data_transfers(
 ):
     """Load the current system/user transfer subset for test-with-data."""
     df = parse_transfers_file(transfers_file)
-    df = df[(df['system'] == current_system) & (df['users'] == current_user)].copy()
+    df = filter_transfers_by_system_user(df, current_system, current_user)
     if df.empty:
         raise ValueError(
             "No transfers found for user '{0}' on system '{1}'".format(
@@ -836,497 +813,6 @@ def run_test_with_data(config_file=None, transfers_file=None, slow=False):
     finally:
         _restore_config_state(snapshot)
 
-
-def check_required_tools():
-    """Check if required system tools are available"""
-    print_header("Checking Required Tools")
-    
-    tools = ['rsync', 'ssh', 'find']
-    
-    all_good = True
-    
-    for tool in tools:
-        try:
-            proc = subprocess.Popen(['which', tool], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = proc.communicate()
-            result_returncode = proc.returncode
-            result_stdout = stdout.decode('utf-8')
-            if result_returncode == 0:
-                location = result_stdout.strip()
-                print_status("{0} available".format(tool), "OK", "Location: {0}".format(location))
-            else:
-                print_status("{0} missing".format(tool), "ERROR", 
-                           "Please install {0}".format(tool))
-                all_good = False
-        except Exception as e:
-            print_status("{0} check failed".format(tool), "ERROR", str(e))
-            all_good = False
-    
-    return all_good
-
-
-def check_flock_command(system):
-    """Check whether the configured flock binary exists and is executable."""
-    flock_path = config.get_flock_path(system)
-    expanded_path = os.path.expandvars(os.path.expanduser(flock_path))
-
-    if not os.path.exists(expanded_path):
-        print_status("Flock binary", "ERROR",
-                     "Configured path does not exist: {0}".format(flock_path))
-        return False
-
-    if not os.access(expanded_path, os.X_OK):
-        print_status("Flock binary", "ERROR",
-                     "Configured path is not executable: {0}".format(flock_path))
-        return False
-
-    print_status("Flock binary", "OK",
-                 "Using: {0}".format(flock_path))
-    return True
-
-
-def check_local_directory(path, description, check_writable=True):
-    """Check if a local directory exists and is writable
-    
-    If the path ends with a wildcard (e.g., /path/to/dir/*), 
-    it will check the parent directory instead.
-    """
-    # Expand both environment variables ($HOME, $USER, etc.) and user home (~)
-    expanded_path = os.path.expandvars(os.path.expanduser(path))
-    
-    # Handle wildcards at the end of the path
-    # If path ends with /* or /*, check the parent directory instead
-    check_path = expanded_path
-    is_wildcard = False
-    if expanded_path.endswith('/*') or expanded_path.endswith('*'):
-        # Strip the wildcard and trailing slash
-        check_path = expanded_path.rstrip('*').rstrip('/')
-        is_wildcard = True
-        if description == "Source directory":
-            description = "Source directory (wildcard pattern)"
-    
-    if not os.path.exists(check_path):
-        print_status("{0}".format(description), "ERROR", "Directory does not exist: {0}".format(path))
-        return False
-    
-    if not os.path.isdir(check_path):
-        print_status("{0}".format(description), "ERROR", "Path exists but is not a directory: {0}".format(path))
-        return False
-    
-    if check_writable and not os.access(check_path, os.W_OK):
-        print_status("{0}".format(description), "ERROR", "Directory is not writable: {0}".format(path))
-        return False
-    
-    if is_wildcard:
-        print_status("{0}".format(description), "OK", "Parent path: {0}".format(check_path))
-    else:
-        print_status("{0}".format(description), "OK", "Path: {0}".format(check_path))
-    return True
-
-
-def parse_remote_destination(destination):
-    """Parse a transfer endpoint into remote target components."""
-    value = str(destination).strip() if destination is not None else ''
-    if ':' not in value:
-        return None, None, value
-
-    remote, path = value.split(':', 1)
-    if not remote or not path or '/' in remote:
-        return None, None, value
-
-    if '@' in remote:
-        user, host = remote.split('@', 1)
-        if user and host:
-            return user, host, path
-        return None, None, value
-
-    return None, remote, path
-
-
-def build_ssh_target(user, host):
-    """Build an ssh target string from parsed endpoint parts."""
-    if user:
-        return '{0}@{1}'.format(user, host)
-    return host
-
-
-def check_ssh_connection(user, host, port=None):
-    """Check SSH connection to remote host"""
-    try:
-        cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
-        if port:
-            cmd.extend(['-p', str(port)])
-        cmd.extend([build_ssh_target(user, host), 'echo', 'SSH_TEST_OK'])
-        
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = proc.communicate()
-        result_returncode = proc.returncode
-        result_stdout = stdout.decode('utf-8')
-        result_stderr = stderr.decode('utf-8')
-        
-        if result_returncode == 0 and 'SSH_TEST_OK' in result_stdout:
-            return True, "Connection successful"
-        else:
-            return False, "SSH failed: {0}".format(result_stderr.strip() if result_stderr else 'Unknown error')
-    
-    except Exception as e:
-        return False, "SSH test error: {0}".format(str(e))
-
-
-def check_remote_directory(
-    user, host, path, port=None, description="Remote directory", check_writable=True
-):
-    """Check if a remote directory exists and is optionally writable."""
-    try:
-        cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
-        if port:
-            cmd.extend(['-p', str(port)])
-        
-        if check_writable:
-            test_cmd = (
-                '[ -d "{0}" ] && [ -w "{0}" ] && echo "DIR_OK" || echo "DIR_FAIL"'
-            ).format(path)
-        else:
-            test_cmd = '[ -d "{0}" ] && echo "DIR_OK" || echo "DIR_FAIL"'.format(path)
-        cmd.extend([build_ssh_target(user, host), test_cmd])
-        
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = proc.communicate()
-        result_returncode = proc.returncode
-        result_stdout = stdout.decode('utf-8')
-        result_stderr = stderr.decode('utf-8')
-        
-        if result_returncode == 0:
-            if 'DIR_OK' in result_stdout:
-                if check_writable:
-                    return True, "Directory exists and is writable"
-                return True, "Directory exists"
-            if check_writable:
-                return False, "Directory does not exist or is not writable"
-            return False, "Directory does not exist"
-        else:
-            return False, "Remote check failed: {0}".format(result_stderr.strip())
-    
-    except Exception as e:
-        return False, "Remote directory check error: {0}".format(str(e))
-
-
-def check_log_directory(log_file_path):
-    """Check if log directory exists and create if necessary"""
-    if not log_file_path or log_file_path == 'nan':
-        return True, "No log file specified"
-    
-    # Expand both environment variables ($HOME, $USER, etc.) and user home (~)
-    expanded_path = os.path.expandvars(os.path.expanduser(log_file_path))
-    log_dir = os.path.dirname(expanded_path)
-    
-    if not log_dir:  # Relative path in current directory
-        return True, "Log file in current directory"
-    
-    if not os.path.exists(log_dir):
-        try:
-            os.makedirs(log_dir)
-            return True, "Created log directory: {0}".format(log_dir)
-        except OSError as e:
-            # Handle race condition where directory was created by another process
-            if e.errno == errno.EEXIST and os.path.isdir(log_dir):
-                pass
-            else:
-                return False, "Cannot create log directory {0}: {1}".format(log_dir, str(e))
-    
-    if not os.access(log_dir, os.W_OK):
-        return False, "Log directory not writable: {0}".format(log_dir)
-    
-    return True, "Log directory OK: {0}".format(log_dir)
-
-
-def check_lock_file_directory(lock_file=None):
-    """Check if lock file directory exists and is writable
-    
-    Args:
-        lock_file: Path to lock file. If None, uses config.default_lock_file
-    """
-    if lock_file is None:
-        lock_file = config.default_lock_file
-    
-    lock_dir = os.path.dirname(lock_file)
-    
-    # Handle case where lock file is in current directory
-    if not lock_dir:
-        lock_dir = '.'
-    
-    if not os.path.exists(lock_dir):
-        print_status("Lock file directory", "ERROR", "Directory does not exist: {0}".format(lock_dir))
-        return False
-    
-    if not os.access(lock_dir, os.W_OK):
-        print_status("Lock file directory", "ERROR", "Directory not writable: {0}".format(lock_dir))
-        return False
-    
-    print_status("Lock file directory", "OK", "Path: {0} (lock: {1})".format(lock_dir, lock_file))
-    return True
-
-
-def get_current_user():
-    """Get current user and allow selection if multiple users exist in transfers"""
-    current_user = os.environ.get('USER', os.environ.get('USERNAME', ''))
-    transfers_file = config.transfers_file
-    
-    try:
-        df = parse_transfers_file(transfers_file)
-        users = df['users'].unique()
-        
-        # If current user is in the list, use it
-        if current_user in users:
-            return current_user
-        
-        # If only one user, use that
-        if len(users) == 1:
-            return users[0]
-            
-    except Exception:
-        pass
-    
-    # Ask user if we can't determine
-    print("\n{0}Current user: {1}{2}".format(Colors.YELLOW, current_user, Colors.END))
-    print("Available users in {0}:".format(transfers_file))
-    
-    try:
-        df = parse_transfers_file(transfers_file)
-        users = df['users'].unique()
-        for i, user in enumerate(users, 1):
-            marker = " (current)" if user == current_user else ""
-            print("  {0}. {1}{2}".format(i, user, marker))
-        
-        while True:
-            try:
-                choice = input("\nSelect user (1-{0}) or enter username: ".format(len(users))).strip()
-                if choice.isdigit():
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(users):
-                        return users[idx]
-                elif choice in users:
-                    return choice
-                elif not choice and current_user in users:
-                    return current_user
-                print("Invalid choice. Please try again.")
-            except KeyboardInterrupt:
-                print("\nOperation cancelled.")
-                sys.exit(1)
-    
-    except Exception as e:
-        print("Could not read {0}: {1}".format(transfers_file, e))
-        return current_user if current_user else input("Please enter your username: ").strip()
-
-
-def get_current_system():
-    """Determine current system based on hostname or user input"""
-    hostname = socket.gethostname().lower()
-    transfers_file = config.transfers_file
-    
-    # Try to match hostname against systems defined in transfers.tsv
-    try:
-        df = parse_transfers_file(transfers_file)
-        systems = df['system'].unique()
-        
-        # Check if hostname contains any known system name
-        for system in systems:
-            if system.lower() in hostname:
-                return system
-    except Exception:
-        pass
-    
-    # Ask user if we can't determine
-    print("\n{0}Current hostname: {1}{2}".format(Colors.YELLOW, hostname, Colors.END))
-    print("Available systems in {0}:".format(transfers_file))
-    
-    try:
-        df = parse_transfers_file(transfers_file)
-        systems = df['system'].unique()
-        for i, system in enumerate(systems, 1):
-            print("  {0}. {1}".format(i, system))
-        
-        while True:
-            try:
-                choice = input("\nSelect your system (1-{0}) or enter system name: ".format(len(systems))).strip()
-                if choice.isdigit():
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(systems):
-                        return systems[idx]
-                elif choice in systems:
-                    return choice
-                print("Invalid choice. Please try again.")
-            except KeyboardInterrupt:
-                print("\nOperation cancelled.")
-                sys.exit(1)
-    
-    except Exception as e:
-        print("Could not read {0}: {1}".format(transfers_file, e))
-        return input("Please enter your system name: ").strip()
-
-
-def generate_cron_files():
-    """Generate cron files using the installed module.
-
-    Prefer calling landingzones.generate_cron_files.main() directly.
-    Falls back to `python -m landingzones.generate_cron_files` if import fails.
-    """
-    # First, try to import and call the module directly
-    try:
-        from landingzones import generate_cron_files as gcf
-        # Capture stdout so we can show a concise message to the user
-        output_capture = None
-        old_stdout = None
-        if StringIO is not None:
-            output_capture = StringIO()
-            old_stdout = sys.stdout
-            sys.stdout = output_capture
-        try:
-            gcf.main()
-        finally:
-            if old_stdout is not None:
-                sys.stdout = old_stdout
-        details = output_capture.getvalue() if output_capture is not None else "Generated cron files"
-        return True, details
-    except Exception as import_err:
-        # Fallback to module execution via python -m
-        try:
-            proc = subprocess.Popen([sys.executable, '-m', 'landingzones.generate_cron_files'],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = proc.communicate()
-            rc = proc.returncode
-            out = stdout.decode('utf-8') if stdout else ''
-            err = stderr.decode('utf-8') if stderr else ''
-            if rc == 0:
-                return True, out or 'Generated cron files'
-            return False, "Generation failed: {0}".format(err or out)
-        except Exception as e:
-            return False, "Error running generator: {0}".format(str(e))
-
-
-def setup_crontab_directory():
-    """Ensure ~/crontab.d directory exists"""
-    crontab_dir = os.path.expandvars(os.path.expanduser("~/crontab.d"))
-    try:
-        os.makedirs(crontab_dir)
-        return True, "Directory ready: {0}".format(crontab_dir)
-    except OSError as e:
-        # Handle race condition where directory already exists
-        if e.errno == errno.EEXIST and os.path.isdir(crontab_dir):
-            return True, "Directory ready: {0}".format(crontab_dir)
-        else:
-            return False, "Cannot create directory {0}: {1}".format(crontab_dir, str(e))
-
-
-def deploy_cron_files(current_system, current_user=None):
-    """Deploy cron files for the current system and user
-    
-    Args:
-        current_system: The system name to deploy for
-        current_user: The user to deploy for (defaults to current OS user)
-    """
-    if current_user is None:
-        current_user = os.environ.get('USER', os.environ.get('USERNAME', ''))
-    
-    print_header("Automatic Cron Deployment")
-    print_status("Deploying for", "INFO", "{0}@{1}".format(current_user, current_system))
-
-    # Step 1: Ensure local crontab.d exists before generation
-    dir_ok, dir_msg = setup_crontab_directory()
-    print_status("Crontab directory setup", "OK" if dir_ok else "ERROR", dir_msg)
-    if not dir_ok:
-        return False
-
-    # Step 2: Generate cron files via installed module
-    print_status("Generating cron files", "INFO", "Using landingzones.generate_cron_files")
-    gen_ok, gen_msg = generate_cron_files()
-    if not gen_ok:
-        print_status("Cron file generation", "WARN", gen_msg)
-        print_status("Continuing deployment", "INFO", "Will use existing files in crontab.d/")
-    else:
-        print_status("Cron file generation", "OK", gen_msg)
-    
-    # Step 3: Find and copy relevant cron files
-    cron_files = []
-    try:
-        # Look for cron files that match the current system and user in crontab.d/
-        # File format: system.user.Landing_Zone.cron
-        pattern = "crontab.d/{0}.{1}.Landing_Zone.cron".format(current_system, current_user)
-        matches = glob.glob(pattern)
-        
-        if not matches:
-            msg = (
-                "No new files for '{0}@{1}'. Using existing crontab.d/"
-            ).format(current_user, current_system)
-            print_status("Cron file discovery", "WARN", msg)
-            return True  # Not an error, just no files to deploy
-
-        cron_files = matches
-        found_msg = "Found {0} files".format(len(cron_files))
-        print_status("Cron file discovery", "OK", found_msg)
-    except Exception as e:
-        print_status("Cron file discovery", "ERROR", "Search failed: {0}".format(str(e)))
-        return False
-    
-    # Step 4: Copy files to ~/crontab.d/
-    crontab_dir = os.path.expandvars(os.path.expanduser("~/crontab.d"))
-    copied_files = []
-    
-    for cron_file in cron_files:
-        try:
-            # Extract just the filename from the path (remove crontab.d/ prefix)
-            filename = os.path.basename(cron_file)
-            dest_path = os.path.join(crontab_dir, filename)
-            shutil.copy2(cron_file, dest_path)
-            copied_files.append(filename)
-            print_status("Copy {0}".format(filename), "OK", "Copied to {0}".format(dest_path))
-        except Exception as e:
-            print_status("Copy {0}".format(cron_file), "ERROR", "Failed: {0}".format(str(e)))
-            return False
-    
-    if not copied_files:
-        return True  # Nothing to deploy
-    
-    # Step 5: Activate cron jobs
-    try:
-        # Run: cat ~/crontab.d/*.cron | crontab -
-        crontab_pattern = os.path.join(crontab_dir, "*.cron")
-        cmd = "cat {0} | crontab -".format(crontab_pattern)
-        
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = proc.communicate()
-        result_returncode = proc.returncode
-        result_stderr = stderr.decode('utf-8')
-
-        if result_returncode == 0:
-            print_status("Crontab activation", "OK",
-                         "Activated {0} cron files".format(len(copied_files)))
-
-            # Show current crontab for verification
-            verify_proc = subprocess.Popen(['crontab', '-l'],
-                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            verify_stdout, verify_stderr = verify_proc.communicate()
-            verify_returncode = verify_proc.returncode
-            verify_result_stdout = verify_stdout.decode('utf-8')
-            if verify_returncode == 0:
-                lines = verify_result_stdout.split('\n')
-                active_jobs = len([line for line in lines
-                                   if (line.strip() and
-                                       not line.startswith('#'))])
-                print_status("Crontab verification", "OK",
-                             "Total active cron jobs: {0}".format(active_jobs))
-
-            return True
-        else:
-            print_status("Crontab activation", "ERROR",
-                         "Failed: {0}".format(result_stderr.strip()))
-            return False
-    
-    except Exception as e:
-        print_status("Crontab activation", "ERROR", "Error: {0}".format(str(e)))
-        return False
-
-
 def main(argv=None):
     """Main verification function."""
     # Parse command line arguments
@@ -1392,7 +878,7 @@ def main(argv=None):
     
     # Load and filter transfers
     try:
-        df = parse_transfers_file(transfers_file)
+        df = load_runtime_transfers(transfers_file=transfers_file)
         
         print_status("Configuration file", "OK", "Loaded {0} active transfers".format(len(df)))
     except Exception as e:
@@ -1406,7 +892,7 @@ def main(argv=None):
         Colors.BOLD, current_system, current_user, Colors.END))
     
     # Filter transfers for current system and user
-    system_transfers = df[(df['system'] == current_system) & (df['users'] == current_user)]
+    system_transfers = filter_transfers_by_system_user(df, current_system, current_user)
     if len(system_transfers) == 0:
         # Check if there are transfers for the system but different user
         system_only = df[df['system'] == current_system]

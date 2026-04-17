@@ -14,11 +14,13 @@ import shlex
 import pandas as pd
 
 from landingzones.config import config
+from landingzones.transfer_definitions import definitions_from_dataframe
 
 
 VALIDATION_HELPER_NAME = 'lz_run_validation.sh'
 VALIDATION_WRAPPER_PREFIX = 'lz_run_validation_'
 VALIDATION_TEMPLATE_NAME = 'lz_run_validation.sh'
+PATH_VARIABLE_PATTERN = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}')
 
 
 def normalize_bool_text(value):
@@ -33,8 +35,22 @@ def normalize_bool_text(value):
     raise ValueError("Unsupported boolean value: {0}".format(value))
 
 
-def parse_transfers_file(filename):
-    """Parse the transfers.tsv file and return a pandas DataFrame"""
+def ensure_text_column(df, column_name, default=''):
+    """Ensure a normalized text column exists on the transfer DataFrame."""
+    if column_name not in df.columns:
+        df[column_name] = default
+    df[column_name] = df[column_name].fillna(default).astype(str)
+
+
+def parse_transfers_file(filename, require_runtime_files=True):
+    """Parse the transfers.tsv file and return a normalized DataFrame.
+
+    Args:
+        filename: Path to a transfers.tsv file.
+        require_runtime_files: When True, keep generator/runtime validation that
+            requires fields such as log_file. When False, parse only the shared
+            transfer metadata needed for reporting/analysis.
+    """
     # Read the TSV file with pandas - now with proper header line
     df = pd.read_csv(filename, sep='\t')
     
@@ -54,26 +70,23 @@ def parse_transfers_file(filename):
     # Clean up any extra whitespace in string columns
     for col in df.select_dtypes(include=['object']).columns:
         df[col] = df[col].astype(str).str.strip()
+
+    df = expand_transfer_endpoint_variables(df)
     
     # Create system_user combination column
     df['system_user'] = df['system'] + '.' + df['users']
     
     # Handle empty columns and convert destination_port to string
-    df['rsync_options'] = df['rsync_options'].fillna('').astype(str)
-    df['log_file'] = df['log_file'].fillna('').astype(str)
-    df['flock_file'] = df['flock_file'].fillna('').astype(str)
-    if 'io_nice' not in df.columns:
-        df['io_nice'] = ''
-    df['io_nice'] = df['io_nice'].fillna('').astype(str)
+    ensure_text_column(df, 'rsync_options')
+    ensure_text_column(df, 'log_file')
+    ensure_text_column(df, 'flock_file')
+    ensure_text_column(df, 'io_nice')
     
     # Handle frequency column - use default if not present or empty
-    if 'frequency' not in df.columns:
-        df['frequency'] = ''
-    df['frequency'] = df['frequency'].fillna('').astype(str)
+    ensure_text_column(df, 'frequency')
 
-    if 'flow_group' not in df.columns:
-        df['flow_group'] = ''
-    df['flow_group'] = df['flow_group'].fillna('').astype(str).str.strip()
+    ensure_text_column(df, 'flow_group')
+    df['flow_group'] = df['flow_group'].str.strip()
 
     for bool_column in (
         'is_entry_point',
@@ -86,12 +99,10 @@ def parse_transfers_file(filename):
         df[bool_column] = df[bool_column].apply(normalize_bool_text)
     
     # Handle destination_port and source_port specially (may be numeric)
-    df['destination_port'] = df['destination_port'].fillna('').astype(str)
+    ensure_text_column(df, 'destination_port')
     
     # Handle source_port if it exists, otherwise create empty column
-    if 'source_port' not in df.columns:
-        df['source_port'] = ''
-    df['source_port'] = df['source_port'].fillna('').astype(str)
+    ensure_text_column(df, 'source_port')
     
     # Remove rows where columns contain 'nan' (from NaN values)
     df['rsync_options'] = df['rsync_options'].replace('nan', '')
@@ -109,7 +120,7 @@ def parse_transfers_file(filename):
 
     if (df['identifiers'] == '').any():
         raise ValueError("identifiers is required for all enabled transfers")
-    if (df['log_file'] == '').any():
+    if require_runtime_files and (df['log_file'] == '').any():
         raise ValueError("log_file is required for all enabled transfers")
 
     sanitized_identifiers = df['identifiers'].apply(sanitize_identifier)
@@ -211,6 +222,68 @@ def split_remote_path(path):
     return remote, remote_path
 
 
+def unresolved_path_variables(value):
+    """Return unresolved ${VAR} placeholders from a transfer path."""
+    return sorted(set(PATH_VARIABLE_PATTERN.findall(str(value or ''))))
+
+
+def expand_path_variables(text, variables, identifier, field_name):
+    """Expand ${VAR} placeholders using config-backed path variables."""
+    value = str(text).strip() if text is not None else ''
+    if not value or value == 'nan':
+        return value
+
+    missing = []
+
+    def replace(match):
+        name = match.group(1)
+        if name not in variables:
+            missing.append(name)
+            return match.group(0)
+        return str(variables[name])
+
+    expanded = PATH_VARIABLE_PATTERN.sub(replace, value)
+    remaining = unresolved_path_variables(expanded)
+    if missing or remaining:
+        unresolved = sorted(set(missing + remaining))
+        raise ValueError(
+            "Transfer '{0}' has unresolved variable(s) in {1}: {2}".format(
+                identifier,
+                field_name,
+                ', '.join(unresolved),
+            )
+        )
+    return expanded
+
+
+def expand_transfer_endpoint(endpoint, variables, identifier, field_name):
+    """Expand ${VAR} placeholders in a local or remote transfer endpoint."""
+    remote, path = split_remote_path(endpoint)
+    if remote:
+        return join_remote_path(
+            remote,
+            expand_path_variables(path, variables, identifier, field_name),
+        )
+    return expand_path_variables(endpoint, variables, identifier, field_name)
+
+
+def expand_transfer_endpoint_variables(df):
+    """Expand config-backed ${VAR} placeholders in transfer endpoints."""
+    df = df.copy()
+    variables = config.path_variables
+    for field_name in ('source', 'destination'):
+        df[field_name] = df.apply(
+            lambda row: expand_transfer_endpoint(
+                row.get(field_name, ''),
+                variables,
+                row.get('identifiers', ''),
+                field_name,
+            ),
+            axis=1,
+        )
+    return df
+
+
 def validate_transfer_endpoints(df):
     """Reject malformed remote endpoints before generating scripts."""
     errors = []
@@ -272,6 +345,8 @@ def audit_shared_file_pairs(df):
     warnings = []
     grouped = df.groupby(['log_file', 'flock_file'], dropna=False)
     for (log_file, flock_file), group_df in grouped:
+        if not str(log_file or '').strip() and not str(flock_file or '').strip():
+            continue
         identifiers = sorted(group_df['identifiers'].tolist())
         if len(identifiers) < 2:
             continue
@@ -1315,7 +1390,8 @@ def resolve_validation_fixture_dir(transfer):
     """Resolve the default validation fixture directory for an entry-point transfer."""
     toy_data_root = os.path.abspath(config.test_data)
     candidate_roots = []
-    for candidate in get_validation_fixture_container_candidates(transfer['source']):
+    source = transfer.source if hasattr(transfer, 'source') else transfer['source']
+    for candidate in get_validation_fixture_container_candidates(source):
         candidate_root = os.path.join(toy_data_root, candidate)
         if os.path.isdir(candidate_root):
             candidate_roots.append(candidate_root)
@@ -1349,11 +1425,11 @@ def build_validation_wrapper_specs(transfers_df):
         return []
 
     flow_groups = {}
-    for _, transfer in transfers_df.iterrows():
-        flow_group = str(transfer.get('flow_group', '') or '').strip()
+    for transfer in definitions_from_dataframe(transfers_df):
+        flow_group = transfer.flow_group.strip()
         if not flow_group or flow_group == 'nan':
             continue
-        if str(transfer.get('is_entry_point', 'FALSE') or 'FALSE').strip().upper() != 'TRUE':
+        if not transfer.is_entry_point:
             continue
         flow_groups.setdefault(flow_group, []).append(transfer)
 
@@ -1361,7 +1437,7 @@ def build_validation_wrapper_specs(transfers_df):
     script_names = set()
     for flow_group, entries in sorted(flow_groups.items()):
         if len(entries) != 1:
-            identifiers = ', '.join(sorted(entry['identifiers'] for entry in entries))
+            identifiers = ', '.join(sorted(entry.identifier for entry in entries))
             raise ValueError(
                 "flow_group '{0}' must have exactly one entry-point transfer to generate "
                 "a validation wrapper; found {1}: {2}".format(
@@ -1380,10 +1456,10 @@ def build_validation_wrapper_specs(transfers_df):
         specs.append({
             'script_name': script_name,
             'flow_group': flow_group,
-            'entry_dir': os.path.abspath(normalize_source_path(transfer['source'])),
-            'next_hop': str(transfer.get('destination', '') or '').strip(),
-            'next_hop_port': str(transfer.get('destination_port', '') or '').strip(),
-            'producer': str(transfer.get('system', '') or '').strip(),
+            'entry_dir': os.path.abspath(normalize_source_path(transfer.source)),
+            'next_hop': transfer.destination.strip(),
+            'next_hop_port': transfer.destination_port.strip(),
+            'producer': transfer.system.strip(),
             'fixture_dir': resolve_validation_fixture_dir(transfer),
         })
     return specs

@@ -166,6 +166,20 @@ class Config:
         for key, value in kwargs.items():
             if value is not None:
                 self._runtime_config[key] = value
+
+    def snapshot_state(self):
+        """Capture internal config state for temporary override workflows."""
+        return {
+            'yaml_config': dict(self._yaml_config),
+            'runtime_config': dict(self._runtime_config),
+            'config_file': self._config_file,
+        }
+
+    def restore_state(self, snapshot):
+        """Restore a snapshot created by snapshot_state()."""
+        self._yaml_config = dict(snapshot['yaml_config'])
+        self._runtime_config = dict(snapshot['runtime_config'])
+        self._config_file = snapshot['config_file']
     
     def _get_value(self, key, env_var, default):
         """Get configuration value with priority: runtime > env > yaml > default."""
@@ -281,6 +295,23 @@ class Config:
 
         return {}
 
+    @property
+    def path_variables(self):
+        """Configured ${VAR} placeholder values used in transfers.tsv paths."""
+        values = dict(os.environ)
+
+        yaml_value = self._yaml_config.get('path_variables')
+        if yaml_value is not None:
+            for key, value in yaml_value.items():
+                values[str(key)] = _expand_path(value)
+
+        runtime_value = self._runtime_config.get('path_variables')
+        if runtime_value is not None:
+            for key, value in runtime_value.items():
+                values[str(key)] = _expand_path(value)
+
+        return values
+
     def get_rit_managed_location(self, system):
         """Return the rit_managed base location for a system."""
         if system in self.rit_managed_locations:
@@ -340,6 +371,7 @@ class Config:
             'validation_scripts_dir': self.validation_scripts_dir,
             'rit_managed_locations': self.rit_managed_locations,
             'flock_paths': self.flock_paths,
+            'path_variables': self.path_variables,
             'rit_managed_folder_structure': self.rit_managed_folder_structure,
             'default_cron_frequency': self.default_cron_frequency,
         }

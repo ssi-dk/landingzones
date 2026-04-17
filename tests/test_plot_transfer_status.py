@@ -165,6 +165,11 @@ def test_aggregate_runs_assigns_expected_health_states():
     assert by_run.loc["epsilon", "state_identifier"] == "pullback"
 
 
+def test_describe_state_logic_includes_warning_threshold():
+    assert "2h threshold" in pts.describe_state_logic("warning", 2)
+    assert "0.5h threshold" in pts.describe_state_logic("in_progress", 0.5)
+
+
 def test_metric_cards_count_unique_runs_by_window():
     log_df = make_log_df()
     runs_df = pts.aggregate_runs(
@@ -259,3 +264,6 @@ def test_render_dashboard_includes_tables_truncation_and_anchor_time(tmp_path):
     assert "warning" in html_output
     assert "in progress" in html_output
     assert "failed" in html_output
+    assert 'title="Warning: no newer terminal success or error exists, and the latest initiated event is older than the 2h threshold."' in html_output
+    assert 'title="Failed: the most recent decisive event is an error event."' in html_output
+    assert "Hover a status label for classification logic" in html_output
