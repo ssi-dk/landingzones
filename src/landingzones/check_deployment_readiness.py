@@ -22,6 +22,7 @@ from landingzones.config import config
 from landingzones.generate_cron_files import (
     parse_transfers_file,
     normalize_source_path,
+    sanitize_identifier,
     split_remote_path,
     shell_path,
 )
@@ -432,6 +433,15 @@ def cleanup_test_with_data_runtime_artifacts(transfers_df):
             remove_local_path(path)
 
 
+def cleanup_test_with_data_generated_scripts(runtime_dirs):
+    """Remove generated integration script artifacts from a previous run."""
+    if not runtime_dirs:
+        return
+    runtime_root = runtime_dirs.get('root', '')
+    if runtime_root and (os.path.exists(runtime_root) or os.path.islink(runtime_root)):
+        remove_local_path(runtime_root)
+
+
 def seed_test_data_sources(seed_plan):
     """Copy toy-data directories into the initial source roots."""
     seeded_count = 0
@@ -506,6 +516,22 @@ def load_test_with_data_transfer_graph(transfers_file, base_dir):
             lambda value: absolutize_local_endpoint(value, base_dir)
         )
     return df
+
+
+def get_test_with_data_runtime_dirs(current_system, current_user):
+    """Return writable directories used to generate integration-only artifacts."""
+    base_root = config.get_rit_managed_location(current_system)
+    runtime_name = "{0}.{1}".format(
+        sanitize_identifier(current_system) or 'system',
+        sanitize_identifier(current_user) or 'user',
+    )
+    runtime_root = os.path.join(base_root, 'test_with_data_runtime', runtime_name)
+    return {
+        'root': runtime_root,
+        'scripts_dir': os.path.join(runtime_root, 'scripts'),
+        'crontab_dir': os.path.join(runtime_root, 'crontab.d'),
+        'validation_scripts_dir': os.path.join(runtime_root, 'validation_scripts'),
+    }
 
 
 def generate_test_scripts(transfers_df, scripts_dir, crontab_dir, validation_scripts_dir):
@@ -773,7 +799,7 @@ def validate_script_test_results(test_plan, expected_contents):
     return errors
 
 
-def cleanup_test_with_data_outputs(test_plan, transfers_df, seed_plan):
+def cleanup_test_with_data_outputs(test_plan, transfers_df, seed_plan, runtime_dirs=None):
     """Remove seeded test directories and runtime artifacts after a test-with-data run."""
     entry_names = sorted({
         entry_name
@@ -782,6 +808,7 @@ def cleanup_test_with_data_outputs(test_plan, transfers_df, seed_plan):
     })
     cleanup_test_with_data_entries(test_plan, entry_names)
     cleanup_test_with_data_runtime_artifacts(transfers_df)
+    cleanup_test_with_data_generated_scripts(runtime_dirs)
 
 
 def ask_yes_no(prompt_text):
@@ -899,6 +926,7 @@ def run_test_with_data(config_file=None, transfers_file=None, slow=False):
     transfers_df = None
     test_plan = None
     seed_plan = None
+    runtime_dirs = None
 
     try:
         work_root = os.getcwd()
@@ -926,6 +954,9 @@ def run_test_with_data(config_file=None, transfers_file=None, slow=False):
         transfers_df = load_test_with_data_transfers(
             transfers_path, current_system, current_user, work_root
         )
+        runtime_dirs = get_test_with_data_runtime_dirs(
+            current_system, current_user
+        )
         test_plan = build_run_test_plan(transfers_df)
         seed_plan = build_test_with_data_seed_plan(
             test_plan, toy_data_root, test_tree_root
@@ -937,6 +968,7 @@ def run_test_with_data(config_file=None, transfers_file=None, slow=False):
         })
         cleanup_test_with_data_entries(test_plan, expected_entry_names)
         cleanup_test_with_data_runtime_artifacts(transfers_df)
+        cleanup_test_with_data_generated_scripts(runtime_dirs)
         seeded_count = seed_test_data_sources(seed_plan)
         print_status(
             "Seeded toy data",
@@ -951,9 +983,9 @@ def run_test_with_data(config_file=None, transfers_file=None, slow=False):
                 "WARN",
                 "No flock binary found on PATH; test-with-data is running without lock enforcement",
             )
-        scripts_dir = config.get_rit_managed_path(current_system, 'sh_output')
-        crontab_dir = config.get_rit_managed_path(current_system, 'crontabs')
-        validation_scripts_dir = config.validation_scripts_dir
+        scripts_dir = runtime_dirs['scripts_dir']
+        crontab_dir = runtime_dirs['crontab_dir']
+        validation_scripts_dir = runtime_dirs['validation_scripts_dir']
         generate_test_scripts(
             transfers_df, scripts_dir, crontab_dir, validation_scripts_dir
         )
@@ -1030,7 +1062,9 @@ def run_test_with_data(config_file=None, transfers_file=None, slow=False):
         if ask_yes_no(
             "Do you want to clean up the propagated output locations so test-with-data can be rerun from the initial state?"
         ):
-            cleanup_test_with_data_outputs(test_plan, transfers_df, seed_plan)
+            cleanup_test_with_data_outputs(
+                test_plan, transfers_df, seed_plan, runtime_dirs
+            )
             print_status(
                 "Test-with-data cleanup",
                 "OK",

@@ -495,6 +495,7 @@ class TestTestWithData:
             config_file=str(config_file),
             transfers_file=str(transfers_file),
         )
+        runtime_root = rit_managed / 'test_with_data_runtime' / 'testbox.runner'
 
         assert result is True
         assert cdr.list_visible_entries(str(source_root)) == []
@@ -502,8 +503,9 @@ class TestTestWithData:
         assert cdr.list_visible_directories(str(final_root)) == ['flow_one', 'flow_two']
         assert (final_root / 'flow_one' / 'payload.txt').read_text() == 'flow_one'
         assert (final_root / 'flow_two' / 'payload.txt').read_text() == 'flow_two'
-        assert (rit_managed / 'scripts' / 'step1.sh').exists()
-        assert (rit_managed / 'scripts' / 'step2.sh').exists()
+        assert (runtime_root / 'scripts' / 'step1.sh').exists()
+        assert (runtime_root / 'scripts' / 'step2.sh').exists()
+        assert (runtime_root / 'validation_scripts' / 'lz_run_validation.sh').exists()
         assert (rit_managed / 'log' / 'step1.log').exists()
         assert (rit_managed / 'flock' / 'step1.lock').exists()
 
@@ -533,11 +535,13 @@ class TestTestWithData:
             config_file=str(config_file),
             transfers_file=str(transfers_file),
         )
+        runtime_root = rit_managed / 'test_with_data_runtime' / 'testbox.runner'
 
         assert result is True
         assert cdr.list_visible_entries(str(source_root)) == []
         assert cdr.list_visible_entries(str(transit_root)) == []
         assert cdr.list_visible_entries(str(final_root)) == []
+        assert not runtime_root.exists()
         assert not (rit_managed / 'log' / 'step1.log').exists()
         assert not (rit_managed / 'flock' / 'step1.lock').exists()
 
@@ -725,11 +729,13 @@ class TestTestWithData:
             slow=True,
         )
         captured = capsys.readouterr()
+        runtime_root = rit_managed / 'test_with_data_runtime' / 'calc.runner'
 
         assert result is True
         assert cleanup_prompts == []
         assert cdr.list_visible_entries(str(handoff_root)) == ['flow_one']
         assert cdr.list_visible_entries(str(final_root)) == []
+        assert (runtime_root / 'scripts').exists()
         assert "Next System Handoff" in captured.out
         assert "Switch to corfac@ugerm" in captured.out
         assert "landingzones validate integration --slow" in captured.out
