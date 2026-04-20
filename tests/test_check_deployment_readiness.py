@@ -885,6 +885,61 @@ class TestTestWithData:
         assert results[0]['returncode'] == 0
         assert captured['env']['LZ_DEBUG_CLI'] == '1'
 
+    def test_validate_script_test_results_reports_unavailable_terminal_root(
+        self, monkeypatch
+    ):
+        """Validation should distinguish an unavailable terminal root from a missing run."""
+        test_plan = {
+            'terminal_destinations': [
+                {'value': '/tmp/final/', 'port': ''}
+            ]
+        }
+        expected_contents = {
+            cdr.endpoint_key('/tmp/final/'): {'flow_one'}
+        }
+
+        monkeypatch.setattr(
+            cdr,
+            'endpoint_root_ready',
+            lambda endpoint: (False, '/tmp/final'),
+        )
+
+        errors = cdr.validate_script_test_results(test_plan, expected_contents)
+
+        assert errors == ['Terminal destination root unavailable: /tmp/final']
+
+    def test_validate_script_test_results_reports_missing_run_under_ready_root(
+        self, monkeypatch
+    ):
+        """Validation should report missing runs only after root readiness succeeds."""
+        test_plan = {
+            'terminal_destinations': [
+                {'value': '/tmp/final/', 'port': ''}
+            ]
+        }
+        expected_contents = {
+            cdr.endpoint_key('/tmp/final/'): {'flow_one'}
+        }
+
+        monkeypatch.setattr(
+            cdr,
+            'endpoint_root_ready',
+            lambda endpoint: (True, '/tmp/final'),
+        )
+        monkeypatch.setattr(
+            cdr,
+            'endpoint_directory_exists',
+            lambda endpoint, directory_name: (
+                False, '/tmp/final/{0}'.format(directory_name)
+            ),
+        )
+
+        errors = cdr.validate_script_test_results(test_plan, expected_contents)
+
+        assert errors == [
+            'Expected test directory missing under terminal destination root: /tmp/final/flow_one'
+        ]
+
     def test_run_generated_scripts_slow_mode_pauses_between_steps(
         self, tmp_path, monkeypatch, capsys
     ):

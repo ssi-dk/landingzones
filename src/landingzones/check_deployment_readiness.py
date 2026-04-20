@@ -797,6 +797,33 @@ def endpoint_directory_exists(endpoint, directory_name):
     return os.path.isdir(directory_path), directory_path
 
 
+def endpoint_root_ready(endpoint):
+    """Check whether a terminal endpoint root is reachable and exists."""
+    root = get_endpoint_root(endpoint)
+    user, host, _ = parse_remote_destination(endpoint['value'])
+    port = endpoint.get('port', '')
+
+    if host:
+        command = '[ -d {0} ] && echo EXISTS || echo MISSING'.format(
+            shell_path(root)
+        )
+        rc, stdout, stderr = run_remote_shell(user, host, command, port)
+        remote_path = "{0}:{1}".format(
+            build_ssh_target(user, host),
+            root,
+        )
+        if rc != 0:
+            return False, "Remote check failed for {0}: {1}".format(
+                remote_path,
+                stderr.strip() or 'unknown error',
+            )
+        if 'EXISTS' in stdout:
+            return True, remote_path
+        return False, remote_path
+
+    return os.path.isdir(root), root
+
+
 def validate_script_test_results(test_plan, expected_contents):
     """Validate that seeded toy-data directories reached each terminal destination."""
     errors = []
@@ -804,14 +831,29 @@ def validate_script_test_results(test_plan, expected_contents):
         expected_entries = sorted(
             expected_contents.get(endpoint_key(endpoint['value']), set())
         )
+        root_ready, root_status = endpoint_root_ready(endpoint)
+        if not root_ready:
+            errors.append(
+                "Terminal destination root unavailable: {0}".format(
+                    root_status
+                )
+            )
+            continue
         for entry_name in expected_entries:
             exists, path = endpoint_directory_exists(endpoint, entry_name)
             if not exists:
-                errors.append(
-                    "Expected test directory missing at terminal destination: {0}".format(
-                        path
+                if str(path).startswith("Remote check failed for "):
+                    errors.append(
+                        "Terminal destination entry check failed: {0}".format(
+                            path
+                        )
                     )
-                )
+                else:
+                    errors.append(
+                        "Expected test directory missing under terminal destination root: {0}".format(
+                            path
+                        )
+                    )
     return errors
 
 
