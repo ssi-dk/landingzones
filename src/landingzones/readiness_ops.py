@@ -7,12 +7,14 @@ import glob
 from io import StringIO
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
 import sys
 
 from landingzones.config import config
+from landingzones.generate_cron_files import shell_path
 from landingzones.transfer_loading import load_runtime_transfers
 
 
@@ -198,26 +200,25 @@ def inspect_remote_directory(
         cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
         if port:
             cmd.extend(['-p', str(port)])
+        remote_path_expr = shell_path(normalized_path)
+        writable_flag = '1' if check_writable else '0'
         remote_script = (
-            'if [ ! -e "$1" ]; then '
+            'target_path={0}; '
+            'if [ ! -e "$target_path" ]; then '
             'echo "DIR_MISSING"; '
-            'elif [ ! -d "$1" ]; then '
+            'elif [ ! -d "$target_path" ]; then '
             'echo "DIR_NOT_DIRECTORY"; '
-            'elif [ "$2" = "1" ] && [ ! -w "$1" ]; then '
+            'elif [ "{1}" = "1" ] && [ ! -w "$target_path" ]; then '
             'echo "DIR_NOT_WRITABLE"; '
             'else '
             'echo "DIR_OK"; '
             'fi'
+        ).format(
+            remote_path_expr,
+            writable_flag,
         )
-        cmd.extend([
-            build_ssh_target(user, host),
-            'sh',
-            '-c',
-            remote_script,
-            'sh',
-            normalized_path,
-            '1' if check_writable else '0',
-        ])
+        remote_command = "sh -c {0}".format(shlex.quote(remote_script))
+        cmd.extend([build_ssh_target(user, host), remote_command])
 
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = proc.communicate()

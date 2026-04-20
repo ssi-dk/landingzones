@@ -228,6 +228,44 @@ class TestCheckFlockCommand:
         assert result is False
 
 
+class TestCheckRemoteDirectory:
+    """Test the remote directory inspection helper."""
+
+    def test_inspect_remote_directory_builds_quoted_ssh_command(self, monkeypatch):
+        """Remote probes should keep variable expansion on the remote side."""
+        captured = {}
+
+        class DummyProcess:
+            def __init__(self, args, stdout=None, stderr=None):
+                captured['args'] = args
+                self.returncode = 0
+
+            def communicate(self):
+                return b'DIR_OK\n', b''
+
+        monkeypatch.setattr(cdr.subprocess, 'Popen', DummyProcess)
+
+        info = cdr.inspect_remote_directory(
+            'user',
+            'host',
+            '$HOME/test path//nested/',
+            port='2222',
+            check_writable=False,
+        )
+
+        assert info['ok'] is True
+        remote_command = captured['args'][-1]
+        assert captured['args'][:6] == [
+            'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-p'
+        ]
+        assert captured['args'][6] == '2222'
+        assert captured['args'][7] == 'user@host'
+        assert remote_command.startswith("sh -c ")
+        assert 'target_path="$HOME/test path/nested"' in remote_command
+        assert '$1' not in remote_command
+        assert 'syntax error near unexpected token' not in remote_command
+
+
 class TestColors:
     """Test the Colors class"""
     
