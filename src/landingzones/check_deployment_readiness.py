@@ -484,7 +484,12 @@ def shell_target(user, host):
 
 def run_remote_shell(user, host, command, port=''):
     """Run a shell command over ssh."""
-    cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
+    cmd = [
+        'ssh',
+        '-o', 'BatchMode=yes',
+        '-o', 'ConnectTimeout=10',
+        '-o', 'LogLevel=ERROR',
+    ]
     if port:
         cmd.extend(['-p', str(port)])
     cmd.extend([shell_target(user, host), command])
@@ -775,8 +780,19 @@ def endpoint_directory_exists(endpoint, directory_name):
         )
         rc, stdout, stderr = run_remote_shell(user, host, command, port)
         if rc != 0:
-            return False, "Remote check failed: {0}".format(stderr.strip())
-        return 'EXISTS' in stdout, directory_path
+            remote_path = "{0}:{1}".format(
+                build_ssh_target(user, host),
+                directory_path,
+            )
+            return False, "Remote check failed for {0}: {1}".format(
+                remote_path,
+                stderr.strip() or 'unknown error',
+            )
+        remote_path = "{0}:{1}".format(
+            build_ssh_target(user, host),
+            directory_path,
+        )
+        return 'EXISTS' in stdout, remote_path
 
     return os.path.isdir(directory_path), directory_path
 

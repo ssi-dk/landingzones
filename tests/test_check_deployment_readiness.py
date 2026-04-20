@@ -56,6 +56,34 @@ class TestParseRemoteDestination:
         assert path == '$HOME/Landing_Zone/'
 
 
+class TestRunRemoteShell:
+    """Test remote shell invocation details."""
+
+    def test_run_remote_shell_uses_error_log_level(self, monkeypatch):
+        """Remote readiness checks should suppress SSH warning noise."""
+        captured = {}
+
+        class DummyProcess:
+            def __init__(self, args, stdout=None, stderr=None):
+                captured['args'] = args
+                self.returncode = 0
+
+            def communicate(self):
+                return b'EXISTS\n', b''
+
+        monkeypatch.setattr(cdr.subprocess, 'Popen', DummyProcess)
+
+        rc, stdout, stderr = cdr.run_remote_shell(
+            'tester', 'remotehost', 'echo EXISTS', '2222'
+        )
+
+        assert rc == 0
+        assert stdout == 'EXISTS\n'
+        assert stderr == ''
+        assert '-o' in captured['args']
+        assert 'LogLevel=ERROR' in captured['args']
+
+
 class TestCheckLocalDirectory:
     """Test the check_local_directory function"""
     
