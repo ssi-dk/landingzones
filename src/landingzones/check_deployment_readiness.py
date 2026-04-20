@@ -280,7 +280,17 @@ def resolve_test_data_dir(endpoint, toy_data_root, test_tree_root):
 
     available = list_visible_directories(toy_data_root)
     if len(available) == 1:
-        return os.path.join(toy_data_root, available[0])
+        # Allow fixture bundles to be wrapped in one or more single-directory
+        # containers such as test_data/data/lab_machine_1/<runs>.
+        current = os.path.join(toy_data_root, available[0])
+        while True:
+            nested = list_visible_directories(current)
+            if len(nested) != 1:
+                return current
+            child = os.path.join(current, nested[0])
+            if not list_visible_directories(child):
+                return current
+            current = child
 
     raise ValueError(
         "No toy data found for source root '{0}'. Checked: {1}".format(

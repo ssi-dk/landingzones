@@ -612,6 +612,34 @@ class TestTestWithData:
         assert seed_plan[0]['toy_data_dir'] == str(toy_data_root)
         assert seed_plan[0]['entry_names'] == ['flow_one']
 
+    def test_build_test_with_data_seed_plan_unwraps_nested_single_dir_fixture_tree(
+        self, tmp_path
+    ):
+        """Nested single-directory fixture wrappers should resolve to the run container."""
+        run_container = (
+            tmp_path / 'tests' / 'toy_data' / 'data' / 'lab_machine_1'
+        )
+        (run_container / 'Illumina_TransferTest').mkdir(parents=True)
+        (run_container / 'Nanopore_TransferTest').mkdir()
+
+        test_plan = {
+            'initial_sources': [
+                {'value': str(tmp_path / 'somewhere' / 'corefacility') + '/', 'port': ''}
+            ]
+        }
+
+        seed_plan = cdr.build_test_with_data_seed_plan(
+            test_plan,
+            str(tmp_path / 'tests' / 'toy_data'),
+            str(tmp_path),
+        )
+
+        assert seed_plan[0]['toy_data_dir'] == str(run_container)
+        assert seed_plan[0]['entry_names'] == [
+            'Illumina_TransferTest',
+            'Nanopore_TransferTest',
+        ]
+
     def test_build_test_with_data_seed_plan_filters_configured_fixtures(
         self, tmp_path
     ):
