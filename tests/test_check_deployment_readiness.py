@@ -148,6 +148,18 @@ class TestCheckLocalDirectory:
         
         assert result is True
 
+    def test_inspect_local_directory_normalizes_redundant_slashes(self, tmp_path):
+        """Repeated slashes should collapse to a single normalized path."""
+        test_dir = tmp_path / "double" / "slashes"
+        test_dir.mkdir(parents=True)
+
+        raw_path = str(tmp_path) + "//double//slashes/"
+        info = cdr.inspect_local_directory(raw_path, check_writable=False)
+
+        assert info['ok'] is True
+        assert info['path'] == str(test_dir)
+        assert '//' not in info['path']
+
 
 class TestCheckLogDirectory:
     """Test the check_log_directory function"""
@@ -716,6 +728,51 @@ class TestTestWithData:
             'transfers_file': 'transfers.tsv',
             'slow': True,
         }
+
+    def test_main_lists_and_creates_missing_directories(self, tmp_path, monkeypatch, capsys):
+        """Missing local directories should be summarized and created on confirmation."""
+        transfers_file = tmp_path / 'transfers.tsv'
+        transfers_file.write_text("placeholder\n")
+        source_dir = tmp_path / 'calc' / 'Landing_Zone' / 'from_labnet'
+        destination_dir = tmp_path / 'calc' / 'Landing_Zone' / 'to_ugerm'
+        log_file = tmp_path / 'log' / 'transfer.log'
+        flock_file = tmp_path / 'flock' / 'transfer.lock'
+
+        df = pd.DataFrame([
+            {
+                'source': str(tmp_path) + '//calc//Landing_Zone//from_labnet/',
+                'source_port': '',
+                'destination': str(tmp_path) + '//calc//Landing_Zone//to_ugerm/',
+                'destination_port': '',
+                'log_file': str(log_file),
+                'flock_file': str(flock_file),
+                'system': 'calc',
+                'users': 'runner',
+            }
+        ])
+
+        monkeypatch.setattr(cdr, 'check_required_tools', lambda: True)
+        monkeypatch.setattr(cdr, 'check_flock_command', lambda system: True)
+        monkeypatch.setattr(cdr, 'load_runtime_transfers', lambda transfers_file=None: df)
+        monkeypatch.setattr(
+            cdr,
+            'filter_transfers_by_system_user',
+            lambda loaded_df, system, user: loaded_df,
+        )
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'calc')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+        monkeypatch.setattr(cdr, 'ask_yes_no', lambda prompt_text: True)
+
+        result = cdr.main(['--transfers', str(transfers_file)])
+        captured = capsys.readouterr()
+
+        assert result is False
+        assert source_dir.is_dir()
+        assert destination_dir.is_dir()
+        assert "Missing Directories" in captured.out
+        assert str(source_dir) in captured.out
+        assert str(destination_dir) in captured.out
+        assert "Directory creation" in captured.out
 
 
 if __name__ == '__main__':

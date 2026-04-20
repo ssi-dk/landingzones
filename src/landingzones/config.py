@@ -212,11 +212,33 @@ class Config:
     @property
     def report_transfer_log_file(self):
         """Path to the default transfer TSV input used for reporting commands."""
-        return self._get_value(
+        value = self._get_value(
             'report_transfer_log_file',
             'LZ_REPORT_TRANSFER_LOG_FILE',
             '',
         )
+        if value:
+            return value
+
+        # Backward compatibility for pre-rename config and automation setups.
+        legacy_env_value = os.environ.get('LZ_TRANSFER_LOG_FILE')
+        if legacy_env_value:
+            return _expand_path(legacy_env_value)
+
+        legacy_yaml_value = self._yaml_config.get('transfer_log_file')
+        if legacy_yaml_value:
+            return _expand_path(legacy_yaml_value)
+
+        legacy_runtime_value = self._runtime_config.get('transfer_log_file')
+        if legacy_runtime_value:
+            return _expand_path(legacy_runtime_value)
+
+        return ''
+
+    @property
+    def transfer_log_file(self):
+        """Backward-compatible alias for older callers."""
+        return self.report_transfer_log_file
     
     @property
     def default_lock_file(self):

@@ -6,6 +6,7 @@ import errno
 import glob
 from io import StringIO
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -24,6 +25,14 @@ class Colors:
     BLUE = '\033[94m'
     BOLD = '\033[1m'
     END = '\033[0m'
+
+
+def normalize_directory_path(path):
+    """Collapse redundant slashes in a filesystem path string."""
+    value = str(path).strip() if path is not None else ''
+    if not value:
+        return value
+    return re.sub(r'/+', '/', value)
 
 
 def print_status(message, status, details=None):
@@ -92,34 +101,62 @@ def check_flock_command(system):
     return True
 
 
-def check_local_directory(path, description, check_writable=True):
-    """Check if a local directory exists and is writable."""
-    expanded_path = os.path.expandvars(os.path.expanduser(path))
-    check_path = expanded_path
+def inspect_local_directory(path, check_writable=True):
+    """Return structured status for a local directory check."""
+    expanded_path = os.path.expandvars(os.path.expanduser(str(path)))
+    normalized_path = normalize_directory_path(expanded_path)
+    check_path = normalized_path.rstrip('/') or '/'
     is_wildcard = False
-    if expanded_path.endswith('/*') or expanded_path.endswith('*'):
-        check_path = expanded_path.rstrip('*').rstrip('/')
+    if normalized_path.endswith('/*') or normalized_path.endswith('*'):
+        check_path = normalized_path.rstrip('*').rstrip('/') or '/'
         is_wildcard = True
-        if description == "Source directory":
-            description = "Source directory (wildcard pattern)"
+
+    result = {
+        'ok': False,
+        'status': 'missing',
+        'path': check_path,
+        'message': "Directory does not exist: {0}".format(check_path),
+        'is_wildcard': is_wildcard,
+        'missing': False,
+    }
 
     if not os.path.exists(check_path):
-        print_status("{0}".format(description), "ERROR", "Directory does not exist: {0}".format(path))
-        return False
+        result['missing'] = True
+        return result
 
     if not os.path.isdir(check_path):
-        print_status("{0}".format(description), "ERROR", "Path exists but is not a directory: {0}".format(path))
-        return False
+        result['status'] = 'not_directory'
+        result['message'] = "Path exists but is not a directory: {0}".format(
+            check_path
+        )
+        return result
 
     if check_writable and not os.access(check_path, os.W_OK):
-        print_status("{0}".format(description), "ERROR", "Directory is not writable: {0}".format(path))
-        return False
+        result['status'] = 'not_writable'
+        result['message'] = "Directory is not writable: {0}".format(check_path)
+        return result
 
+    result['ok'] = True
+    result['status'] = 'ok'
     if is_wildcard:
-        print_status("{0}".format(description), "OK", "Parent path: {0}".format(check_path))
+        result['message'] = "Parent path: {0}".format(check_path)
     else:
-        print_status("{0}".format(description), "OK", "Path: {0}".format(check_path))
-    return True
+        result['message'] = "Path: {0}".format(check_path)
+    return result
+
+
+def check_local_directory(path, description, check_writable=True):
+    """Check if a local directory exists and is writable."""
+    info = inspect_local_directory(path, check_writable=check_writable)
+    if info['is_wildcard'] and description == "Source directory":
+        description = "Source directory (wildcard pattern)"
+
+    print_status(
+        "{0}".format(description),
+        "OK" if info['ok'] else "ERROR",
+        info['message'],
+    )
+    return info['ok']
 
 
 def parse_remote_destination(destination):
@@ -148,6 +185,102 @@ def build_ssh_target(user, host):
     return host
 
 
+def inspect_remote_directory(
+    user,
+    host,
+    path,
+    port=None,
+    check_writable=True,
+):
+    """Return structured status for a remote directory check."""
+    normalized_path = normalize_directory_path(path).rstrip('/') or '/'
+    try:
+        cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
+        if port:
+            cmd.extend(['-p', str(port)])
+        remote_script = (
+            'if [ ! -e "$1" ]; then '
+            'echo "DIR_MISSING"; '
+            'elif [ ! -d "$1" ]; then '
+            'echo "DIR_NOT_DIRECTORY"; '
+            'elif [ "$2" = "1" ] && [ ! -w "$1" ]; then '
+            'echo "DIR_NOT_WRITABLE"; '
+            'else '
+            'echo "DIR_OK"; '
+            'fi'
+        )
+        cmd.extend([
+            build_ssh_target(user, host),
+            'sh',
+            '-c',
+            remote_script,
+            'sh',
+            normalized_path,
+            '1' if check_writable else '0',
+        ])
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = proc.communicate()
+        result_stdout = stdout.decode('utf-8').strip()
+        result_stderr = stderr.decode('utf-8').strip()
+
+        result = {
+            'ok': False,
+            'status': 'remote_error',
+            'path': normalized_path,
+            'message': "Remote check failed: {0}".format(result_stderr),
+            'missing': False,
+        }
+
+        if proc.returncode != 0:
+            return result
+
+        if 'DIR_OK' in result_stdout:
+            result['ok'] = True
+            result['status'] = 'ok'
+            result['message'] = (
+                "Directory exists and is writable"
+                if check_writable else
+                "Directory exists"
+            )
+            return result
+
+        if 'DIR_MISSING' in result_stdout:
+            result['status'] = 'missing'
+            result['missing'] = True
+            result['message'] = "Directory does not exist: {0}".format(
+                normalized_path
+            )
+            return result
+
+        if 'DIR_NOT_DIRECTORY' in result_stdout:
+            result['status'] = 'not_directory'
+            result['message'] = "Path exists but is not a directory: {0}".format(
+                normalized_path
+            )
+            return result
+
+        if 'DIR_NOT_WRITABLE' in result_stdout:
+            result['status'] = 'not_writable'
+            result['message'] = "Directory is not writable: {0}".format(
+                normalized_path
+            )
+            return result
+
+        result['message'] = "Remote check returned unexpected output: {0}".format(
+            result_stdout or '(empty)'
+        )
+        return result
+    except Exception as exc:
+        return {
+            'ok': False,
+            'status': 'remote_error',
+            'path': normalized_path,
+            'message': "Remote directory check error: {0}".format(str(exc)),
+            'missing': False,
+        }
+
+
 def check_ssh_connection(user, host, port=None):
     """Check SSH connection to remote host."""
     try:
@@ -170,29 +303,14 @@ def check_ssh_connection(user, host, port=None):
 
 def check_remote_directory(user, host, path, port=None, description="Remote directory", check_writable=True):
     """Check if a remote directory exists and is optionally writable."""
-    try:
-        cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
-        if port:
-            cmd.extend(['-p', str(port)])
-
-        if check_writable:
-            test_cmd = '[ -d "{0}" ] && [ -w "{0}" ] && echo "DIR_OK" || echo "DIR_FAIL"'.format(path)
-        else:
-            test_cmd = '[ -d "{0}" ] && echo "DIR_OK" || echo "DIR_FAIL"'.format(path)
-        cmd.extend([build_ssh_target(user, host), test_cmd])
-
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = proc.communicate()
-        result_stdout = stdout.decode('utf-8')
-        result_stderr = stderr.decode('utf-8')
-
-        if proc.returncode == 0:
-            if 'DIR_OK' in result_stdout:
-                return True, "Directory exists and is writable" if check_writable else "Directory exists"
-            return False, "Directory does not exist or is not writable" if check_writable else "Directory does not exist"
-        return False, "Remote check failed: {0}".format(result_stderr.strip())
-    except Exception as exc:
-        return False, "Remote directory check error: {0}".format(str(exc))
+    info = inspect_remote_directory(
+        user,
+        host,
+        path,
+        port=port,
+        check_writable=check_writable,
+    )
+    return info['ok'], info['message']
 
 
 def check_log_directory(log_file_path):
@@ -201,7 +319,7 @@ def check_log_directory(log_file_path):
         return True, "No log file specified"
 
     expanded_path = os.path.expandvars(os.path.expanduser(log_file_path))
-    log_dir = os.path.dirname(expanded_path)
+    log_dir = normalize_directory_path(os.path.dirname(expanded_path))
 
     if not log_dir:
         return True, "Log file in current directory"

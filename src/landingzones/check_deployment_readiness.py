@@ -38,6 +38,9 @@ from landingzones.readiness_ops import (
     generate_cron_files,
     get_current_system,
     get_current_user,
+    inspect_local_directory,
+    inspect_remote_directory,
+    normalize_directory_path,
     parse_remote_destination,
     print_header,
     print_status,
@@ -674,6 +677,97 @@ def ask_yes_no(prompt_text):
         return False
 
 
+def normalize_endpoint_display(value):
+    """Render a local or remote endpoint with redundant slashes collapsed."""
+    user, host, path = parse_remote_destination(value)
+    normalized_path = normalize_directory_path(path)
+    if host:
+        return "{0}:{1}".format(build_ssh_target(user, host), normalized_path)
+    return normalized_path
+
+
+def missing_directory_key(entry):
+    """Return a stable dedupe key for a missing directory record."""
+    if entry['scope'] == 'remote':
+        return (
+            entry['scope'],
+            entry['user'] or '',
+            entry['host'],
+            str(entry['port'] or ''),
+            entry['path'],
+        )
+    return (entry['scope'], entry['path'])
+
+
+def add_missing_directory(missing_directories, entry):
+    """Append a missing directory record if it is not already present."""
+    key = missing_directory_key(entry)
+    if key in {missing_directory_key(item) for item in missing_directories}:
+        return
+    missing_directories.append(entry)
+
+
+def format_missing_directory(entry):
+    """Return a user-facing display string for a missing directory."""
+    if entry['scope'] == 'remote':
+        return "{0}:{1}".format(
+            build_ssh_target(entry['user'], entry['host']),
+            entry['path'],
+        )
+    return entry['path']
+
+
+def create_missing_directories(missing_directories):
+    """Attempt to create the collected missing directories."""
+    if not missing_directories:
+        return True
+
+    print_header("Create Missing Directories")
+    all_ok = True
+
+    for entry in missing_directories:
+        display_path = format_missing_directory(entry)
+        if entry['scope'] == 'local':
+            try:
+                os.makedirs(entry['path'], exist_ok=True)
+                print_status(
+                    "Create local directory",
+                    "OK",
+                    display_path,
+                )
+            except OSError as exc:
+                print_status(
+                    "Create local directory",
+                    "ERROR",
+                    "{0}: {1}".format(display_path, exc),
+                )
+                all_ok = False
+            continue
+
+        command = 'mkdir -p {0}'.format(shell_path(entry['path']))
+        rc, _, stderr = run_remote_shell(
+            entry['user'],
+            entry['host'],
+            command,
+            entry['port'],
+        )
+        if rc == 0:
+            print_status(
+                "Create remote directory",
+                "OK",
+                display_path,
+            )
+        else:
+            print_status(
+                "Create remote directory",
+                "ERROR",
+                "{0}: {1}".format(display_path, stderr.strip() or 'unknown error'),
+            )
+            all_ok = False
+
+    return all_ok
+
+
 def run_test_with_data(config_file=None, transfers_file=None, slow=False):
     """Run generated scripts against seeded toy-data in the real test tree."""
     print_header("Transfer Test With Data")
@@ -916,9 +1010,15 @@ def main(argv=None):
     
     # Check each transfer
     all_transfers_ok = True
+    missing_directories = []
     
     for _, transfer in system_transfers.iterrows():
-        print_header("Transfer: {0} → {1}".format(transfer['source'], transfer['destination']))
+        print_header(
+            "Transfer: {0} → {1}".format(
+                normalize_endpoint_display(transfer['source']),
+                normalize_endpoint_display(transfer['destination']),
+            )
+        )
         
         transfer_ok = True
         
@@ -941,22 +1041,53 @@ def main(argv=None):
                 ssh_msg,
             )
             if ssh_ok:
-                dir_ok, dir_msg = check_remote_directory(
+                remote_source_info = inspect_remote_directory(
                     source_user,
                     source_host,
                     source_path,
-                    source_port,
-                    "Source directory",
+                    port=source_port,
                     check_writable=False,
                 )
-                print_status("Source directory", "OK" if dir_ok else "ERROR", dir_msg)
-                if not dir_ok:
+                print_status(
+                    "Source directory",
+                    "OK" if remote_source_info['ok'] else "ERROR",
+                    remote_source_info['message'],
+                )
+                if not remote_source_info['ok']:
                     transfer_ok = False
+                    if remote_source_info['missing']:
+                        add_missing_directory(
+                            missing_directories,
+                            {
+                                'scope': 'remote',
+                                'user': source_user,
+                                'host': source_host,
+                                'port': source_port,
+                                'path': remote_source_info['path'],
+                            },
+                        )
             else:
                 transfer_ok = False
         else:
-            if not check_local_directory(transfer['source'], "Source directory"):
+            local_source_info = inspect_local_directory(
+                transfer['source'],
+                check_writable=False,
+            )
+            print_status(
+                "Source directory",
+                "OK" if local_source_info['ok'] else "ERROR",
+                local_source_info['message'],
+            )
+            if not local_source_info['ok']:
                 transfer_ok = False
+                if local_source_info['missing']:
+                    add_missing_directory(
+                        missing_directories,
+                        {
+                            'scope': 'local',
+                            'path': local_source_info['path'],
+                        },
+                    )
         
         # Check destination
         user, host, dest_path = parse_remote_destination(transfer['destination'])
@@ -969,7 +1100,12 @@ def main(argv=None):
         if host:
             # Remote destination
             remote_label = build_ssh_target(user, host)
-            print("\n  Remote destination: {0}:{1}".format(remote_label, dest_path))
+            print(
+                "\n  Remote destination: {0}:{1}".format(
+                    remote_label,
+                    normalize_directory_path(dest_path),
+                )
+            )
             if port:
                 print("  Using port: {0}".format(port))
             
@@ -978,17 +1114,54 @@ def main(argv=None):
             print_status("SSH connection to {0}".format(host), "OK" if ssh_ok else "ERROR", ssh_msg)
             
             if ssh_ok:
-                # Check remote directory
-                dir_ok, dir_msg = check_remote_directory(user, host, dest_path, port, "Remote destination")
-                print_status("Remote destination directory", "OK" if dir_ok else "ERROR", dir_msg)
-                if not dir_ok:
+                remote_dest_info = inspect_remote_directory(
+                    user,
+                    host,
+                    dest_path,
+                    port=port,
+                    check_writable=True,
+                )
+                print_status(
+                    "Remote destination directory",
+                    "OK" if remote_dest_info['ok'] else "ERROR",
+                    remote_dest_info['message'],
+                )
+                if not remote_dest_info['ok']:
                     transfer_ok = False
+                    if remote_dest_info['missing']:
+                        add_missing_directory(
+                            missing_directories,
+                            {
+                                'scope': 'remote',
+                                'user': user,
+                                'host': host,
+                                'port': port,
+                                'path': remote_dest_info['path'],
+                            },
+                        )
             else:
                 transfer_ok = False
         else:
             # Local destination
-            if not check_local_directory(dest_path, "Destination directory"):
+            local_dest_info = inspect_local_directory(
+                dest_path,
+                check_writable=True,
+            )
+            print_status(
+                "Destination directory",
+                "OK" if local_dest_info['ok'] else "ERROR",
+                local_dest_info['message'],
+            )
+            if not local_dest_info['ok']:
                 transfer_ok = False
+                if local_dest_info['missing']:
+                    add_missing_directory(
+                        missing_directories,
+                        {
+                            'scope': 'local',
+                            'path': local_dest_info['path'],
+                        },
+                    )
         
         # Check log file directory
         log_file = transfer.get('log_file', '')
@@ -1011,6 +1184,30 @@ def main(argv=None):
             all_transfers_ok = False
         
         print()  # Blank line between transfers
+
+    if missing_directories:
+        print_header("Missing Directories")
+        print_status(
+            "Missing directory count",
+            "INFO",
+            "Found {0} missing directories.".format(len(missing_directories)),
+        )
+        for entry in missing_directories:
+            print("  - {0}".format(format_missing_directory(entry)))
+        if ask_yes_no("Do you want to attempt to create these missing directories now?"):
+            create_ok = create_missing_directories(missing_directories)
+            if create_ok:
+                print_status(
+                    "Directory creation",
+                    "OK",
+                    "Created all listed directories. Re-run validate deployment to confirm readiness.",
+                )
+            else:
+                print_status(
+                    "Directory creation",
+                    "ERROR",
+                    "Some directories could not be created. Review the errors above.",
+                )
     
     # Final summary
     print_header("Deployment Readiness Summary")

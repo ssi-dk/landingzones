@@ -190,6 +190,17 @@ class TestConfigClass:
         assert cfg.get_rit_managed_location('unknown') == 'custom_output'
         assert cfg.get_rit_managed_path('calc', 'sh_output') == '/srv/rit_managed/scripts/out'
         assert cfg.get_flock_path('calc') == '/usr/bin/flock'
+
+    def test_report_transfer_log_file_accepts_legacy_yaml_key(self, tmp_path, monkeypatch):
+        """Older configs using transfer_log_file should keep working."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("transfer_log_file: legacy/transfers.tsv\n")
+
+        monkeypatch.chdir(tmp_path)
+        cfg = config.Config()
+
+        assert cfg.report_transfer_log_file == 'legacy/transfers.tsv'
+        assert cfg.transfer_log_file == 'legacy/transfers.tsv'
     
     def test_config_from_config_subdir(self, tmp_path, monkeypatch):
         """Test that Config loads values from config/config.yaml"""
@@ -214,6 +225,15 @@ class TestConfigClass:
         cfg = config.Config()
         
         assert cfg.log_dir == 'from_env'
+
+    def test_report_transfer_log_file_accepts_legacy_env_var(self, tmp_path, monkeypatch):
+        """Older automation environments should still resolve LZ_TRANSFER_LOG_FILE."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LZ_TRANSFER_LOG_FILE", "/tmp/legacy.tsv")
+
+        cfg = config.Config()
+
+        assert cfg.report_transfer_log_file == '/tmp/legacy.tsv'
 
     def test_path_variables_merge_env_yaml_and_runtime(self, tmp_path, monkeypatch):
         """Config path variables should merge env, YAML, and runtime values."""
