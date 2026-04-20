@@ -12,6 +12,10 @@ import pytest
 from landingzones import generate_cron_files as gcf
 
 
+HAS_RSYNC = shutil.which("rsync") is not None
+HAS_FLOCK = shutil.which("flock") is not None
+
+
 class TestParseTransfersFile:
     """Test the parse_transfers_file function"""
     
@@ -319,6 +323,52 @@ promote_calc\tTRUE\ttest_local\tlocal\t/flow/stage/\t/flow/final/
 
 class TestGenerateRsyncCommand:
     """Test the generate_rsync_command function"""
+
+    def _run_generated_transfer_script(self, tmp_path, transfer):
+        """Write and execute a generated transfer script under test-local config."""
+        managed_root = tmp_path / "managed"
+        snapshot = gcf.config.snapshot_state()
+        gcf.config.load_config(
+            output_dir=str(tmp_path / "output"),
+            rit_managed_locations={'server1': str(managed_root)},
+            rit_managed_folder_structure={
+                'sh_output': 'scripts',
+                'crontabs': 'crontab.d',
+                'log': 'log',
+                'flock': 'flock',
+            },
+            flock_paths={'server1': shutil.which("flock") or '/usr/bin/flock'},
+        )
+        try:
+            script = gcf.generate_script_content(transfer)
+        finally:
+            gcf.config.restore_state(snapshot)
+
+        script_path = tmp_path / "{0}.sh".format(transfer['identifiers'])
+        script_path.write_text(script)
+        script_path.chmod(0o755)
+
+        env = dict(os.environ)
+        if HAS_RSYNC or HAS_FLOCK:
+            path_parts = []
+            rsync_path = shutil.which("rsync")
+            flock_path = shutil.which("flock")
+            if rsync_path:
+                path_parts.append(os.path.dirname(rsync_path))
+            if flock_path:
+                path_parts.append(os.path.dirname(flock_path))
+            path_parts.append(env.get("PATH", ""))
+            env["PATH"] = os.pathsep.join([part for part in path_parts if part])
+
+        proc = subprocess.run(
+            [str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(tmp_path),
+            env=env,
+        )
+        return proc, managed_root
     
     def test_basic_rsync_command(self):
         """Test basic rsync command generation"""
@@ -718,11 +768,21 @@ class TestGenerateRsyncCommand:
         assert script.startswith('#!/bin/sh\n')
         assert 'set -eu' in script
         assert 'find "/source" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | while IFS= read -r source_dir; do' in script
+        assert 'preflight_log="$(mktemp "${TMPDIR:-/tmp}/landingzones.sample.preflight.XXXXXX")"' in script
+        assert 'preflight_stderr_log="$(mktemp "${TMPDIR:-/tmp}/landingzones.sample.preflight-stderr.XXXXXX")"' in script
+        assert 'if ! find "$source_dir" -type d -print | while IFS= read -r dir_path; do [ -w "$dir_path" ] && [ -x "$dir_path" ] || printf "%s\\n" "$dir_path"; done >"$preflight_log" 2>"$preflight_stderr_log"; then' in script
+        assert 'rsync --dry-run -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$preflight_log" 2>&1' in script
         assert 'rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
+        assert 'preflight_message="source cleanup preflight command failed: $(summarize_log "$preflight_stderr_log")"' in script
+        assert 'preflight_message="source cleanup preflight failed: $(summarize_log "$preflight_log")"' in script
+        assert 'preflight_message="rsync dry-run failed: $(summarize_log "$preflight_log")"' in script
+        assert 'reset_current_run_context' in script
         assert 'exec 9>"$flock_file"' in script
         assert '/opt/bin/flock -n 9' in script
         assert 'flock_file="/tmp/test.lock"' in script
         assert 'cat "$run_log" >> "$log_file"' in script
+        assert 'cat "$preflight_log" >> "$log_file"' in script
+        assert 'cat "$preflight_stderr_log" >> "$log_file"' in script
         assert 'mini_log_file="/tmp/test.log.mini"' in script
         assert "printf '%s %s\\n'" in script
         assert 'common_status_log_file="output/log/Landing_Zone_server1.transfers.tsv"' in script
@@ -735,6 +795,8 @@ class TestGenerateRsyncCommand:
         assert 'dump_debug_log "run log" "$run_log"' in script
         assert 'dump_debug_log "promote log" "$promote_log"' in script
         assert 'dump_debug_log "cleanup log" "$cleanup_log"' in script
+        assert 'dump_debug_log "preflight log" "$preflight_log"' in script
+        assert 'dump_debug_log "preflight stderr log" "$preflight_stderr_log"' in script
         assert 'debug "script failed with exit code $status"' in script
         assert 'debug "$dir_name initiated"' in script
         assert 'debug "$dir_name completed"' in script
@@ -1183,6 +1245,8 @@ class TestGenerateRsyncCommand:
             gcf.config._runtime_config = original_runtime_config
 
         assert "ssh -p 2200 user@remote 'find \"/source\" -mindepth 1 -maxdepth 1 -type d ! -name \".*\" -print' | while IFS= read -r source_dir; do" in script
+        assert 'if ! remote_ssh "$source_remote_target" "$source_remote_port" sh -c \'find "$1" -type d -print | while IFS= read -r dir_path; do [ -w "$dir_path" ] && [ -x "$dir_path" ] || printf "%s\\n" "$dir_path"; done\' sh "$source_dir" >"$preflight_log" 2>"$preflight_stderr_log"; then' in script
+        assert 'rsync --dry-run -av --remove-source-files -e \'ssh -p 2200\' "user@remote:$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$preflight_log" 2>&1' in script
         assert 'rsync -av --remove-source-files -e \'ssh -p 2200\' "user@remote:$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'current_run_source="user@remote:$source_dir"' in script
         assert 'current_run_destination="/dest/$dir_name"' in script
@@ -1213,6 +1277,98 @@ class TestGenerateRsyncCommand:
             gcf.config._runtime_config = original_runtime_config
 
         assert '! -name ".*"' in script
+
+    @pytest.mark.skipif(
+        not (HAS_RSYNC and HAS_FLOCK),
+        reason="requires rsync and flock",
+    )
+    def test_generated_script_skips_run_when_hidden_directory_permissions_fail(self, tmp_path):
+        """A hidden directory with bad permissions should block that run before transfer."""
+        source_root = tmp_path / "source"
+        destination_root = tmp_path / "destination"
+        run_dir = source_root / "Run1"
+        hidden_dir = run_dir / ".cache"
+        hidden_file = hidden_dir / ".hidden_payload"
+        source_root.mkdir()
+        destination_root.mkdir()
+        hidden_dir.mkdir(parents=True)
+        hidden_file.write_text("hidden")
+        hidden_dir.chmod(0o600)
+
+        transfer = {
+            'identifiers': 'hidden_permission_failure',
+            'system': 'server1',
+            'source': str(source_root / '*'),
+            'source_port': '',
+            'destination': str(destination_root) + '/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': str(tmp_path / 'hidden_permission_failure.log'),
+            'flock_file': str(tmp_path / 'hidden_permission_failure.lock'),
+            'frequency': '',
+        }
+
+        try:
+            proc, managed_root = self._run_generated_transfer_script(tmp_path, transfer)
+        finally:
+            hidden_dir.chmod(0o700)
+
+        common_status_log = managed_root / "log" / "Landing_Zone_server1.transfers.tsv"
+
+        assert proc.returncode == 0
+        assert run_dir.exists()
+        assert not (destination_root / "Run1").exists()
+        assert common_status_log.exists()
+        status_text = common_status_log.read_text()
+        assert "initiated" in status_text
+        assert "error" in status_text
+        assert "source cleanup preflight failed" in status_text
+        assert ".cache" in status_text
+
+    @pytest.mark.skipif(
+        not (HAS_RSYNC and HAS_FLOCK),
+        reason="requires rsync and flock",
+    )
+    def test_generated_script_transfers_hidden_files_when_permissions_are_valid(self, tmp_path):
+        """Hidden files inside a selected run should transfer when permissions are fine."""
+        source_root = tmp_path / "source"
+        destination_root = tmp_path / "destination"
+        run_dir = source_root / "RunGood"
+        source_root.mkdir()
+        destination_root.mkdir()
+        run_dir.mkdir()
+        (run_dir / "payload.txt").write_text("visible")
+        (run_dir / ".hidden_payload").write_text("hidden")
+
+        transfer = {
+            'identifiers': 'hidden_permission_success',
+            'system': 'server1',
+            'source': str(source_root / '*'),
+            'source_port': '',
+            'destination': str(destination_root) + '/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': str(tmp_path / 'hidden_permission_success.log'),
+            'flock_file': str(tmp_path / 'hidden_permission_success.lock'),
+            'frequency': '',
+        }
+
+        proc, managed_root = self._run_generated_transfer_script(tmp_path, transfer)
+        destination_run = destination_root / "RunGood"
+        common_status_log = managed_root / "log" / "Landing_Zone_server1.transfers.tsv"
+
+        assert proc.returncode == 0
+        assert not run_dir.exists()
+        assert destination_run.exists()
+        assert (destination_run / "payload.txt").read_text() == "visible"
+        assert (destination_run / ".hidden_payload").read_text() == "hidden"
+        assert common_status_log.exists()
+        status_text = common_status_log.read_text()
+        assert "RunGood" in status_text
+        assert "completed" in status_text
+        assert "source cleanup preflight failed" not in status_text
 
 
 class TestGenerateCronHeader:

@@ -744,8 +744,10 @@ def generate_iterative_script_content(transfer):
 
     io_nice_cmd = normalize_io_nice(transfer.get('io_nice', ''))
     rsync_cmd = "rsync {0}".format(base_options)
+    dry_run_rsync_cmd = "rsync --dry-run {0}".format(base_options)
     if io_nice_cmd:
         rsync_cmd = "{0} {1}".format(io_nice_cmd, rsync_cmd)
+        dry_run_rsync_cmd = "{0} {1}".format(io_nice_cmd, dry_run_rsync_cmd)
 
     if source_remote:
         remote_find_cmd = (
@@ -759,12 +761,24 @@ def generate_iterative_script_content(transfer):
             build_remote_shell_command(remote_find_cmd, source_remote, source_port),
         )
         rsync_source = '"{0}:$source_dir/"'.format(source_remote)
+        source_cleanup_preflight_cmd = (
+            'remote_ssh "$source_remote_target" "$source_remote_port" sh -c '
+            '\'find "$1" -type d -print | while IFS= read -r dir_path; do '
+            '[ -w "$dir_path" ] && [ -x "$dir_path" ] || printf "%s\\n" "$dir_path"; '
+            'done\' '
+            'sh "$source_dir"'
+        )
     else:
         source_loop = (
             'find {0} -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | '
             'while IFS= read -r source_dir; do'
         ).format(shell_path(source_root))
         rsync_source = '"$source_dir/"'
+        source_cleanup_preflight_cmd = (
+            'find "$source_dir" -type d -print | while IFS= read -r dir_path; do '
+            '[ -w "$dir_path" ] && [ -x "$dir_path" ] || printf "%s\\n" "$dir_path"; '
+            'done'
+        )
 
     remote_destination_setup = ''
     runtime_destination_root = destination_root
@@ -801,6 +815,13 @@ def generate_iterative_script_content(transfer):
             destination_remote,
             escaped_destination_root,
         )
+        cleanup_staging_cmd = (
+            '{0} "rmdir \\"{1}/.staging/$dir_name\\" 2>/dev/null || true; '
+            'rmdir \\"{1}/.staging\\" 2>/dev/null || true"'
+        ).format(
+            build_ssh_command(destination_remote, destination_port),
+            escaped_destination_root,
+        )
     else:
         mkdir_cmd = 'mkdir -p "{0}/.staging/$dir_name"'.format(destination_root)
         promote_cmd = (
@@ -813,6 +834,10 @@ def generate_iterative_script_content(transfer):
             'rmdir "{0}/.staging" 2>/dev/null || true'
         ).format(destination_root)
         rsync_destination = '"{0}/.staging/$dir_name/"'.format(destination_root)
+        cleanup_staging_cmd = (
+            'rmdir "{0}/.staging/$dir_name" 2>/dev/null || true; '
+            'rmdir "{0}/.staging" 2>/dev/null || true'
+        ).format(destination_root)
 
     if source_remote:
         run_source_expr = '"{0}:$source_dir"'.format(source_remote)
@@ -866,6 +891,8 @@ portable_events_file_name="landingzone-transfer-events.tsv"
 run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.rsync.XXXXXX")"
 cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.cleanup.XXXXXX")"
 promote_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.promote.XXXXXX")"
+preflight_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.preflight.XXXXXX")"
+preflight_stderr_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.preflight-stderr.XXXXXX")"
 current_run=""
 current_run_id=""
 current_run_name=""
@@ -877,7 +904,7 @@ current_run_destination=""
 current_run_completed=0
 
 cleanup() {{
-    rm -f "$run_log" "$cleanup_log" "$promote_log"
+    rm -f "$run_log" "$cleanup_log" "$promote_log" "$preflight_log" "$preflight_stderr_log"
 }}
 debug_enabled() {{
     [ -t 1 ] || [ "${{LZ_DEBUG_CLI:-0}}" = "1" ]
@@ -1209,6 +1236,27 @@ dump_debug_log() {{
     fi
 }}
 
+reset_current_run_context() {{
+    current_run=""
+    current_run_id=""
+    current_run_name=""
+    current_origin_system=""
+    current_entry_transfer_identifier=""
+    current_created_at_utc=""
+    current_run_source=""
+    current_run_destination=""
+    current_run_completed=0
+}}
+
+summarize_log() {{
+    path="$1"
+    if [ ! -s "$path" ]; then
+        printf 'see log'
+        return 0
+    fi
+    awk 'NF {{ gsub(/\\t/, " "); print; exit }}' "$path"
+}}
+
 on_exit() {{
     status=$?
     if [ "$status" -ne 0 ]; then
@@ -1223,6 +1271,8 @@ on_exit() {{
         dump_debug_log "run log" "$run_log"
         dump_debug_log "promote log" "$promote_log"
         dump_debug_log "cleanup log" "$cleanup_log"
+        dump_debug_log "preflight log" "$preflight_log"
+        dump_debug_log "preflight stderr log" "$preflight_stderr_log"
     fi
     cleanup
     exit "$status"
@@ -1265,7 +1315,38 @@ fi
     append_source_portable_event "initiated"
     append_common_status "initiated" "$dir_name" "$current_run_source" "$current_run_destination"
     debug "$dir_name initiated"
+    : >"$preflight_log"
+    : >"$preflight_stderr_log"
+    if ! {source_cleanup_preflight_cmd} >"$preflight_log" 2>"$preflight_stderr_log"; then
+        preflight_message="source cleanup preflight command failed: $(summarize_log "$preflight_stderr_log")"
+        log_status "$dir_name error"
+        append_source_portable_event "error" "$preflight_message"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$preflight_message"
+        debug "$dir_name $preflight_message"
+        reset_current_run_context
+        continue
+    fi
+    if [ -s "$preflight_log" ]; then
+        preflight_message="source cleanup preflight failed: $(summarize_log "$preflight_log")"
+        log_status "$dir_name error"
+        append_source_portable_event "error" "$preflight_message"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$preflight_message"
+        debug "$dir_name $preflight_message"
+        reset_current_run_context
+        continue
+    fi
     {mkdir_cmd} </dev/null >>"$promote_log" 2>&1
+    if ! {dry_run_rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$preflight_log" 2>&1; then
+        preflight_message="rsync dry-run failed: $(summarize_log "$preflight_log")"
+        {cleanup_staging_cmd} </dev/null >>"$preflight_log" 2>&1
+        log_status "$dir_name error"
+        append_source_portable_event "error" "$preflight_message"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$preflight_message"
+        debug "$dir_name $preflight_message"
+        reset_current_run_context
+        continue
+    fi
+    : >"$preflight_log"
     {rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$run_log" 2>&1
     {promote_cmd} </dev/null >>"$promote_log" 2>&1
     log_status "$dir_name completed"
@@ -1273,20 +1354,19 @@ fi
     append_common_status "completed" "$dir_name" "$current_run_source" "$current_run_destination"
     debug "$dir_name completed"
     current_run_completed=1
-    current_run=""
-    current_run_id=""
-    current_run_name=""
-    current_origin_system=""
-    current_entry_transfer_identifier=""
-    current_created_at_utc=""
-    current_run_source=""
-    current_run_destination=""
+    reset_current_run_context
 done
 if [ -s "$run_log" ]; then
     cat "$run_log" >> "$log_file"
 fi
 if [ -s "$promote_log" ]; then
     cat "$promote_log" >> "$log_file"
+fi
+if [ -s "$preflight_log" ]; then
+    cat "$preflight_log" >> "$log_file"
+fi
+if [ -s "$preflight_stderr_log" ]; then
+    cat "$preflight_stderr_log" >> "$log_file"
 fi
 
 {find_cmd} >"$cleanup_log" 2>&1
@@ -1298,6 +1378,12 @@ if sed '/^sending incremental file list$/d; /^sent .* bytes .*$/d; /^total size 
     cat "$run_log" > "$latest_log_file"
     if [ -s "$promote_log" ]; then
         cat "$promote_log" >> "$latest_log_file"
+    fi
+    if [ -s "$preflight_log" ]; then
+        cat "$preflight_log" >> "$latest_log_file"
+    fi
+    if [ -s "$preflight_stderr_log" ]; then
+        cat "$preflight_stderr_log" >> "$latest_log_file"
     fi
     if [ -s "$cleanup_log" ]; then
         cat "$cleanup_log" >> "$latest_log_file"
@@ -1330,10 +1416,13 @@ fi
         run_source_expr=run_source_expr,
         run_destination_expr=run_destination_expr,
         mkdir_cmd=mkdir_cmd,
+        source_cleanup_preflight_cmd=source_cleanup_preflight_cmd,
+        dry_run_rsync_cmd=dry_run_rsync_cmd,
         rsync_cmd=rsync_cmd,
         rsync_source=rsync_source,
         rsync_destination=rsync_destination,
         promote_cmd=promote_cmd,
+        cleanup_staging_cmd=cleanup_staging_cmd,
         find_cmd=commands['find_cmd'],
         transfer_source_label=transfer_source_label.replace('"', '\\"'),
         transfer_destination_label=transfer_destination_label.replace('"', '\\"'),

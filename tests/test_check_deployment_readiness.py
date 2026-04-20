@@ -571,6 +571,38 @@ class TestTestWithData:
             str(tmp_path / 'final')
         ]
 
+    def test_build_run_test_plan_prefers_explicit_entry_points_for_seed_sources(
+        self, tmp_path
+    ):
+        """Explicit entry-point metadata should exclude inherited remote sources from seeding."""
+        df = pd.DataFrame([
+            {
+                'identifiers': 'entry_local',
+                'source': str(tmp_path / 'calc' / 'Landing_Zone' / 'to_ugerm') + '/',
+                'source_port': '',
+                'destination': 'sshdat@ugerm:/users/data/Landing_Zone/from_calc/',
+                'destination_port': '',
+                'test_fixture_names': 'fixture_one',
+                'is_entry_point': 'TRUE',
+            },
+            {
+                'identifiers': 'return_remote',
+                'source': 'sshdat@ugerm:/users/data/Landing_Zone/to_calc/',
+                'source_port': '',
+                'destination': str(tmp_path / 'calc' / 'Landing_Zone' / 'from_ugerm') + '/',
+                'destination_port': '',
+                'test_fixture_names': '',
+                'is_entry_point': 'FALSE',
+            },
+        ])
+
+        plan = cdr.build_run_test_plan(df)
+
+        assert len(plan['initial_sources']) == 1
+        assert plan['initial_sources'][0]['value'] == str(
+            tmp_path / 'calc' / 'Landing_Zone' / 'to_ugerm'
+        ) + '/'
+
     def test_load_test_with_data_transfers_preserves_env_var_paths(self, tmp_path):
         """test-with-data should keep env-var based paths unchanged."""
         transfers_file = tmp_path / 'transfers.tsv'
@@ -588,6 +620,120 @@ class TestTestWithData:
 
         assert subset_df['source'].tolist() == ['$LZ_TEST_ROOT/source/']
         assert subset_df['destination'].tolist() == ['$LZ_TEST_ROOT/dest/']
+
+    def test_build_test_with_data_handoffs_identifies_next_system_user(self, tmp_path):
+        """A destination that feeds another system should produce a handoff hint."""
+        all_transfers_df = pd.DataFrame([
+            {
+                'identifiers': 'step1',
+                'system': 'calc',
+                'users': 'runner',
+                'source': str(tmp_path / 'source') + '/',
+                'destination': str(tmp_path / 'handoff') + '/',
+                'flow_group': 'flow_a',
+            },
+            {
+                'identifiers': 'step2',
+                'system': 'ugerm',
+                'users': 'corfac',
+                'source': str(tmp_path / 'handoff') + '/',
+                'destination': str(tmp_path / 'final') + '/',
+                'flow_group': 'flow_a',
+            },
+        ])
+
+        current_transfers_df = all_transfers_df.iloc[[0]].copy()
+
+        handoffs = cdr.build_test_with_data_handoffs(
+            all_transfers_df,
+            current_transfers_df,
+            slow=True,
+        )
+
+        assert len(handoffs) == 1
+        assert handoffs[0]['system'] == 'ugerm'
+        assert handoffs[0]['user'] == 'corfac'
+        assert handoffs[0]['command'] == 'landingzones validate integration --slow'
+        assert handoffs[0]['transfers'][0]['identifier'] == 'step2'
+        assert handoffs[0]['transfers'][0]['source'] == str(tmp_path / 'handoff') + '/'
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_reports_handoff_and_skips_cleanup_prompt(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Intermediate system runs should print handoff guidance and keep state."""
+        config_file = tmp_path / 'config.yaml'
+        transfers_file = tmp_path / 'transfers.tsv'
+        source_root = tmp_path / 'tests' / 'toy_data' / 'producer_a'
+        handoff_root = tmp_path / 'handoff'
+        final_root = tmp_path / 'final'
+        rit_managed = tmp_path / 'rit_managed'
+
+        source_root.mkdir(parents=True)
+        handoff_root.mkdir()
+        final_root.mkdir()
+        rit_managed.mkdir()
+        run_dir = source_root / 'flow_one'
+        run_dir.mkdir()
+        (run_dir / 'payload.txt').write_text('flow_one')
+
+        config_file.write_text(
+            "\n".join([
+                "transfers_file: {0}".format(transfers_file),
+                "test_data: {0}".format(tmp_path / 'tests' / 'toy_data'),
+                "rit_managed_locations:",
+                "  calc: {0}".format(rit_managed),
+                "flock_paths:",
+                "  calc: /usr/bin/true",
+                "rit_managed_folder_structure:",
+                "  log: log/",
+                "  flock: flock/",
+                "  sh_output: scripts/",
+                "  crontabs: crontab.d/",
+                "",
+            ])
+        )
+        transfers_file.write_text(
+            "\n".join([
+                "identifiers\tenabled\tsystem\tnotes\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tfrequency",
+                "step1\tTRUE\tcalc\t''\trunner\t{0}/\t\t{1}/\t\t--out-format='%t %o %i %n%L'\t\tstep1.log\tstep1.lock\t* * * * *".format(
+                    tmp_path / 'producer_a', handoff_root
+                ),
+                "step2\tTRUE\tugerm\t''\tcorfac\t{0}/\t\t{1}/\t\t--out-format='%t %o %i %n%L'\t\tstep2.log\tstep2.lock\t* * * * *".format(
+                    handoff_root, final_root
+                ),
+                "",
+            ])
+        )
+
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'calc')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        cleanup_prompts = []
+        monkeypatch.setattr(
+            cdr,
+            'ask_yes_no',
+            lambda prompt_text: cleanup_prompts.append(prompt_text) or False,
+        )
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+            slow=True,
+        )
+        captured = capsys.readouterr()
+
+        assert result is True
+        assert cleanup_prompts == []
+        assert cdr.list_visible_entries(str(handoff_root)) == ['flow_one']
+        assert cdr.list_visible_entries(str(final_root)) == []
+        assert "Next System Handoff" in captured.out
+        assert "Switch to corfac@ugerm" in captured.out
+        assert "landingzones validate integration --slow" in captured.out
+        assert "step2" in captured.out
 
     def test_build_test_with_data_seed_plan_uses_only_available_toy_data_directory(
         self, tmp_path

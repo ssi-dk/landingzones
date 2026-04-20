@@ -163,6 +163,12 @@ def build_run_test_plan(transfers_df):
 
     initial_source_map = {}
     terminal_destinations = []
+    entry_point_flags = {
+        str(transfer.get('is_entry_point', '') or '').strip().upper()
+        for _, transfer in transfers_df.iterrows()
+    }
+    prefer_explicit_entry_points = 'TRUE' in entry_point_flags
+
     for _, transfer in transfers_df.iterrows():
         source_info = {
             'value': transfer['source'],
@@ -175,7 +181,16 @@ def build_run_test_plan(transfers_df):
             'value': transfer['destination'],
             'port': str(transfer.get('destination_port', '') or '').strip(),
         }
-        if endpoint_key(transfer['source']) not in destination_keys:
+        is_entry_point = (
+            str(transfer.get('is_entry_point', '') or '').strip().upper() == 'TRUE'
+        )
+        is_initial_source = False
+        if prefer_explicit_entry_points:
+            is_initial_source = is_entry_point
+        else:
+            is_initial_source = endpoint_key(transfer['source']) not in destination_keys
+
+        if is_initial_source:
             source_key = endpoint_key(transfer['source'])
             existing = initial_source_map.get(source_key)
             if existing is None:
@@ -472,7 +487,7 @@ def load_test_with_data_transfers(
     transfers_file, current_system, current_user, base_dir
 ):
     """Load the current system/user transfer subset for test-with-data."""
-    df = parse_transfers_file(transfers_file)
+    df = load_test_with_data_transfer_graph(transfers_file, base_dir)
     df = filter_transfers_by_system_user(df, current_system, current_user)
     if df.empty:
         raise ValueError(
@@ -480,6 +495,12 @@ def load_test_with_data_transfers(
                 current_user, current_system
             )
         )
+    return df
+
+
+def load_test_with_data_transfer_graph(transfers_file, base_dir):
+    """Load all test-with-data transfers with local endpoints absolutized."""
+    df = parse_transfers_file(transfers_file)
     for column in ('source', 'destination'):
         df[column] = df[column].apply(
             lambda value: absolutize_local_endpoint(value, base_dir)
@@ -623,6 +644,96 @@ def run_generated_scripts(transfers_df, scripts_dir, runtime_root=None, slow=Fal
                     )
                 )
     return results
+
+
+def build_test_with_data_handoffs(
+    all_transfers_df,
+    current_transfers_df,
+    slow=False,
+):
+    """Identify downstream system/user handoffs after the current subset finishes."""
+    if all_transfers_df is None or all_transfers_df.empty:
+        return []
+    if current_transfers_df is None or current_transfers_df.empty:
+        return []
+
+    current_pairs = {
+        (str(row['system']).strip(), str(row['users']).strip())
+        for _, row in current_transfers_df.iterrows()
+    }
+    destination_keys = {
+        endpoint_key(row['destination'])
+        for _, row in current_transfers_df.iterrows()
+    }
+
+    grouped = []
+    grouped_index = {}
+    for _, transfer in all_transfers_df.iterrows():
+        system = str(transfer['system']).strip()
+        user = str(transfer['users']).strip()
+        if (system, user) in current_pairs:
+            continue
+        if endpoint_key(transfer['source']) not in destination_keys:
+            continue
+
+        group_key = (system, user)
+        if group_key not in grouped_index:
+            grouped_index[group_key] = len(grouped)
+            grouped.append({
+                'system': system,
+                'user': user,
+                'command': 'landingzones validate integration{0}'.format(
+                    ' --slow' if slow else ''
+                ),
+                'transfers': [],
+            })
+
+        grouped[grouped_index[group_key]]['transfers'].append({
+            'identifier': str(transfer['identifiers']).strip(),
+            'flow_group': str(transfer.get('flow_group', '') or '').strip(),
+            'source': transfer['source'],
+            'destination': transfer['destination'],
+        })
+
+    return grouped
+
+
+def format_test_with_data_handoff(handoff):
+    """Render a downstream handoff for the operator."""
+    lines = [
+        "Switch to {0}@{1}".format(handoff['user'], handoff['system']),
+        "Run from that deployment root: `{0}`".format(handoff['command']),
+    ]
+    for transfer in handoff['transfers']:
+        flow_group = transfer['flow_group']
+        if flow_group and flow_group != 'nan':
+            lines.append(
+                "Next transfer: {0} (flow: {1})".format(
+                    transfer['identifier'], flow_group
+                )
+            )
+        else:
+            lines.append("Next transfer: {0}".format(transfer['identifier']))
+        lines.append(
+            "Source to verify there: {0}".format(
+                normalize_endpoint_display(transfer['source'])
+            )
+        )
+    return '\n'.join(lines)
+
+
+def print_test_with_data_handoffs(handoffs):
+    """Print downstream handoff guidance for multi-system integration runs."""
+    if not handoffs:
+        return
+
+    print_header("Next System Handoff")
+    for handoff in handoffs:
+        print_status(
+            "Continue flow",
+            "INFO",
+            format_test_with_data_handoff(handoff),
+        )
 
 
 def endpoint_directory_exists(endpoint, directory_name):
@@ -784,6 +895,7 @@ def run_test_with_data(config_file=None, transfers_file=None, slow=False):
     snapshot = _snapshot_config_state()
     current_system = None
     current_user = None
+    all_transfers_df = None
     transfers_df = None
     test_plan = None
     seed_plan = None
@@ -808,6 +920,9 @@ def run_test_with_data(config_file=None, transfers_file=None, slow=False):
         toy_data_root = config.test_data
         if not os.path.isabs(toy_data_root):
             toy_data_root = os.path.abspath(os.path.join(work_root, toy_data_root))
+        all_transfers_df = load_test_with_data_transfer_graph(
+            transfers_path, work_root
+        )
         transfers_df = load_test_with_data_transfers(
             transfers_path, current_system, current_user, work_root
         )
@@ -898,6 +1013,20 @@ def run_test_with_data(config_file=None, transfers_file=None, slow=False):
             "OK",
             "Seeded toy-data directories reached all terminal destinations",
         )
+        downstream_handoffs = build_test_with_data_handoffs(
+            all_transfers_df,
+            transfers_df,
+            slow=slow,
+        )
+        if downstream_handoffs:
+            print_test_with_data_handoffs(downstream_handoffs)
+            print_status(
+                "Test-with-data handoff",
+                "INFO",
+                "Left propagated data and runtime artifacts in place so the downstream system can continue the flow",
+            )
+            return True
+
         if ask_yes_no(
             "Do you want to clean up the propagated output locations so test-with-data can be rerun from the initial state?"
         ):
