@@ -1347,7 +1347,15 @@ fi
         continue
     fi
     : >"$preflight_log"
-    {rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$run_log" 2>&1
+    if ! {rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$run_log" 2>&1; then
+        rsync_message="rsync failed: $(summarize_log "$run_log")"
+        log_status "$dir_name error"
+        append_source_portable_event "error" "$rsync_message"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$rsync_message"
+        debug "$dir_name $rsync_message"
+        reset_current_run_context
+        continue
+    fi
     if ! ( {promote_cmd} ) </dev/null >>"$promote_log" 2>&1; then
         promote_message="staging promote failed: see promote log"
         log_status "$dir_name error"

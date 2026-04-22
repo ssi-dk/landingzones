@@ -772,7 +772,8 @@ class TestGenerateRsyncCommand:
         assert 'preflight_stderr_log="$(mktemp "${TMPDIR:-/tmp}/landingzones.sample.preflight-stderr.XXXXXX")"' in script
         assert 'if ! find "$source_dir" -type d -print | while IFS= read -r dir_path; do [ -w "$dir_path" ] && [ -x "$dir_path" ] || printf "%s\\n" "$dir_path"; done >"$preflight_log" 2>"$preflight_stderr_log"; then' in script
         assert 'rsync --dry-run -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$preflight_log" 2>&1' in script
-        assert 'rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
+        assert 'if ! rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1; then' in script
+        assert 'rsync_message="rsync failed: $(summarize_log "$run_log")"' in script
         assert 'if ! ( if [ -d "/dest/$dir_name" ]; then find "/dest/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {} "/dest/$dir_name"/ \\; && rmdir "/dest/.staging/$dir_name"; else mv "/dest/.staging/$dir_name" "/dest/$dir_name"; fi; rmdir "/dest/.staging" 2>/dev/null || true ) </dev/null >>"$promote_log" 2>&1; then' in script
         assert 'preflight_message="source cleanup preflight command failed: $(summarize_log "$preflight_stderr_log")"' in script
         assert 'preflight_message="source cleanup preflight failed: $(summarize_log "$preflight_log")"' in script
@@ -1151,7 +1152,8 @@ class TestGenerateRsyncCommand:
             gcf.config._runtime_config = original_runtime_config
 
         assert ': >"$run_log"' in script
-        assert 'rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
+        assert 'if ! rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1; then' in script
+        assert 'append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$rsync_message"' in script
         assert 'dump_debug_log "run log" "$run_log"' in script
         assert 'debug "script failed with exit code $status"' in script
 
