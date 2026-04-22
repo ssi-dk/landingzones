@@ -132,6 +132,25 @@ class TestOperatorCli:
             '--config', 'config.yaml', '--slow', '--test-with-data'
         ]
 
+    def test_deploy_cron_routes_to_readiness(self, monkeypatch):
+        """`landingzones deploy cron` should route to the cron deployment prompt."""
+        captured = {}
+
+        def fake_main(argv=None):
+            captured['argv'] = argv
+            return True
+
+        monkeypatch.setattr(cli.cdr, 'main', fake_main)
+
+        rc = cli.main([
+            'deploy',
+            'cron',
+            '--config', 'config.yaml',
+        ])
+
+        assert rc == 0
+        assert captured['argv'] == ['--config', 'config.yaml', '--deploy-cron']
+
     def test_report_transfers_routes_to_dashboard(self, monkeypatch):
         """`landingzones report transfers` should forward its dashboard arguments."""
         captured = {}

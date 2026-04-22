@@ -574,11 +574,11 @@ class TestGenerateRsyncCommand:
         }
         
         cmd = gcf.generate_rsync_command(transfer)
-        
+
         assert '--chown=:group' in cmd
         assert '--chmod=Du=rwx' in cmd
         assert 'ionice -c2 -n4 rsync' in cmd
-        assert 'find /dest/.staging/transfer -mindepth 1 -maxdepth 1 ! -name \'.staging\' -exec mv {} /dest/ \\;' in cmd
+        assert 'if [ -d /dest ]; then find /dest/.staging/transfer -mindepth 1 -maxdepth 1 ! -name \'.staging\' -exec mv {} /dest/ \\; && rmdir /dest/.staging/transfer; else mv /dest/.staging/transfer /dest; fi' in cmd
 
     def test_rsync_with_io_nice_arguments_only(self):
         """Test that bare io_nice arguments are prefixed with ionice."""
@@ -639,7 +639,7 @@ class TestGenerateRsyncCommand:
 
         assert 'ssh -p 2222 user@host "mkdir -p /dest/.staging/sample"' in cmd
         assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' /source/ user@host:/dest/.staging/sample/' in cmd
-        assert 'ssh -p 2222 user@host "find /dest/.staging/sample -mindepth 1 -maxdepth 1 ! -name \'.staging\' -exec mv {} /dest/ \\; && { rmdir /dest/.staging/sample 2>/dev/null || true; } && { rmdir /dest/.staging 2>/dev/null || true; }"' in cmd
+        assert 'ssh -p 2222 user@host "set -eu; if [ -d /dest ]; then find /dest/.staging/sample -mindepth 1 -maxdepth 1 ! -name \'.staging\' -exec mv {} /dest/ \\; && rmdir /dest/.staging/sample; else mv /dest/.staging/sample /dest; fi && rmdir /dest/.staging 2>/dev/null || true"' in cmd
 
     def test_rsync_cleans_remote_sources_via_ssh(self):
         """Test that remote source cleanup runs on the remote host."""
@@ -773,9 +773,11 @@ class TestGenerateRsyncCommand:
         assert 'if ! find "$source_dir" -type d -print | while IFS= read -r dir_path; do [ -w "$dir_path" ] && [ -x "$dir_path" ] || printf "%s\\n" "$dir_path"; done >"$preflight_log" 2>"$preflight_stderr_log"; then' in script
         assert 'rsync --dry-run -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$preflight_log" 2>&1' in script
         assert 'rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
+        assert 'if ! ( if [ -d "/dest/$dir_name" ]; then find "/dest/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {} "/dest/$dir_name"/ \\; && rmdir "/dest/.staging/$dir_name"; else mv "/dest/.staging/$dir_name" "/dest/$dir_name"; fi; rmdir "/dest/.staging" 2>/dev/null || true ) </dev/null >>"$promote_log" 2>&1; then' in script
         assert 'preflight_message="source cleanup preflight command failed: $(summarize_log "$preflight_stderr_log")"' in script
         assert 'preflight_message="source cleanup preflight failed: $(summarize_log "$preflight_log")"' in script
         assert 'preflight_message="rsync dry-run failed: $(summarize_log "$preflight_log")"' in script
+        assert 'promote_message="staging promote failed: see promote log"' in script
         assert 'reset_current_run_context' in script
         assert 'exec 9>"$flock_file"' in script
         assert '/opt/bin/flock -n 9' in script
@@ -1215,7 +1217,7 @@ class TestGenerateRsyncCommand:
         assert 'find "/source" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | while IFS= read -r source_dir; do' in script
         assert 'ssh -p 2222 user@host "mkdir -p \\"/dest/.staging/$dir_name\\""' in script
         assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' "$source_dir/" "user@host:/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
-        assert 'ssh -p 2222 user@host "if [ -d \\"/dest/$dir_name\\" ]; then ' in script
+        assert 'ssh -p 2222 user@host "set -eu; if [ -d \\"/dest/$dir_name\\" ]; then ' in script
         assert 'find \\"/dest/.staging/$dir_name\\" -mindepth 1 -maxdepth 1 ! -name \\".staging\\" -exec mv {} \\"/dest/$dir_name/\\" \\;' in script
         assert 'current_run_destination="user@host:/dest/$dir_name"' in script
         assert 'if ! [ -d "/source" ]; then' in script

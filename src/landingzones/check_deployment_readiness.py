@@ -354,6 +354,168 @@ def remove_endpoint_entries(endpoint, entry_names):
         remove_local_path(os.path.join(root, entry_name))
 
 
+def list_endpoint_entries(endpoint):
+    """List top-level entries under an endpoint root, including hidden names."""
+    root = get_endpoint_root(endpoint)
+    user, host, _ = parse_remote_destination(endpoint['value'])
+    port = endpoint.get('port', '')
+
+    if host:
+        command = (
+            "if [ -d {0} ]; then find {0} -mindepth 1 -maxdepth 1 "
+            "-exec basename {{}} \\; | sort; fi"
+        ).format(shell_path(root))
+        rc, stdout, stderr = run_remote_shell(user, host, command, port)
+        if rc != 0:
+            raise ValueError(
+                "Cannot inspect test entries on {0}: {1}".format(
+                    shell_target(user, host), stderr.strip() or 'unknown error'
+                )
+            )
+        return [
+            line.strip()
+            for line in stdout.splitlines()
+            if line.strip() not in ('.', '..')
+        ]
+
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        name for name in os.listdir(root)
+        if name not in ('.', '..')
+    )
+
+
+def build_test_with_data_existing_state(test_plan, expected_entry_names):
+    """Classify existing endpoint contents before seeding toy data."""
+    source_keys = {
+        endpoint_key(endpoint['value']) for endpoint in test_plan['all_sources']
+    }
+    endpoint_state = []
+
+    for endpoint in dedupe_test_endpoints(
+        test_plan['all_sources'] + test_plan['all_destinations']
+    ):
+        entries = list_endpoint_entries(endpoint)
+        if not entries:
+            continue
+
+        endpoint_is_source = endpoint_key(endpoint['value']) in source_keys
+        blockers = []
+        extras = []
+        for entry_name in entries:
+            is_hidden = entry_name.startswith('.')
+            is_expected = entry_name in expected_entry_names
+            is_blocker = False
+            if entry_name == '.staging':
+                is_blocker = True
+            elif endpoint_is_source and not is_hidden:
+                is_blocker = True
+            elif is_expected:
+                is_blocker = True
+
+            if is_blocker:
+                blockers.append(entry_name)
+            else:
+                extras.append(entry_name)
+
+        endpoint_state.append({
+            'endpoint': endpoint,
+            'display': normalize_endpoint_display(endpoint['value']),
+            'is_source': endpoint_is_source,
+            'entries': entries,
+            'blockers': blockers,
+            'extras': extras,
+        })
+
+    return endpoint_state
+
+
+def summarize_test_with_data_existing_state(existing_state):
+    """Render a concise summary of pre-existing test data state."""
+    lines = []
+    for item in existing_state:
+        lines.append(item['display'])
+        if item['blockers']:
+            lines.append(
+                "blockers: {0}".format(', '.join(item['blockers']))
+            )
+        if item['extras']:
+            lines.append(
+                "extras: {0}".format(', '.join(item['extras']))
+            )
+    return '\n'.join(lines)
+
+
+def ask_test_with_data_existing_state_action(existing_state):
+    """Ask how pre-existing integration entries should be handled."""
+    if not existing_state:
+        return 'blockers'
+
+    print_header("Existing Test Data State")
+    print_status(
+        "Pre-existing entries",
+        "WARN",
+        summarize_test_with_data_existing_state(existing_state),
+    )
+    prompt = (
+        "\n{0}Choose cleanup scope before seeding "
+        "[a]ll/[b]lockers/[l]eave as-is (default: b): {1}"
+    ).format(Colors.YELLOW, Colors.END)
+    print(prompt, end="")
+    try:
+        response = input().strip().lower()
+    except KeyboardInterrupt:
+        print("\n{0}Operation cancelled.{1}".format(Colors.YELLOW, Colors.END))
+        return 'leave'
+
+    if response in ('', 'b', 'blockers'):
+        return 'blockers'
+    if response in ('a', 'all'):
+        return 'all'
+    if response in ('l', 'leave', 'leave as-is', 'leave as is'):
+        return 'leave'
+    print_status(
+        "Pre-existing state choice",
+        "WARN",
+        "Unrecognized response '{0}', defaulting to blocker cleanup".format(
+            response
+        ),
+    )
+    return 'blockers'
+
+
+def build_test_with_data_cleanup_map(existing_state, mode):
+    """Build per-endpoint cleanup entries for the requested preflight mode."""
+    cleanup_map = []
+    for item in existing_state:
+        if mode == 'all':
+            entry_names = item['entries']
+        elif mode == 'blockers':
+            entry_names = item['blockers']
+        else:
+            entry_names = []
+        if not entry_names:
+            continue
+        cleanup_map.append({
+            'endpoint': item['endpoint'],
+            'entry_names': sorted(set(entry_names)),
+        })
+    return cleanup_map
+
+
+def cleanup_test_with_data_endpoint_entries(cleanup_map):
+    """Remove the requested entry names from each endpoint."""
+    cleanup_errors = []
+    for item in cleanup_map:
+        try:
+            remove_endpoint_entries(item['endpoint'], item['entry_names'])
+        except ValueError as exc:
+            cleanup_errors.append(str(exc))
+    if cleanup_errors:
+        raise ValueError('\n'.join(cleanup_errors))
+
+
 def build_test_with_data_seed_plan(test_plan, toy_data_root, test_tree_root):
     """Resolve toy-data sources and expected top-level directories for testing with data."""
     seed_plan = []
@@ -402,15 +564,14 @@ def build_test_with_data_seed_plan(test_plan, toy_data_root, test_tree_root):
 
 def cleanup_test_with_data_entries(test_plan, entry_names):
     """Remove seeded test directories from all test-with-data roots."""
-    cleanup_errors = []
     all_entries = sorted(set(entry_names) | {'.staging'})
-    for endpoint in test_plan['all_destinations'] + test_plan['all_sources']:
-        try:
-            remove_endpoint_entries(endpoint, all_entries)
-        except ValueError as exc:
-            cleanup_errors.append(str(exc))
-    if cleanup_errors:
-        raise ValueError('\n'.join(cleanup_errors))
+    cleanup_test_with_data_endpoint_entries([
+        {
+            'endpoint': endpoint,
+            'entry_names': all_entries,
+        }
+        for endpoint in test_plan['all_destinations'] + test_plan['all_sources']
+    ])
 
 
 def cleanup_test_with_data_runtime_artifacts(transfers_df):
@@ -883,6 +1044,42 @@ def ask_yes_no(prompt_text):
         return False
 
 
+def run_cron_deployment_prompt():
+    """Offer an interactive cron deployment for the current system/user."""
+    current_system = get_current_system()
+    current_user = get_current_user()
+
+    print_header("Cron Deployment")
+    print_status(
+        "Deployment target",
+        "INFO",
+        "{0}@{1}".format(current_user, current_system),
+    )
+
+    if not ask_yes_no("Do you want to deploy the cron files now?"):
+        print_status(
+            "Cron deployment",
+            "INFO",
+            "Skipped. Re-run `landingzones deploy cron` when ready.",
+        )
+        return False
+
+    deploy_ok = deploy_cron_files(current_system, current_user)
+    if deploy_ok:
+        print_status(
+            "Cron deployment",
+            "OK",
+            "Cron files deployed and activated. Use `crontab -l` to review active jobs.",
+        )
+    else:
+        print_status(
+            "Cron deployment",
+            "ERROR",
+            "Deployment failed. Review the errors above and retry when ready.",
+        )
+    return deploy_ok
+
+
 def normalize_endpoint_display(value):
     """Render a local or remote endpoint with redundant slashes collapsed."""
     user, host, path = parse_remote_destination(value)
@@ -1024,7 +1221,35 @@ def run_test_with_data(config_file=None, transfers_file=None, slow=False):
             for seed in seed_plan
             for entry_name in seed['entry_names']
         })
-        cleanup_test_with_data_entries(test_plan, expected_entry_names)
+        existing_state = build_test_with_data_existing_state(
+            test_plan, expected_entry_names
+        )
+        cleanup_mode = ask_test_with_data_existing_state_action(existing_state)
+        if cleanup_mode != 'leave':
+            cleanup_test_with_data_endpoint_entries(
+                build_test_with_data_cleanup_map(existing_state, cleanup_mode)
+            )
+            print_status(
+                "Pre-existing test data cleanup",
+                "OK",
+                "Removed {0} entries before seeding".format(cleanup_mode),
+            )
+        else:
+            remaining_blockers = [
+                item for item in existing_state
+                if item['blockers']
+            ]
+            if remaining_blockers:
+                print_status(
+                    "Pre-existing test data cleanup",
+                    "ERROR",
+                    "Blocking entries left in place:\n{0}".format(
+                        summarize_test_with_data_existing_state(
+                            remaining_blockers
+                        )
+                    ),
+                )
+                return False
         cleanup_test_with_data_runtime_artifacts(transfers_df)
         cleanup_test_with_data_generated_scripts(runtime_dirs)
         seeded_count = seed_test_data_sources(seed_plan)
@@ -1169,6 +1394,11 @@ def main(argv=None):
         default=None,
         help='Directory containing generated validation wrappers (overrides config)'
     )
+    parser.add_argument(
+        '--deploy-cron',
+        action='store_true',
+        help='Prompt to deploy the generated cron files for the current system/user'
+    )
     args = parser.parse_args(argv)
     
     # Load configuration from file and/or command line arguments
@@ -1184,6 +1414,9 @@ def main(argv=None):
             transfers_file=args.transfers,
             slow=args.slow,
         )
+
+    if args.deploy_cron:
+        return run_cron_deployment_prompt()
     
     print("{0}{1}".format(Colors.BOLD, Colors.BLUE))
     print("╔══════════════════════════════════════════════════════════════╗")
@@ -1449,27 +1682,9 @@ def main(argv=None):
         print_status("System ready for cron deployment", "OK", 
                     "All checks passed! You can safely deploy the cron files.")
         print("\n{0}{1}✓ READY TO DEPLOY{2}".format(Colors.GREEN, Colors.BOLD, Colors.END))
-        
-        # Ask user if they want automatic deployment
-        if ask_yes_no("Do you want to automatically deploy the cron files now?"):
-            print_header("Automatic Deployment")
-            deploy_ok = deploy_cron_files(current_system, current_user)
-            
-            if deploy_ok:
-                success_msg = ("\n{0}🚀 Deployment completed "
-                               "successfully!{1}").format(Colors.GREEN, Colors.END)
-                print(success_msg)
-                print("Your cron jobs are now active and will run "
-                      "according to schedule.")
-                print("Use 'crontab -l' to view active jobs.")
-            else:
-                print("\n{0}❌ Deployment failed.{1}".format(Colors.RED, Colors.END))
-                print("Please check the errors above and deploy manually.")
-        else:
-            print("\nManual deployment steps:")
-            print("1. Run: python generate_cron_files.py")
-            print("2. Copy relevant .cron files to ~/crontab.d/")
-            print("3. Activate: cat ~/crontab.d/*.cron | crontab -")
+        print("\nNext steps after all validations pass:")
+        print("1. Run: landingzones validate integration")
+        print("2. Deploy crons when ready: landingzones deploy cron")
     else:
         print_status("System deployment readiness", "ERROR",
                      "Please fix the issues above before deploying "

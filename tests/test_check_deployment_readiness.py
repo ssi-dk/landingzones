@@ -84,6 +84,19 @@ class TestRunRemoteShell:
         assert 'LogLevel=ERROR' in captured['args']
 
 
+class TestCronDeploymentPrompt:
+    """Test explicit cron deployment prompting."""
+
+    def test_main_routes_deploy_cron_prompt(self, monkeypatch):
+        """`--deploy-cron` should bypass readiness checks and run the prompt flow."""
+        monkeypatch.setattr(cdr.config, 'load_config', lambda **kwargs: None)
+        monkeypatch.setattr(cdr, 'run_cron_deployment_prompt', lambda: True)
+
+        result = cdr.main(['--deploy-cron'])
+
+        assert result is True
+
+
 class TestCheckLocalDirectory:
     """Test the check_local_directory function"""
     
@@ -573,6 +586,113 @@ class TestTestWithData:
         assert not (rit_managed / 'log' / 'step1.log').exists()
         assert not (rit_managed / 'flock' / 'step1.lock').exists()
 
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_blocker_cleanup_leaves_destination_extras(
+        self, tmp_path, monkeypatch
+    ):
+        """Blocker cleanup should preserve unrelated destination leftovers."""
+        (
+            config_file,
+            transfers_file,
+            source_root,
+            transit_root,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        (source_root / 'old_run').mkdir()
+        (source_root / 'old_run' / 'payload.txt').write_text('stale')
+        (final_root / 'archived_run').mkdir()
+        (final_root / '.staging').mkdir()
+
+        responses = iter(['b', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+
+        assert result is True
+        assert not (source_root / 'old_run').exists()
+        assert cdr.list_visible_entries(str(transit_root)) == []
+        assert cdr.list_visible_entries(str(final_root)) == [
+            'archived_run',
+            'flow_one',
+            'flow_two',
+        ]
+        assert not (final_root / '.staging').exists()
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_all_cleanup_removes_destination_extras(
+        self, tmp_path, monkeypatch
+    ):
+        """Full cleanup should remove optional stale entries before seeding."""
+        (
+            config_file,
+            transfers_file,
+            _,
+            _,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        (final_root / 'archived_run').mkdir()
+
+        responses = iter(['a', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+
+        assert result is True
+        assert cdr.list_visible_entries(str(final_root)) == ['flow_one', 'flow_two']
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_leave_rejects_remaining_blockers(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Leaving blocking entries in place should fail before seeding."""
+        (
+            config_file,
+            transfers_file,
+            source_root,
+            _,
+            _,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        (source_root / 'old_run').mkdir()
+
+        responses = iter(['l'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+        captured = capsys.readouterr()
+
+        assert result is False
+        assert "Blocking entries left in place" in captured.out
+
     def test_build_run_test_plan_identifies_initial_and_terminal_roots(self, tmp_path):
         """Intermediate destinations should not be treated as initial or terminal."""
         df = pd.DataFrame([
@@ -634,6 +754,87 @@ class TestTestWithData:
         assert plan['initial_sources'][0]['value'] == str(
             tmp_path / 'calc' / 'Landing_Zone' / 'to_ugerm'
         ) + '/'
+
+    def test_dev_calc_seed_plan_scopes_fixtures_per_entry_flow(self):
+        """The dev calc subset should not seed every fixture into every entry flow."""
+        repo_root = Path(cdr.get_repo_root())
+        config_file = repo_root / 'deploy' / 'dev' / 'config' / 'config.yaml'
+        transfers_file = repo_root / 'deploy' / 'dev' / 'input' / 'transfers.tsv'
+        base_dir = repo_root / 'deploy' / 'dev'
+        snapshot = cdr.config.snapshot_state()
+
+        try:
+            cdr.config.load_config(config_file=str(config_file))
+            transfers_df = cdr.load_test_with_data_transfers(
+                str(transfers_file),
+                'calc',
+                'f041664',
+                str(base_dir),
+            )
+            plan = cdr.build_run_test_plan(transfers_df)
+        finally:
+            cdr.config.restore_state(snapshot)
+
+        fixture_by_root = {
+            cdr.get_endpoint_root(endpoint): endpoint['test_fixture_names']
+            for endpoint in plan['initial_sources']
+        }
+
+        assert fixture_by_root == {
+            '/srv/data/NGS_Kaare/rit_managed/tests/dev/landingzones/labnet//corefacility': [
+                'Illumina_TransferTest'
+            ],
+            '/srv/data/NGS_Kaare/rit_managed/tests/dev/landingzones/calc/Landing_Zone//to_ugerm/Projects/dev_shadow/proj/Landing_Zone': [
+                'Illumina_TransferTest'
+            ],
+            '/srv/data/NGS_Kaare/rit_managed/tests/dev/landingzones/calc/Landing_Zone//regionh/to_ssicompute': [
+                'Illumina_TransferTest'
+            ],
+        }
+
+    def test_build_test_with_data_existing_state_classifies_blockers(self, tmp_path):
+        """Existing endpoint contents should distinguish blockers from extras."""
+        source_root = tmp_path / 'source_root'
+        destination_root = tmp_path / 'destination_root'
+        source_root.mkdir()
+        destination_root.mkdir()
+
+        (source_root / 'old_run').mkdir()
+        (source_root / '.cache').mkdir()
+        (source_root / '.staging').mkdir()
+        (destination_root / 'flow_one').mkdir()
+        (destination_root / 'archived_run').mkdir()
+        (destination_root / '.staging').mkdir()
+
+        test_plan = {
+            'all_sources': [
+                {'value': str(source_root) + '/', 'port': ''},
+            ],
+            'all_destinations': [
+                {'value': str(destination_root) + '/', 'port': ''},
+            ],
+        }
+
+        existing_state = cdr.build_test_with_data_existing_state(
+            test_plan,
+            ['flow_one', 'flow_two'],
+        )
+
+        state_by_root = {
+            cdr.get_endpoint_root(item['endpoint']): item
+            for item in existing_state
+        }
+
+        assert state_by_root[str(source_root)]['blockers'] == [
+            '.staging',
+            'old_run',
+        ]
+        assert state_by_root[str(source_root)]['extras'] == ['.cache']
+        assert state_by_root[str(destination_root)]['blockers'] == [
+            '.staging',
+            'flow_one',
+        ]
+        assert state_by_root[str(destination_root)]['extras'] == ['archived_run']
 
     def test_load_test_with_data_transfers_preserves_env_var_paths(self, tmp_path):
         """test-with-data should keep env-var based paths unchanged."""

@@ -112,6 +112,24 @@ def build_cli_parser():
     )
     validate_hop_parser.set_defaults(handler=handle_validate_hop)
 
+    deploy_parser = subparsers.add_parser(
+        'deploy',
+        help='Perform operator deployment actions',
+    )
+    deploy_subparsers = deploy_parser.add_subparsers(
+        dest='deploy_command',
+        required=True,
+    )
+
+    deploy_cron_parser = deploy_subparsers.add_parser(
+        'cron',
+        help='Prompt to deploy cron files for the current system/user',
+    )
+    deploy_cron_parser.add_argument('--config', '-c', default=None)
+    deploy_cron_parser.add_argument('--transfers', '-t', default=None)
+    deploy_cron_parser.add_argument('--validation-scripts-dir', default=None)
+    deploy_cron_parser.set_defaults(handler=handle_deploy_cron)
+
     report_parser = subparsers.add_parser(
         'report',
         help='Generate reporting outputs',
@@ -220,6 +238,18 @@ def handle_validate_hop(args, extra_args):
         wrapper_args = wrapper_args[1:]
     command = [wrapper_path, args.action] + wrapper_args
     return subprocess.call(command)
+
+
+def handle_deploy_cron(args, extra_args):
+    """Route `landingzones deploy cron` to the interactive cron deployment."""
+    if extra_args:
+        raise SystemExit("unrecognized arguments: {0}".format(' '.join(extra_args)))
+    argv = []
+    append_option(argv, '--config', resolve_cli_config(args))
+    append_option(argv, '--transfers', args.transfers)
+    append_option(argv, '--validation-scripts-dir', args.validation_scripts_dir)
+    argv.append('--deploy-cron')
+    return normalize_exit_code(cdr.main(argv))
 
 
 def handle_report_transfers(args, extra_args):

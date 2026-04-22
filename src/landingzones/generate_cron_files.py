@@ -440,23 +440,23 @@ def build_staging_paths(destination, identifier):
 
 def build_promote_command(destination_dir, staging_dir, remote=None, port=''):
     """Move staged content into the final destination."""
-    move_cmd = (
-        "find {0} -mindepth 1 -maxdepth 1 ! -name '.staging' -exec mv {{}} {1}/ \\;".format(
-            shell_quote(staging_dir),
+    staging_root = os.path.dirname(staging_dir)
+    full_cmd = (
+        "if [ -d {0} ]; then "
+        "find {1} -mindepth 1 -maxdepth 1 ! -name '.staging' -exec mv {{}} {0}/ \\; && "
+        "rmdir {1}; "
+        "else "
+        "mv {1} {0}; "
+        "fi && "
+        "rmdir {2} 2>/dev/null || true".format(
             shell_quote(destination_dir),
-        )
-    )
-    cleanup_cmd = (
-        "{{ rmdir {0} 2>/dev/null || true; }} && "
-        "{{ rmdir {1} 2>/dev/null || true; }}".format(
             shell_quote(staging_dir),
-            shell_quote(os.path.dirname(staging_dir)),
+            shell_quote(staging_root),
         )
     )
-    full_cmd = "{0} && {1}".format(move_cmd, cleanup_cmd)
     if remote:
         ssh_cmd = build_ssh_command(remote, port)
-        return '{0} "{1}"'.format(ssh_cmd, full_cmd)
+        return '{0} "set -eu; {1}"'.format(ssh_cmd, full_cmd)
     return full_cmd
 
 
@@ -800,9 +800,9 @@ def generate_iterative_script_content(transfer):
             "{0}/.staging/$dir_name".format(escaped_destination_root),
         )
         promote_cmd = (
-            '{0} "if [ -d \\"{1}/$dir_name\\" ]; then '
+            '{0} "set -eu; if [ -d \\"{1}/$dir_name\\" ]; then '
             'find \\"{1}/.staging/$dir_name\\" -mindepth 1 -maxdepth 1 ! -name \\".staging\\" -exec mv {{}} \\"{1}/$dir_name/\\" \\; && '
-            'rmdir \\"{1}/.staging/$dir_name\\" 2>/dev/null || true; '
+            'rmdir \\"{1}/.staging/$dir_name\\"; '
             'else '
             'mv \\"{1}/.staging/$dir_name\\" \\"{1}/$dir_name\\"; '
             'fi; '
@@ -827,7 +827,7 @@ def generate_iterative_script_content(transfer):
         promote_cmd = (
             'if [ -d "{0}/$dir_name" ]; then '
             'find "{0}/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {{}} "{0}/$dir_name"/ \\; && '
-            'rmdir "{0}/.staging/$dir_name" 2>/dev/null || true; '
+            'rmdir "{0}/.staging/$dir_name"; '
             'else '
             'mv "{0}/.staging/$dir_name" "{0}/$dir_name"; '
             'fi; '
@@ -1348,7 +1348,15 @@ fi
     fi
     : >"$preflight_log"
     {rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$run_log" 2>&1
-    {promote_cmd} </dev/null >>"$promote_log" 2>&1
+    if ! ( {promote_cmd} ) </dev/null >>"$promote_log" 2>&1; then
+        promote_message="staging promote failed: see promote log"
+        log_status "$dir_name error"
+        append_source_portable_event "error" "$promote_message"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$promote_message"
+        debug "$dir_name $promote_message"
+        reset_current_run_context
+        continue
+    fi
     log_status "$dir_name completed"
     append_destination_portable_event "completed"
     append_common_status "completed" "$dir_name" "$current_run_source" "$current_run_destination"
