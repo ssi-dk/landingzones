@@ -177,6 +177,31 @@ server1_main\tserver1\tuser1\t/src/\t/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt\t
         assert row['notify_on_success'] == 'TRUE'
         assert row['notify_on_error'] == 'FALSE'
 
+    def test_parse_normalizes_tags_column(self, tmp_path):
+        """Tags should normalize to lowercase deduplicated comma-separated text."""
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\ttags
+server1_main\tserver1\tuser1\t/src/\t/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt\tHeartbeat, lab , heartbeat
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        df = gcf.parse_transfers_file(str(test_file))
+
+        assert df.iloc[0]['tags'] == 'heartbeat,lab'
+
+    def test_parse_allows_notifications_without_flow_group(self, tmp_path):
+        """Notification flags should not require portable flow metadata."""
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tnotify_on_success\tnotify_on_error
+server1_main\tserver1\tuser1\t/src/\t/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt\tTRUE\tTRUE
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        df = gcf.parse_transfers_file(str(test_file))
+
+        assert df.iloc[0]['notify_on_success'] == 'TRUE'
+        assert df.iloc[0]['notify_on_error'] == 'TRUE'
+
     def test_parse_rejects_hidden_root_exclude_for_portable_metadata(self, tmp_path):
         """Portable metadata cannot coexist with --exclude='/.*'."""
         tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tflow_group\tis_entry_point
@@ -324,21 +349,24 @@ promote_calc\tTRUE\ttest_local\tlocal\t/flow/stage/\t/flow/final/
 class TestGenerateRsyncCommand:
     """Test the generate_rsync_command function"""
 
-    def _run_generated_transfer_script(self, tmp_path, transfer):
+    def _run_generated_transfer_script(self, tmp_path, transfer, notifications=None):
         """Write and execute a generated transfer script under test-local config."""
         managed_root = tmp_path / "managed"
         snapshot = gcf.config.snapshot_state()
-        gcf.config.load_config(
-            output_dir=str(tmp_path / "output"),
-            rit_managed_locations={'server1': str(managed_root)},
-            rit_managed_folder_structure={
+        config_kwargs = {
+            'output_dir': str(tmp_path / "output"),
+            'rit_managed_locations': {'server1': str(managed_root)},
+            'rit_managed_folder_structure': {
                 'sh_output': 'scripts',
                 'crontabs': 'crontab.d',
                 'log': 'log',
                 'flock': 'flock',
             },
-            flock_paths={'server1': shutil.which("flock") or '/usr/bin/flock'},
-        )
+            'flock_paths': {'server1': shutil.which("flock") or '/usr/bin/flock'},
+        }
+        if notifications is not None:
+            config_kwargs['notifications'] = notifications
+        gcf.config.load_config(**config_kwargs)
         try:
             script = gcf.generate_script_content(transfer)
         finally:
@@ -790,7 +818,8 @@ class TestGenerateRsyncCommand:
         assert "printf '%s %s\\n'" in script
         assert 'common_status_log_file="output/log/Landing_Zone_server1.transfers.tsv"' in script
         assert 'common_status_lock_file="output/flock/Landing_Zone_server1.transfers.lock"' in script
-        assert "printf 'event_time_utc\\ttransfer_identifier\\tsystem\\trun_id\\trun_name\\tflow_group\\torigin_system\\tentry_transfer_identifier\\tcreated_at_utc\\tdirectory\\tsource_path\\tdestination_path\\tstatus\\tmessage\\n'" in script
+        assert 'transfer_tags=""' in script
+        assert "printf 'event_time_utc\\ttransfer_identifier\\tsystem\\trun_id\\trun_name\\tflow_group\\ttags\\torigin_system\\tentry_transfer_identifier\\tcreated_at_utc\\tdirectory\\tsource_path\\tdestination_path\\tstatus\\tmessage\\n'" in script
         assert 'append_common_status "initiated" "$dir_name" "$current_run_source" "$current_run_destination"' in script
         assert 'append_common_status "completed" "$dir_name" "$current_run_source" "$current_run_destination"' in script
         assert 'append_common_status "error" "$current_run" "$current_run_source" "$current_run_destination"' in script
@@ -827,6 +856,7 @@ class TestGenerateRsyncCommand:
             'frequency': '',
             'flow_group': 'flow_a',
             'is_entry_point': 'TRUE',
+            'tags': 'heartbeat,lab',
         }
 
         original_runtime_config = dict(gcf.config._runtime_config)
@@ -838,6 +868,7 @@ class TestGenerateRsyncCommand:
 
         assert 'portable_metadata_enabled="1"' in script
         assert 'is_entry_point="TRUE"' in script
+        assert 'transfer_tags="heartbeat,lab"' in script
         assert 'portable_metadata_dir_name=".landing_zones"' in script
         assert 'portable_metadata_file_name="landingzone-run-metadata.tsv"' in script
         assert 'portable_events_file_name="landingzone-transfer-events.tsv"' in script
@@ -892,6 +923,61 @@ class TestGenerateRsyncCommand:
         assert 'grep "^run_id" "$1" | head -n 1 | cut -f2-' in script
         assert 'cut -f2-' in script
         assert 'append_portable_event_remote "$destination_remote_target" "$destination_remote_port" "$destination_run_dir" "$event_status" "$event_message"' in script
+
+    def test_generate_script_content_includes_notification_delivery(self):
+        """Generated scripts should derive notification attempts from status events."""
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': '/source/',
+            'source_port': '',
+            'destination': '/dest/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': '',
+            'notify_on_success': 'TRUE',
+            'notify_on_error': 'TRUE',
+            'tags': 'heartbeat',
+        }
+
+        snapshot = gcf.config.snapshot_state()
+        gcf.config.load_config(
+            rit_managed_locations={'server1': '/srv/rit'},
+            rit_managed_folder_structure={
+                'log': 'log',
+                'flock': 'flock',
+            },
+            flock_paths={'server1': '/opt/bin/flock'},
+            notifications={
+                'endpoint': 'https://notify.example/events',
+                'token_env': 'NOTIFY_TOKEN',
+                'title': 'Transfer event',
+                'body': 'A transfer changed state',
+                'timeout_seconds': '3',
+            },
+        )
+        try:
+            script = gcf.generate_script_content(transfer)
+        finally:
+            gcf.config.restore_state(snapshot)
+
+        assert "notification_api_endpoint=https://notify.example/events" in script
+        assert "notification_token_env=NOTIFY_TOKEN" in script
+        assert "notification_title='Transfer event'" in script
+        assert "notification_body='A transfer changed state'" in script
+        assert "notification_timeout_seconds=3" in script
+        assert 'notification_status_log_file="/srv/rit/log/Landing_Zone_server1.notifications.tsv"' in script
+        assert 'notification_status_lock_file="/srv/rit/flock/Landing_Zone_server1.notifications.lock"' in script
+        assert 'notify_on_success="TRUE"' in script
+        assert 'notify_on_error="TRUE"' in script
+        assert 'notification_enabled_for_status()' in script
+        assert 'notification_already_sent "$idempotency_key" && return 0' in script
+        assert "-H \"Idempotency-Key: $idempotency_key\"" in script
+        assert 'append_notification_status "$transfer_event_time_utc"' in script
+        assert 'notify_transfer_event "$event_timestamp" "$event_status" "$event_directory" "$event_source" "$event_destination" "$event_message"' in script
 
     def test_generate_validation_script_content(self):
         """The shared validation helper should provide preflight and run modes."""
@@ -1373,6 +1459,78 @@ class TestGenerateRsyncCommand:
         assert "RunGood" in status_text
         assert "completed" in status_text
         assert "source cleanup preflight failed" not in status_text
+
+    @pytest.mark.skipif(
+        not (HAS_RSYNC and HAS_FLOCK),
+        reason="requires rsync and flock",
+    )
+    def test_generated_script_writes_notification_log_and_suppresses_duplicate_success(self, tmp_path, monkeypatch):
+        """Notification delivery should be tracked separately and deduplicated."""
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_curl = fake_bin / "curl"
+        fake_curl.write_text("#!/bin/sh\nprintf '200'\n")
+        fake_curl.chmod(0o755)
+        monkeypatch.setenv(
+            "PATH",
+            "{0}{1}{2}".format(fake_bin, os.pathsep, os.environ.get("PATH", "")),
+        )
+
+        source_root = tmp_path / "source"
+        destination_root = tmp_path / "destination"
+        source_root.mkdir()
+        destination_root.mkdir()
+
+        transfer = {
+            'identifiers': 'notify_success',
+            'system': 'server1',
+            'source': str(source_root / '*'),
+            'source_port': '',
+            'destination': str(destination_root) + '/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': str(tmp_path / 'notify_success.log'),
+            'flock_file': str(tmp_path / 'notify_success.lock'),
+            'frequency': '',
+            'notify_on_success': 'TRUE',
+            'tags': 'heartbeat',
+        }
+        notifications = {
+            'endpoint': 'https://notify.example/events',
+            'title': 'Transfer complete',
+            'body': 'A transfer completed.',
+            'timeout_seconds': '3',
+        }
+
+        run_dir = source_root / "RunGood"
+        run_dir.mkdir()
+        (run_dir / "payload.txt").write_text("first")
+        proc, managed_root = self._run_generated_transfer_script(
+            tmp_path,
+            transfer,
+            notifications=notifications,
+        )
+
+        assert proc.returncode == 0
+
+        run_dir.mkdir()
+        (run_dir / "payload.txt").write_text("second")
+        proc, managed_root = self._run_generated_transfer_script(
+            tmp_path,
+            transfer,
+            notifications=notifications,
+        )
+
+        notification_log = managed_root / "log" / "Landing_Zone_server1.notifications.tsv"
+        rows = notification_log.read_text().splitlines()
+
+        assert proc.returncode == 0
+        assert len(rows) == 2
+        assert rows[0].startswith("event_time_utc\tnotification_time_utc\tidempotency_key")
+        assert "\tnotify_success\tserver1\t" in rows[1]
+        assert "\theartbeat\t" in rows[1]
+        assert "\tcompleted\tsent\t200\t1\t" in rows[1]
 
 
 class TestGenerateCronHeader:

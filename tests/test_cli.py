@@ -132,6 +132,163 @@ class TestOperatorCli:
             '--config', 'config.yaml', '--slow', '--test-with-data'
         ]
 
+    def test_validate_separation_routes_to_validator(self, monkeypatch):
+        """`landingzones validate separation` should forward tags to the validator."""
+        captured = {}
+
+        def fake_main(argv=None):
+            captured['argv'] = argv
+            return 0
+
+        monkeypatch.setattr(cli.vsep, 'main', fake_main)
+
+        rc = cli.main([
+            'validate',
+            'separation',
+            '--config', 'config.yaml',
+            '--tag', 'heartbeat',
+            '--tag', 'lab',
+        ])
+
+        assert rc == 0
+        assert captured['argv'] == [
+            '--config', 'config.yaml',
+            '--tag', 'heartbeat',
+            '--tag', 'lab',
+        ]
+
+    def test_validate_chain_runs_steps_in_order(self, monkeypatch):
+        """`landingzones validate chain` should run separation, deployment, integration, then report."""
+        captured = {
+            'separation': [],
+            'readiness': [],
+            'report': [],
+        }
+
+        def fake_separation(argv=None):
+            captured['separation'].append(argv)
+            return 0
+
+        def fake_readiness(argv=None):
+            captured['readiness'].append(argv)
+            return 0
+
+        def fake_report(argv=None):
+            captured['report'].append(argv)
+            return 0
+
+        monkeypatch.setattr(cli.vsep, 'main', fake_separation)
+        monkeypatch.setattr(cli.cdr, 'main', fake_readiness)
+        monkeypatch.setattr(cli.pts, 'main', fake_report)
+
+        rc = cli.main([
+            'validate',
+            'chain',
+            '--config', 'config.yaml',
+            '--transfers', 'transfers.tsv',
+            '--validation-scripts-dir', 'validation_scripts',
+            '--slow',
+            '--tag', 'heartbeat',
+            '--report-output', 'dashboard.html',
+            '--system', 'calc',
+        ])
+
+        assert rc == 0
+        assert captured['separation'] == [[
+            '--config', 'config.yaml',
+            '--transfers', 'transfers.tsv',
+            '--tag', 'heartbeat',
+        ]]
+        assert captured['readiness'] == [
+            [
+                '--config', 'config.yaml',
+                '--transfers', 'transfers.tsv',
+                '--validation-scripts-dir', 'validation_scripts',
+            ],
+            [
+                '--config', 'config.yaml',
+                '--transfers', 'transfers.tsv',
+                '--validation-scripts-dir', 'validation_scripts',
+                '--slow',
+                '--test-with-data',
+            ],
+        ]
+        assert captured['report'] == [[
+            '--output', 'dashboard.html',
+            '--config', 'config.yaml',
+            '--transfers-file', 'transfers.tsv',
+            '--system', 'calc',
+            '--tag', 'heartbeat',
+        ]]
+
+    def test_validate_chain_defaults_to_any_tag_for_separation(self, monkeypatch):
+        """Omitting --tag should run separation across any tagged transfer."""
+        captured = {
+            'separation': [],
+            'readiness': [],
+            'report': [],
+        }
+
+        def fake_separation(argv=None):
+            captured['separation'].append(argv)
+            return 0
+
+        def fake_readiness(argv=None):
+            captured['readiness'].append(argv)
+            return 0
+
+        def fake_report(argv=None):
+            captured['report'].append(argv)
+            return 0
+
+        monkeypatch.setattr(cli.vsep, 'main', fake_separation)
+        monkeypatch.setattr(cli.cdr, 'main', fake_readiness)
+        monkeypatch.setattr(cli.pts, 'main', fake_report)
+
+        rc = cli.main([
+            'validate',
+            'chain',
+        ])
+
+        assert rc == 0
+        assert captured['separation'] == [[]]
+        assert captured['readiness'] == [[], ['--test-with-data']]
+        assert captured['report'] == [[]]
+
+    def test_validate_chain_fails_fast_on_deployment_failure(self, monkeypatch):
+        """`landingzones validate chain` should stop when an earlier step fails."""
+        captured = {
+            'separation': 0,
+            'readiness': [],
+            'report': 0,
+        }
+
+        def fake_separation(argv=None):
+            captured['separation'] += 1
+            return 0
+
+        def fake_readiness(argv=None):
+            captured['readiness'].append(argv)
+            return 1
+
+        def fake_report(argv=None):
+            captured['report'] += 1
+            return 0
+
+        monkeypatch.setattr(cli.vsep, 'main', fake_separation)
+        monkeypatch.setattr(cli.cdr, 'main', fake_readiness)
+        monkeypatch.setattr(cli.pts, 'main', fake_report)
+
+        rc = cli.main([
+            'validate',
+            'chain',
+        ])
+
+        assert rc == 1
+        assert captured['separation'] == 1
+        assert captured['readiness'] == [[]]
+        assert captured['report'] == 0
+
     def test_deploy_cron_routes_to_readiness(self, monkeypatch):
         """`landingzones deploy cron` should route to the cron deployment prompt."""
         captured = {}
@@ -197,6 +354,29 @@ class TestOperatorCli:
         assert captured['argv'] == [
             '--config', 'config.yaml',
             '--system', 'calc',
+        ]
+
+    def test_report_transfers_routes_tag_filters(self, monkeypatch):
+        """`landingzones report transfers --tag` should forward repeatable tags."""
+        captured = {}
+
+        def fake_main(argv=None):
+            captured['argv'] = argv
+            return 0
+
+        monkeypatch.setattr(cli.pts, 'main', fake_main)
+
+        rc = cli.main([
+            'report',
+            'transfers',
+            '--tag', 'heartbeat',
+            '--tag', 'lab',
+        ])
+
+        assert rc == 0
+        assert captured['argv'] == [
+            '--tag', 'heartbeat',
+            '--tag', 'lab',
         ]
 
     def test_validate_hop_executes_discovered_wrapper(self, tmp_path):

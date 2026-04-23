@@ -14,7 +14,10 @@ import shlex
 import pandas as pd
 
 from landingzones.config import config
-from landingzones.transfer_definitions import definitions_from_dataframe
+from landingzones.transfer_definitions import (
+    definitions_from_dataframe,
+    normalize_tags_text,
+)
 
 
 VALIDATION_HELPER_NAME = 'lz_run_validation.sh'
@@ -87,6 +90,8 @@ def parse_transfers_file(filename, require_runtime_files=True):
 
     ensure_text_column(df, 'flow_group')
     df['flow_group'] = df['flow_group'].str.strip()
+    ensure_text_column(df, 'tags')
+    df['tags'] = df['tags'].apply(normalize_tags_text)
 
     for bool_column in (
         'is_entry_point',
@@ -318,12 +323,10 @@ def validate_flow_metadata(df):
                 for column in (
                     'is_entry_point',
                     'is_end_point',
-                    'notify_on_success',
-                    'notify_on_error',
                 )
             ):
                 errors.append(
-                    "Transfer '{0}' sets flow booleans but has no flow_group".format(
+                    "Transfer '{0}' sets flow boundary booleans but has no flow_group".format(
                         identifier
                     )
                 )
@@ -370,6 +373,11 @@ def join_remote_path(remote, path):
 def shell_quote(value):
     """Shell-quote a string value."""
     return shlex.quote(str(value))
+
+
+def shell_assignment_value(value):
+    """Shell-quote a value for a generated variable assignment."""
+    return shlex.quote(str(value or ''))
 
 
 def shell_path(value):
@@ -489,6 +497,28 @@ def get_common_status_lock_file(system):
     """Return the shared per-system lock path used for TSV appends."""
     safe_system = sanitize_identifier(system) or 'system'
     filename = "Landing_Zone_{0}.transfers.lock".format(safe_system)
+    return config.resolve_managed_file_path(system, filename, 'flock')
+
+
+def get_notification_status_log_file(system):
+    """Return the shared per-system TSV notification delivery log path."""
+    notification_config = config.notifications
+    configured_file = notification_config.get('status_file', '')
+    if configured_file:
+        return config.resolve_managed_file_path(system, configured_file, 'log')
+    safe_system = sanitize_identifier(system) or 'system'
+    filename = "Landing_Zone_{0}.notifications.tsv".format(safe_system)
+    return config.resolve_managed_file_path(system, filename, 'log')
+
+
+def get_notification_status_lock_file(system):
+    """Return the shared per-system notification delivery log lock path."""
+    notification_config = config.notifications
+    configured_file = notification_config.get('status_lock_file', '')
+    if configured_file:
+        return config.resolve_managed_file_path(system, configured_file, 'flock')
+    safe_system = sanitize_identifier(system) or 'system'
+    filename = "Landing_Zone_{0}.notifications.lock".format(safe_system)
     return config.resolve_managed_file_path(system, filename, 'flock')
 
 
@@ -670,6 +700,9 @@ def build_transfer_commands(transfer):
     flock_command = config.get_flock_path(transfer['system'])
     common_status_log_file = get_common_status_log_file(transfer['system'])
     common_status_lock_file = get_common_status_lock_file(transfer['system'])
+    notification_config = config.notifications
+    notification_status_log_file = get_notification_status_log_file(transfer['system'])
+    notification_status_lock_file = get_notification_status_lock_file(transfer['system'])
 
     return {
         'prepare_cmd': prepare_cmd,
@@ -683,6 +716,13 @@ def build_transfer_commands(transfer):
         'flock_command': flock_command,
         'common_status_log_file': common_status_log_file,
         'common_status_lock_file': common_status_lock_file,
+        'notification_api_endpoint': notification_config.get('endpoint', ''),
+        'notification_token_env': notification_config.get('token_env', ''),
+        'notification_title': notification_config.get('title', ''),
+        'notification_body': notification_config.get('body', ''),
+        'notification_timeout_seconds': notification_config.get('timeout_seconds', '5'),
+        'notification_status_log_file': notification_status_log_file,
+        'notification_status_lock_file': notification_status_lock_file,
     }
 
 
@@ -860,7 +900,10 @@ def generate_iterative_script_content(transfer):
         transfer_destination_label = destination_root
 
     flow_group = str(transfer.get('flow_group', '') or '').strip()
+    transfer_tags = normalize_tags_text(transfer.get('tags', ''))
     is_entry_point = str(transfer.get('is_entry_point', 'FALSE') or 'FALSE').strip().upper()
+    notify_on_success = str(transfer.get('notify_on_success', 'FALSE') or 'FALSE').strip().upper()
+    notify_on_error = str(transfer.get('notify_on_error', 'FALSE') or 'FALSE').strip().upper()
     portable_metadata_enabled = '1' if transfer_uses_portable_metadata(transfer) else '0'
     source_remote_target = source_remote or ''
     destination_remote_target = destination_remote or ''
@@ -875,11 +918,21 @@ mini_log_file="{mini_log_file}"
 flock_file="{flock_file}"
 common_status_log_file="{common_status_log_file}"
 common_status_lock_file="{common_status_lock_file}"
+notification_api_endpoint={notification_api_endpoint}
+notification_token_env={notification_token_env}
+notification_title={notification_title}
+notification_body={notification_body}
+notification_timeout_seconds={notification_timeout_seconds}
+notification_status_log_file="{notification_status_log_file}"
+notification_status_lock_file="{notification_status_lock_file}"
 transfer_identifier="{transfer_identifier}"
 transfer_system="{transfer_system}"
 flow_group="{flow_group}"
+transfer_tags="{transfer_tags}"
 portable_metadata_enabled="{portable_metadata_enabled}"
 is_entry_point="{is_entry_point}"
+notify_on_success="{notify_on_success}"
+notify_on_error="{notify_on_error}"
 source_remote_target="{source_remote_target}"
 source_remote_port="{source_remote_port}"
 destination_remote_target="{destination_remote_target}"
@@ -1190,6 +1243,139 @@ append_best_effort_portable_error() {{
     append_destination_portable_event "error" "$event_message"
 }}
 
+notification_enabled_for_status() {{
+    event_status="$1"
+    if [ "$event_status" = "completed" ] && [ "$notify_on_success" = "TRUE" ]; then
+        return 0
+    fi
+    if [ "$event_status" = "error" ] && [ "$notify_on_error" = "TRUE" ]; then
+        return 0
+    fi
+    return 1
+}}
+
+notification_token_value() {{
+    if [ -z "$notification_token_env" ]; then
+        return 0
+    fi
+    env | awk -F= -v name="$notification_token_env" '$1 == name {{ print substr($0, length(name) + 2); exit }}'
+}}
+
+json_escape() {{
+    printf '%s' "$1" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g; s/	/\\\\t/g' | tr '\\r\\n' '  '
+}}
+
+build_notification_payload() {{
+    event_status="$1"
+    event_directory="$2"
+    event_source="$3"
+    event_destination="$4"
+    event_message="$5"
+    idempotency_key="$6"
+    printf '{{"title":"%s","body":"%s","idempotency_key":"%s","transfer_identifier":"%s","system":"%s","run_id":"%s","run_name":"%s","flow_group":"%s","tags":"%s","directory":"%s","source_path":"%s","destination_path":"%s","status":"%s","message":"%s"}}' \\
+        "$(json_escape "$notification_title")" \\
+        "$(json_escape "$notification_body")" \\
+        "$(json_escape "$idempotency_key")" \\
+        "$(json_escape "$transfer_identifier")" \\
+        "$(json_escape "$transfer_system")" \\
+        "$(json_escape "$current_run_id")" \\
+        "$(json_escape "$current_run_name")" \\
+        "$(json_escape "$flow_group")" \\
+        "$(json_escape "$transfer_tags")" \\
+        "$(json_escape "$event_directory")" \\
+        "$(json_escape "$event_source")" \\
+        "$(json_escape "$event_destination")" \\
+        "$(json_escape "$event_status")" \\
+        "$(json_escape "$event_message")"
+}}
+
+notification_already_sent() {{
+    idempotency_key="$1"
+    [ -s "$notification_status_log_file" ] || return 1
+    awk -F '\\t' -v key="$idempotency_key" '$3 == key && $14 == "sent" {{ found = 1 }} END {{ exit found ? 0 : 1 }}' "$notification_status_log_file"
+}}
+
+append_notification_status() {{
+    transfer_event_time_utc="$1"
+    notification_time_utc="$2"
+    idempotency_key="$3"
+    event_directory="$4"
+    event_source="$5"
+    event_destination="$6"
+    event_status="$7"
+    notification_status="$8"
+    http_status="$9"
+    attempt="${{10}}"
+    notification_message="${{11:-}}"
+    (
+        exec 7>>"$notification_status_lock_file"
+        {flock_command} 7
+        if [ ! -s "$notification_status_log_file" ]; then
+            printf 'event_time_utc\\tnotification_time_utc\\tidempotency_key\\ttransfer_identifier\\tsystem\\trun_id\\trun_name\\tflow_group\\ttags\\tdirectory\\tsource_path\\tdestination_path\\tstatus\\tnotification_status\\thttp_status\\tattempt\\ttitle\\tbody\\tmessage\\n' >> "$notification_status_log_file"
+        fi
+        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \\
+            "$(sanitize_tsv_field "$transfer_event_time_utc")" \\
+            "$(sanitize_tsv_field "$notification_time_utc")" \\
+            "$(sanitize_tsv_field "$idempotency_key")" \\
+            "$(sanitize_tsv_field "$transfer_identifier")" \\
+            "$(sanitize_tsv_field "$transfer_system")" \\
+            "$(sanitize_tsv_field "$current_run_id")" \\
+            "$(sanitize_tsv_field "$current_run_name")" \\
+            "$(sanitize_tsv_field "$flow_group")" \\
+            "$(sanitize_tsv_field "$transfer_tags")" \\
+            "$(sanitize_tsv_field "$event_directory")" \\
+            "$(sanitize_tsv_field "$event_source")" \\
+            "$(sanitize_tsv_field "$event_destination")" \\
+            "$(sanitize_tsv_field "$event_status")" \\
+            "$(sanitize_tsv_field "$notification_status")" \\
+            "$(sanitize_tsv_field "$http_status")" \\
+            "$(sanitize_tsv_field "$attempt")" \\
+            "$(sanitize_tsv_field "$notification_title")" \\
+            "$(sanitize_tsv_field "$notification_body")" \\
+            "$(sanitize_tsv_field "$notification_message")" >> "$notification_status_log_file"
+    ) || debug "unable to append notification status row"
+}}
+
+notify_transfer_event() {{
+    transfer_event_time_utc="$1"
+    event_status="$2"
+    event_directory="${{3:-}}"
+    event_source="${{4:-}}"
+    event_destination="${{5:-}}"
+    event_message="${{6:-}}"
+    notification_enabled_for_status "$event_status" || return 0
+    [ -n "$notification_api_endpoint" ] || return 0
+    [ -n "$notification_status_log_file" ] || return 0
+    idempotency_key="$(sanitize_tsv_field "${{current_run_id}}|${{transfer_identifier}}|${{event_status}}|${{event_directory}}|${{event_source}}|${{event_destination}}")"
+    notification_already_sent "$idempotency_key" && return 0
+    notification_time_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    if ! command -v curl >/dev/null 2>&1; then
+        append_notification_status "$transfer_event_time_utc" "$notification_time_utc" "$idempotency_key" "$event_directory" "$event_source" "$event_destination" "$event_status" "failed" "curl_missing" "1" "curl command not found"
+        return 0
+    fi
+    payload="$(build_notification_payload "$event_status" "$event_directory" "$event_source" "$event_destination" "$event_message" "$idempotency_key")"
+    token_value="$(notification_token_value)"
+    if [ -n "$token_value" ]; then
+        if http_status="$(curl -sS -o /dev/null -w '%{{http_code}}' --max-time "$notification_timeout_seconds" -H 'Content-Type: application/json' -H "Authorization: Bearer $token_value" -H "Idempotency-Key: $idempotency_key" --data "$payload" "$notification_api_endpoint" 2>/dev/null)"; then
+            :
+        else
+            http_status="curl_error"
+        fi
+    else
+        if http_status="$(curl -sS -o /dev/null -w '%{{http_code}}' --max-time "$notification_timeout_seconds" -H 'Content-Type: application/json' -H "Idempotency-Key: $idempotency_key" --data "$payload" "$notification_api_endpoint" 2>/dev/null)"; then
+            :
+        else
+            http_status="curl_error"
+        fi
+    fi
+    case "$http_status" in
+        2*) notification_status="sent" ;;
+        *) notification_status="failed" ;;
+    esac
+    append_notification_status "$transfer_event_time_utc" "$notification_time_utc" "$idempotency_key" "$event_directory" "$event_source" "$event_destination" "$event_status" "$notification_status" "$http_status" "1" ""
+    return 0
+}}
+
 append_common_status() {{
     event_status="$1"
     event_directory="${{2:-}}"
@@ -1201,15 +1387,16 @@ append_common_status() {{
         exec 8>>"$common_status_lock_file"
         {flock_command} 8
         if [ ! -s "$common_status_log_file" ]; then
-            printf 'event_time_utc\\ttransfer_identifier\\tsystem\\trun_id\\trun_name\\tflow_group\\torigin_system\\tentry_transfer_identifier\\tcreated_at_utc\\tdirectory\\tsource_path\\tdestination_path\\tstatus\\tmessage\\n' >> "$common_status_log_file"
+            printf 'event_time_utc\\ttransfer_identifier\\tsystem\\trun_id\\trun_name\\tflow_group\\ttags\\torigin_system\\tentry_transfer_identifier\\tcreated_at_utc\\tdirectory\\tsource_path\\tdestination_path\\tstatus\\tmessage\\n' >> "$common_status_log_file"
         fi
-        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \\
+        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \\
             "$(sanitize_tsv_field "$event_timestamp")" \\
             "$(sanitize_tsv_field "$transfer_identifier")" \\
             "$(sanitize_tsv_field "$transfer_system")" \\
             "$(sanitize_tsv_field "$current_run_id")" \\
             "$(sanitize_tsv_field "$current_run_name")" \\
             "$(sanitize_tsv_field "$flow_group")" \\
+            "$(sanitize_tsv_field "$transfer_tags")" \\
             "$(sanitize_tsv_field "$current_origin_system")" \\
             "$(sanitize_tsv_field "$current_entry_transfer_identifier")" \\
             "$(sanitize_tsv_field "$current_created_at_utc")" \\
@@ -1219,6 +1406,7 @@ append_common_status() {{
             "$(sanitize_tsv_field "$event_status")" \\
             "$(sanitize_tsv_field "$event_message")" >> "$common_status_log_file"
     ) || debug "unable to append common status row"
+    notify_transfer_event "$event_timestamp" "$event_status" "$event_directory" "$event_source" "$event_destination" "$event_message" || debug "notification delivery failed"
 }}
 
 debug() {{
@@ -1279,7 +1467,7 @@ on_exit() {{
 }}
 trap on_exit EXIT HUP INT TERM
 
-mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")" "$(dirname "$common_status_log_file")" "$(dirname "$common_status_lock_file")"
+mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")" "$(dirname "$common_status_log_file")" "$(dirname "$common_status_lock_file")" "$(dirname "$notification_status_log_file")" "$(dirname "$notification_status_lock_file")"
 debug "using lock file $flock_file"
 {remote_destination_setup}
 exec 9>"$flock_file"
@@ -1412,11 +1600,21 @@ fi
         flock_file=commands['flock_file'],
         common_status_log_file=commands['common_status_log_file'],
         common_status_lock_file=commands['common_status_lock_file'],
+        notification_api_endpoint=shell_assignment_value(commands['notification_api_endpoint']),
+        notification_token_env=shell_assignment_value(commands['notification_token_env']),
+        notification_title=shell_assignment_value(commands['notification_title']),
+        notification_body=shell_assignment_value(commands['notification_body']),
+        notification_timeout_seconds=shell_assignment_value(commands['notification_timeout_seconds']),
+        notification_status_log_file=commands['notification_status_log_file'],
+        notification_status_lock_file=commands['notification_status_lock_file'],
         transfer_identifier=identifier.replace('"', '\\"'),
         transfer_system=str(transfer.get('system', '') or '').replace('"', '\\"'),
         flow_group=flow_group.replace('"', '\\"'),
+        transfer_tags=transfer_tags.replace('"', '\\"'),
         portable_metadata_enabled=portable_metadata_enabled,
         is_entry_point=is_entry_point,
+        notify_on_success=notify_on_success,
+        notify_on_error=notify_on_error,
         source_remote_target=source_remote_target.replace('"', '\\"'),
         source_remote_port=source_port.replace('"', '\\"'),
         destination_remote_target=destination_remote_target.replace('"', '\\"'),

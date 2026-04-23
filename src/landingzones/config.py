@@ -30,6 +30,14 @@ Example config.yaml:
     default_lock_file: /tmp/landingzones.lock
     default_cron_frequency: "*/15 * * * *"
     validation_scripts_dir: output/validation_scripts
+    notifications:
+      endpoint: https://example.org/landingzones/events
+      token_env: LANDINGZONES_NOTIFY_TOKEN
+      title: Landing Zone transfer event
+      body: A Landing Zone transfer emitted a notifiable event.
+      timeout_seconds: 5
+      status_file: Landing_Zone_notifications.tsv
+      status_lock_file: Landing_Zone_notifications.lock
 """
 
 import os
@@ -50,6 +58,15 @@ DEFAULT_RIT_MANAGED_FOLDER_STRUCTURE = {
     'crontabs': 'crontab.d',
     'log': 'log',
     'flock': 'flock',
+}
+DEFAULT_NOTIFICATIONS = {
+    'endpoint': '',
+    'token_env': '',
+    'title': 'Landing Zone transfer event',
+    'body': 'A Landing Zone transfer emitted a notifiable event.',
+    'timeout_seconds': '5',
+    'status_file': '',
+    'status_lock_file': '',
 }
 
 
@@ -115,6 +132,8 @@ class Config:
         - LZ_CRONTAB_DIR: Default crontab output directory
         - LZ_VALIDATION_SCRIPTS_DIR: Default validation wrapper output directory
         - LZ_CRON_FREQUENCY: Default cron schedule expression
+        - LZ_NOTIFICATION_ENDPOINT: Optional notification API endpoint
+        - LZ_NOTIFICATION_TOKEN_ENV: Optional env var name containing bearer token
     """
     
     def __init__(self):
@@ -322,6 +341,32 @@ class Config:
         return {}
 
     @property
+    def notifications(self):
+        """Configured notification API and delivery-log settings."""
+        values = dict(DEFAULT_NOTIFICATIONS)
+
+        yaml_value = self._yaml_config.get('notifications')
+        if yaml_value is not None:
+            values.update(dict(yaml_value))
+
+        runtime_value = self._runtime_config.get('notifications')
+        if runtime_value is not None:
+            values.update(dict(runtime_value))
+
+        env_endpoint = os.environ.get('LZ_NOTIFICATION_ENDPOINT')
+        if env_endpoint:
+            values['endpoint'] = env_endpoint
+
+        env_token_env = os.environ.get('LZ_NOTIFICATION_TOKEN_ENV')
+        if env_token_env:
+            values['token_env'] = env_token_env
+
+        for key in ('endpoint', 'token_env', 'title', 'body', 'status_file', 'status_lock_file'):
+            values[key] = _expand_path(str(values.get(key, '') or ''))
+        values['timeout_seconds'] = str(values.get('timeout_seconds', '') or '5')
+        return values
+
+    @property
     def path_variables(self):
         """Configured ${VAR} placeholder values used in transfers.tsv paths."""
         values = dict(os.environ)
@@ -398,6 +443,7 @@ class Config:
             'validation_scripts_dir': self.validation_scripts_dir,
             'rit_managed_locations': self.rit_managed_locations,
             'flock_paths': self.flock_paths,
+            'notifications': self.notifications,
             'path_variables': self.path_variables,
             'rit_managed_folder_structure': self.rit_managed_folder_structure,
             'default_cron_frequency': self.default_cron_frequency,

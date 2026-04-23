@@ -24,24 +24,25 @@ other_system\tTRUE\tother\tlocal\t/elsewhere/*\t/unused/
 def make_log_df():
     """Create a log fixture spanning success, failed, warning, and in-progress."""
     rows = [
-        ("2026-04-09 09:00:00+0200", "stage_lab", "alpha", "/source/inbox/alpha", "/flow/stage/alpha", "initiated"),
-        ("2026-04-09 09:10:00+0200", "stage_lab", "alpha", "/source/inbox/alpha", "/flow/stage/alpha", "completed"),
-        ("2026-04-09 09:20:00+0200", "promote_calc", "alpha", "/flow/stage/alpha", "/flow/final/alpha", "initiated"),
-        ("2026-04-09 09:25:00+0200", "promote_calc", "alpha", "/flow/stage/alpha", "/flow/final/alpha", "completed"),
-        ("2026-04-09 09:30:00+0200", "pullback", "alpha", "/flow/final/alpha", "/flow/archive/alpha", "initiated"),
-        ("2026-04-09 09:35:00+0200", "pullback", "alpha", "/flow/final/alpha", "/flow/archive/alpha", "completed"),
-        ("2026-04-10 07:00:00+0200", "stage_lab", "beta", "/source/inbox/beta", "/flow/stage/beta", "initiated"),
-        ("2026-04-10 07:20:00+0200", "promote_calc", "beta", "/flow/stage/beta", "/flow/final/beta", "error"),
-        ("2026-04-10 08:00:00+0200", "stage_lab", "gamma", "/source/inbox/gamma", "/flow/stage/gamma", "initiated"),
-        ("2026-04-10 09:15:00+0200", "promote_calc", "gamma", "/flow/stage/gamma", "/flow/final/gamma", "completed"),
-        ("2026-04-10 07:30:00+0200", "stage_lab", "delta", "/source/inbox/delta", "/flow/stage/delta", "initiated"),
-        ("2026-04-10 09:30:00+0200", "stage_lab", "epsilon", "/source/inbox/epsilon", "/flow/stage/epsilon", "initiated"),
-        ("2026-04-10 09:35:00+0200", "promote_calc", "epsilon", "/flow/stage/epsilon", "/flow/final/epsilon", "error"),
-        ("2026-04-10 09:45:00+0200", "pullback", "epsilon", "/flow/final/epsilon", "/flow/archive/epsilon", "completed"),
+        ("2026-04-09 09:00:00+0200", "stage_lab", "alpha", "/source/inbox/alpha", "/flow/stage/alpha", "initiated", "Heartbeat, Lab"),
+        ("2026-04-09 09:10:00+0200", "stage_lab", "alpha", "/source/inbox/alpha", "/flow/stage/alpha", "completed", "heartbeat"),
+        ("2026-04-09 09:20:00+0200", "promote_calc", "alpha", "/flow/stage/alpha", "/flow/final/alpha", "initiated", ""),
+        ("2026-04-09 09:25:00+0200", "promote_calc", "alpha", "/flow/stage/alpha", "/flow/final/alpha", "completed", ""),
+        ("2026-04-09 09:30:00+0200", "pullback", "alpha", "/flow/final/alpha", "/flow/archive/alpha", "initiated", ""),
+        ("2026-04-09 09:35:00+0200", "pullback", "alpha", "/flow/final/alpha", "/flow/archive/alpha", "completed", ""),
+        ("2026-04-10 07:00:00+0200", "stage_lab", "beta", "/source/inbox/beta", "/flow/stage/beta", "initiated", "lab"),
+        ("2026-04-10 07:20:00+0200", "promote_calc", "beta", "/flow/stage/beta", "/flow/final/beta", "error", "side-flow"),
+        ("2026-04-10 08:00:00+0200", "stage_lab", "gamma", "/source/inbox/gamma", "/flow/stage/gamma", "initiated", ""),
+        ("2026-04-10 09:15:00+0200", "promote_calc", "gamma", "/flow/stage/gamma", "/flow/final/gamma", "completed", "lab"),
+        ("2026-04-10 07:30:00+0200", "stage_lab", "delta", "/source/inbox/delta", "/flow/stage/delta", "initiated", ""),
+        ("2026-04-10 09:30:00+0200", "stage_lab", "epsilon", "/source/inbox/epsilon", "/flow/stage/epsilon", "initiated", "manual"),
+        ("2026-04-10 09:35:00+0200", "promote_calc", "epsilon", "/flow/stage/epsilon", "/flow/final/epsilon", "error", "manual"),
+        ("2026-04-10 09:45:00+0200", "pullback", "epsilon", "/flow/final/epsilon", "/flow/archive/epsilon", "completed", "manual"),
     ]
-    columns = ["datetime", "identifier", "directory", "source", "destination", "status"]
+    columns = ["datetime", "identifier", "directory", "source", "destination", "status", "tags"]
     df = pd.DataFrame(rows, columns=columns)
     df["datetime"] = pd.to_datetime(df["datetime"], format="%Y-%m-%d %H:%M:%S%z")
+    df["tags"] = df["tags"].apply(pts.normalize_tags_text)
     df["directory_suffix"] = df["directory"].apply(pts.normalize_directory_suffix)
     return df.sort_values("datetime").reset_index(drop=True)
 
@@ -70,6 +71,22 @@ def test_load_transfer_log_supports_rich_event_schema(tmp_path):
     assert df.loc[0, "run_id"] == "run-123"
     assert df.loc[0, "run_group"] == "run-123"
     assert df.loc[0, "directory_suffix"] == "alpha"
+    assert df.loc[0, "tags"] == ""
+
+
+def test_load_transfer_log_normalizes_tags_column(tmp_path):
+    path = tmp_path / "Landing_Zone_test_local.transfers.tsv"
+    path.write_text(
+        "\n".join([
+            "event_time_utc\ttransfer_identifier\tsystem\trun_id\trun_name\tflow_group\ttags\torigin_system\tentry_transfer_identifier\tcreated_at_utc\tdirectory\tsource_path\tdestination_path\tstatus\tmessage",
+            "2026-04-10T07:00:00Z\tstage_lab\ttest_local\trun-123\talpha\tflow_a\tHeartbeat, lab, heartbeat\tseqbox01\tstage_lab\t2026-04-10T06:55:00Z\talpha\t/source/inbox/alpha\t/flow/stage/alpha\tinitiated\t",
+            "",
+        ])
+    )
+
+    df = pts.load_transfer_log(str(path))
+
+    assert df.loc[0, "tags"] == "heartbeat,lab"
 
 
 def test_main_uses_configured_report_transfer_log_file_when_input_omitted(tmp_path, monkeypatch):
@@ -163,6 +180,22 @@ def test_aggregate_runs_assigns_expected_health_states():
     assert by_run.loc["delta", "state"] == "warning"
     assert by_run.loc["epsilon", "state"] == "success"
     assert by_run.loc["epsilon", "state_identifier"] == "pullback"
+    assert by_run.loc["alpha", "tags"] == "heartbeat,lab"
+    assert by_run.loc["beta", "tags"] == "lab,side-flow"
+
+
+def test_filter_runs_by_tags_matches_any_requested_tag():
+    log_df = make_log_df()
+    runs_df = pts.aggregate_runs(
+        log_df,
+        terminal_identifiers=["pullback"],
+        anchor_time=log_df["datetime"].max(),
+        warning_hours=2,
+    )
+
+    filtered = pts.filter_runs_by_tags(runs_df, ["heartbeat", "manual"])
+
+    assert set(filtered["run"]) == {"alpha", "epsilon"}
 
 
 def test_describe_state_logic_includes_warning_threshold():
@@ -203,16 +236,17 @@ def test_render_dashboard_includes_tables_truncation_and_anchor_time(tmp_path):
         run = "unfinished_{0:02d}".format(index)
         timestamp = anchor - pd.Timedelta(minutes=index)
         extra_rows.append(
-            {
-                "datetime": timestamp,
-                "identifier": "stage_lab",
-                "directory": run,
-                "source": "/source/inbox/{0}".format(run),
-                "destination": "/flow/stage/{0}".format(run),
-                "status": "initiated",
-                "directory_suffix": run,
-            }
-        )
+                {
+                    "datetime": timestamp,
+                    "identifier": "stage_lab",
+                    "directory": run,
+                    "source": "/source/inbox/{0}".format(run),
+                    "destination": "/flow/stage/{0}".format(run),
+                    "status": "initiated",
+                    "tags": "",
+                    "directory_suffix": run,
+                }
+            )
     for index in range(12):
         run = "success_{0:02d}".format(index)
         started = anchor - pd.Timedelta(hours=6, minutes=index)
@@ -226,6 +260,7 @@ def test_render_dashboard_includes_tables_truncation_and_anchor_time(tmp_path):
                     "source": "/source/inbox/{0}".format(run),
                     "destination": "/flow/stage/{0}".format(run),
                     "status": "initiated",
+                    "tags": "",
                     "directory_suffix": run,
                 },
                 {
@@ -235,6 +270,7 @@ def test_render_dashboard_includes_tables_truncation_and_anchor_time(tmp_path):
                     "source": "/flow/final/{0}".format(run),
                     "destination": "/flow/archive/{0}".format(run),
                     "status": "completed",
+                    "tags": "",
                     "directory_suffix": run,
                 },
             ]
@@ -264,6 +300,29 @@ def test_render_dashboard_includes_tables_truncation_and_anchor_time(tmp_path):
     assert "warning" in html_output
     assert "in progress" in html_output
     assert "failed" in html_output
+    assert "Tag Summary" in html_output
+    assert "heartbeat" in html_output
+    assert "Tag filter: (none)" in html_output
     assert 'title="Warning: no newer terminal success or error exists, and the latest initiated event is older than the 2h threshold."' in html_output
     assert 'title="Failed: the most recent decisive event is an error event."' in html_output
     assert "Hover a status label for classification logic" in html_output
+
+
+def test_create_transfer_dashboard_filters_runs_by_tag(tmp_path):
+    transfers_df = pts.load_transfer_metadata(str(make_transfers_tsv(tmp_path)))
+    log_df = make_log_df()
+    output_path = tmp_path / "heartbeat-dashboard.html"
+
+    pts.create_transfer_dashboard(
+        log_df,
+        transfers_df,
+        system="test_local",
+        output_path=str(output_path),
+        filter_tags=["heartbeat"],
+    )
+
+    html_output = output_path.read_text()
+
+    assert "Tag filter: heartbeat" in html_output
+    assert "alpha" in html_output
+    assert "epsilon" not in html_output

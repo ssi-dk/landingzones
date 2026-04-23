@@ -315,6 +315,33 @@ class TestConfigClass:
         assert cfg.get_flock_path('calc') == '/opt/bin/flock'
         assert cfg.get_flock_path('other') == '/usr/bin/flock'
 
+    def test_notifications_from_yaml_runtime_and_env(self, tmp_path, monkeypatch):
+        """Notification settings should merge YAML, runtime, and env overrides."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "notifications:\n"
+            "  endpoint: https://yaml.example/events\n"
+            "  token_env: YAML_TOKEN\n"
+            "  title: YAML title\n"
+            "  body: YAML body\n"
+            "  timeout_seconds: 9\n"
+        )
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LZ_NOTIFICATION_ENDPOINT", "https://env.example/events")
+        cfg = config.Config()
+        cfg.load_config(notifications={
+            'body': 'Runtime body',
+            'status_file': 'notifications.tsv',
+        })
+
+        assert cfg.notifications['endpoint'] == 'https://env.example/events'
+        assert cfg.notifications['token_env'] == 'YAML_TOKEN'
+        assert cfg.notifications['title'] == 'YAML title'
+        assert cfg.notifications['body'] == 'Runtime body'
+        assert cfg.notifications['timeout_seconds'] == '9'
+        assert cfg.notifications['status_file'] == 'notifications.tsv'
+
 
 class TestLoadConfig:
     """Test the Config.load_config method"""

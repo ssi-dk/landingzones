@@ -15,7 +15,10 @@ from landingzones.transfer_loading import (
     load_reporting_transfers,
 )
 from landingzones.transfer_definitions import (
+    normalize_tags,
+    normalize_tags_text,
     normalize_transfer_path,
+    tags_match_any,
 )
 
 
@@ -71,9 +74,13 @@ def load_transfer_log(path):
         df["directory"] = df["run_name"]
 
     df["datetime"] = pd.to_datetime(df["datetime"])
-    for column in ("identifier", "directory", "source", "destination", "status"):
+    for column in ("identifier", "directory", "source", "destination", "status", "tags"):
         if column in df.columns:
             df[column] = df[column].fillna("").astype(str).str.strip()
+    if "tags" in df.columns:
+        df["tags"] = df["tags"].apply(normalize_tags_text)
+    else:
+        df["tags"] = ""
     if "run_id" in df.columns:
         df["run_id"] = df["run_id"].fillna("").astype(str).str.strip()
     else:
@@ -277,6 +284,7 @@ def aggregate_runs(log_df, terminal_identifiers, anchor_time=None, warning_hours
                 "run": rows.iloc[-1].get("run_name") or rows.iloc[-1]["directory_suffix"],
                 "run_group": run_group,
                 "run_id": rows.iloc[-1].get("run_id", ""),
+                "tags": normalize_tags_text(rows["tags"].tolist()),
                 "started_at": started_at,
                 "latest_start": latest_start,
                 "last_event_time": latest_row["datetime"],
@@ -311,6 +319,24 @@ def windowed_runs(runs_df, window, anchor_time):
     return filtered, label
 
 
+def filter_runs_by_tags(runs_df, requested_tags):
+    """Return only runs matching any requested tag."""
+    if runs_df.empty or not requested_tags:
+        return runs_df.copy()
+    return runs_df[runs_df["tags"].apply(
+        lambda value: tags_match_any(value, requested_tags)
+    )].copy()
+
+
+def build_tag_summary(runs_df):
+    """Return tag counts across filtered runs."""
+    counts = {}
+    for value in runs_df.get("tags", []):
+        for tag in normalize_tags(value):
+            counts[tag] = counts.get(tag, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+
 def build_metric_cards(runs_df, anchor_time):
     """Summarize run health in multiple time windows."""
     cards = []
@@ -341,7 +367,14 @@ def select_run_list(runs_df, statuses, window, anchor_time, max_runs, sort_colum
     return filtered.head(max_runs), overflow, label
 
 
-def dashboard_context(log_df, transfers_df, system, warning_hours=2, max_runs=10):
+def dashboard_context(
+    log_df,
+    transfers_df,
+    system,
+    warning_hours=2,
+    max_runs=10,
+    filter_tags=None,
+):
     """Build all data needed to render the HTML dashboard."""
     if log_df.empty:
         raise ValueError("Transfer log is empty: no rows to report")
@@ -353,9 +386,10 @@ def dashboard_context(log_df, transfers_df, system, warning_hours=2, max_runs=10
         anchor_time=anchor_time,
         warning_hours=warning_hours,
     )
-    metric_cards = build_metric_cards(runs_df, anchor_time)
+    filtered_runs_df = filter_runs_by_tags(runs_df, filter_tags or [])
+    metric_cards = build_metric_cards(filtered_runs_df, anchor_time)
     unfinished_runs, unfinished_overflow, unfinished_label = select_run_list(
-        runs_df,
+        filtered_runs_df,
         statuses=("failed", "warning", "in_progress"),
         window=RUN_LIST_WINDOW,
         anchor_time=anchor_time,
@@ -363,7 +397,7 @@ def dashboard_context(log_df, transfers_df, system, warning_hours=2, max_runs=10
         sort_column="last_event_time",
     )
     success_runs, success_overflow, success_label = select_run_list(
-        runs_df,
+        filtered_runs_df,
         statuses=("success",),
         window=RUN_LIST_WINDOW,
         anchor_time=anchor_time,
@@ -372,7 +406,7 @@ def dashboard_context(log_df, transfers_df, system, warning_hours=2, max_runs=10
     )
     return {
         "anchor_time": anchor_time,
-        "runs_df": runs_df,
+        "runs_df": filtered_runs_df,
         "metric_cards": metric_cards,
         "unfinished_runs": unfinished_runs,
         "unfinished_overflow": unfinished_overflow,
@@ -383,6 +417,8 @@ def dashboard_context(log_df, transfers_df, system, warning_hours=2, max_runs=10
         "terminal_identifiers": terminal_identifiers,
         "system": system,
         "warning_hours": warning_hours,
+        "filter_tags": normalize_tags_text(filter_tags or []),
+        "tag_summary": build_tag_summary(filtered_runs_df),
     }
 
 
@@ -394,7 +430,7 @@ def render_run_table(rows_df, empty_message, warning_hours):
     header = (
         "<tr>"
         "<th>Run</th><th>Status</th><th>Last identifier</th><th>Last event</th>"
-        "<th>Age</th><th>Source</th><th>Destination</th>"
+        "<th>Age</th><th>Tags</th><th>Source</th><th>Destination</th>"
         "</tr>"
     )
     body_rows = []
@@ -406,6 +442,7 @@ def render_run_table(rows_df, empty_message, warning_hours):
             "<td>{identifier}</td>"
             "<td>{last_event}</td>"
             "<td>{age}</td>"
+            "<td>{tags}</td>"
             "<td class=\"path\">{source}</td>"
             "<td class=\"path\">{destination}</td>"
             "</tr>".format(
@@ -416,6 +453,7 @@ def render_run_table(rows_df, empty_message, warning_hours):
                     row["last_event_time"].strftime("%Y-%m-%d %H:%M:%S%z")
                 ),
                 age=html.escape(format_timedelta(row["age"])),
+                tags=html.escape(str(row.get("tags", "") or "(none)")),
                 source=html.escape(str(row["source"])),
                 destination=html.escape(str(row["destination"])),
             )
@@ -472,6 +510,28 @@ def render_dashboard(context, output_path, title=None):
         success_more = (
             '<p class="overflow">Showing 10 most recent successes; '
             'and {0} more.</p>'.format(context["success_overflow"])
+        )
+
+    tag_summary = ""
+    if context["tag_summary"]:
+        tag_rows = "".join(
+            "<tr><td>{0}</td><td>{1}</td></tr>".format(
+                html.escape(tag),
+                count,
+            )
+            for tag, count in context["tag_summary"]
+        )
+        tag_summary = (
+            '<section class="section">'
+            '<h2>Tag Summary</h2>'
+            '<table><thead><tr><th>Tag</th><th>Runs</th></tr></thead>'
+            '<tbody>{0}</tbody></table>'
+            '</section>'.format(tag_rows)
+        )
+    else:
+        tag_summary = (
+            '<section class="section"><h2>Tag Summary</h2>'
+            '<p class="empty">No tags present in the filtered runs.</p></section>'
         )
 
     document = """<!DOCTYPE html>
@@ -645,6 +705,7 @@ def render_dashboard(context, output_path, title=None):
         <span>System: {system}</span>
         <span>Terminal identifiers: {terminal_ids}</span>
         <span>Warning threshold: {warning_hours}h</span>
+        <span>Tag filter: {filter_tags}</span>
         <span>Hover a status label for classification logic</span>
       </div>
     </section>
@@ -654,6 +715,7 @@ def render_dashboard(context, output_path, title=None):
         {metric_cards}
       </div>
     </section>
+    {tag_summary}
     <section class="section">
       <h2>Unfinished Runs ({unfinished_label})</h2>
       {unfinished_table}
@@ -680,7 +742,9 @@ def render_dashboard(context, output_path, title=None):
         system=html.escape(context["system"]),
         terminal_ids=html.escape(", ".join(context["terminal_identifiers"]) or "(none)"),
         warning_hours=context["warning_hours"],
+        filter_tags=html.escape(context["filter_tags"] or "(none)"),
         metric_cards="".join(metric_cards),
+        tag_summary=tag_summary,
         unfinished_label=html.escape(context["unfinished_label"]),
         unfinished_table=render_run_table(
             context["unfinished_runs"],
@@ -710,6 +774,7 @@ def create_transfer_dashboard(
     warning_hours=2,
     max_runs=10,
     title=None,
+    filter_tags=None,
 ):
     """Create a self-contained HTML dashboard."""
     context = dashboard_context(
@@ -718,6 +783,7 @@ def create_transfer_dashboard(
         system=system,
         warning_hours=warning_hours,
         max_runs=max_runs,
+        filter_tags=filter_tags,
     )
     return render_dashboard(context, output_path, title=title)
 
@@ -800,6 +866,12 @@ def main(argv=None):
         default=None,
         help="Optional dashboard title override",
     )
+    parser.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        help="Filter runs to those matching any requested tag; repeatable",
+    )
     args = parser.parse_args(argv)
 
     input_path = resolve_report_input_path(
@@ -827,6 +899,7 @@ def main(argv=None):
         warning_hours=args.warning_hours,
         max_runs=args.max_runs,
         title=args.title,
+        filter_tags=args.tag,
     )
     print("Wrote dashboard to {0}".format(output_path))
     return 0

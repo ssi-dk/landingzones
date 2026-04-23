@@ -4,7 +4,10 @@
 
 from landingzones.config import config
 from landingzones import generate_cron_files as gcf
-from landingzones.transfer_definitions import definitions_from_dataframe
+from landingzones.transfer_definitions import (
+    definitions_from_dataframe,
+    tags_match_any,
+)
 
 
 def load_transfers(config_file=None, transfers_file=None, require_runtime_files=True):
@@ -39,6 +42,15 @@ def filter_transfers_by_system_user(transfers_df, system, user):
     return transfers_df[
         (transfers_df['system'] == system) &
         (transfers_df['users'] == user)
+    ].copy()
+
+
+def filter_transfers_by_tags(transfers_df, requested_tags):
+    """Return transfers matching any requested tag."""
+    if not requested_tags:
+        return transfers_df.copy()
+    return transfers_df[
+        transfers_df['tags'].apply(lambda value: tags_match_any(value, requested_tags))
     ].copy()
 
 

@@ -11,6 +11,7 @@ from landingzones.config import config
 from landingzones import check_deployment_readiness as cdr
 from landingzones import generate_cron_files as gcf
 from landingzones import plot_transfer_status as pts
+from landingzones import validate_separation as vsep
 
 
 def append_option(argv, flag, value):
@@ -112,6 +113,44 @@ def build_cli_parser():
     )
     validate_hop_parser.set_defaults(handler=handle_validate_hop)
 
+    validate_separation_parser = validate_subparsers.add_parser(
+        'separation',
+        help='Check whether tagged transfers collide with other enabled flows',
+    )
+    validate_separation_parser.add_argument('--config', '-c', default=None)
+    validate_separation_parser.add_argument('--transfers', '-t', default=None)
+    validate_separation_parser.add_argument(
+        '--tag',
+        action='append',
+        default=[],
+    )
+    validate_separation_parser.set_defaults(handler=handle_validate_separation)
+
+    validate_chain_parser = validate_subparsers.add_parser(
+        'chain',
+        help='Run separation, deployment, integration, and reporting in order',
+    )
+    validate_chain_parser.add_argument('--config', '-c', default=None)
+    validate_chain_parser.add_argument('--transfers', '-t', default=None)
+    validate_chain_parser.add_argument('--validation-scripts-dir', default=None)
+    validate_chain_parser.add_argument(
+        '--slow',
+        action='store_true',
+        help='Pass slow mode through to the integration step',
+    )
+    validate_chain_parser.add_argument(
+        '--tag',
+        action='append',
+        default=[],
+    )
+    validate_chain_parser.add_argument('--report-input', default=None)
+    validate_chain_parser.add_argument('--report-output', default=None)
+    validate_chain_parser.add_argument('--system', default=None)
+    validate_chain_parser.add_argument('--warning-hours', type=float, default=None)
+    validate_chain_parser.add_argument('--max-runs', type=int, default=None)
+    validate_chain_parser.add_argument('--title', default=None)
+    validate_chain_parser.set_defaults(handler=handle_validate_chain)
+
     deploy_parser = subparsers.add_parser(
         'deploy',
         help='Perform operator deployment actions',
@@ -156,6 +195,11 @@ def build_cli_parser():
     report_transfers_parser.add_argument('--warning-hours', type=float, default=None)
     report_transfers_parser.add_argument('--max-runs', type=int, default=None)
     report_transfers_parser.add_argument('--title', default=None)
+    report_transfers_parser.add_argument(
+        '--tag',
+        action='append',
+        default=[],
+    )
     report_transfers_parser.set_defaults(handler=handle_report_transfers)
 
     return parser
@@ -252,6 +296,78 @@ def handle_deploy_cron(args, extra_args):
     return normalize_exit_code(cdr.main(argv))
 
 
+def handle_validate_separation(args, extra_args):
+    """Route `landingzones validate separation` to the tag collision checker."""
+    if extra_args:
+        raise SystemExit("unrecognized arguments: {0}".format(' '.join(extra_args)))
+    argv = []
+    append_option(argv, '--config', resolve_cli_config(args))
+    append_option(argv, '--transfers', args.transfers)
+    for tag in args.tag:
+        append_option(argv, '--tag', tag)
+    return normalize_exit_code(vsep.main(argv))
+
+
+def handle_validate_chain(args, extra_args):
+    """Run separation, deployment, integration, and reporting in order."""
+    if extra_args:
+        raise SystemExit("unrecognized arguments: {0}".format(' '.join(extra_args)))
+
+    config_path = resolve_cli_config(args)
+
+    separation_argv = []
+    append_option(separation_argv, '--config', config_path)
+    append_option(separation_argv, '--transfers', args.transfers)
+    for tag in args.tag:
+        append_option(separation_argv, '--tag', tag)
+    rc = normalize_exit_code(vsep.main(separation_argv))
+    if rc != 0:
+        return rc
+
+    deployment_argv = []
+    append_option(deployment_argv, '--config', config_path)
+    append_option(deployment_argv, '--transfers', args.transfers)
+    append_option(
+        deployment_argv,
+        '--validation-scripts-dir',
+        args.validation_scripts_dir,
+    )
+    rc = normalize_exit_code(cdr.main(deployment_argv))
+    if rc != 0:
+        return rc
+
+    integration_argv = []
+    append_option(integration_argv, '--config', config_path)
+    append_option(integration_argv, '--transfers', args.transfers)
+    append_option(
+        integration_argv,
+        '--validation-scripts-dir',
+        args.validation_scripts_dir,
+    )
+    if args.slow:
+        integration_argv.append('--slow')
+    integration_argv.append('--test-with-data')
+    rc = normalize_exit_code(cdr.main(integration_argv))
+    if rc != 0:
+        return rc
+
+    report_argv = []
+    if args.report_input:
+        report_argv.append(args.report_input)
+    append_option(report_argv, '--output', args.report_output)
+    append_option(report_argv, '--config', config_path)
+    append_option(report_argv, '--transfers-file', args.transfers)
+    append_option(report_argv, '--system', args.system)
+    if args.warning_hours is not None:
+        append_option(report_argv, '--warning-hours', args.warning_hours)
+    if args.max_runs is not None:
+        append_option(report_argv, '--max-runs', args.max_runs)
+    append_option(report_argv, '--title', args.title)
+    for tag in args.tag:
+        append_option(report_argv, '--tag', tag)
+    return normalize_exit_code(pts.main(report_argv))
+
+
 def handle_report_transfers(args, extra_args):
     """Route `landingzones report transfers` to dashboard generation."""
     if extra_args:
@@ -268,6 +384,8 @@ def handle_report_transfers(args, extra_args):
     if args.max_runs is not None:
         append_option(argv, '--max-runs', args.max_runs)
     append_option(argv, '--title', args.title)
+    for tag in args.tag:
+        append_option(argv, '--tag', tag)
     return normalize_exit_code(pts.main(argv))
 
 
