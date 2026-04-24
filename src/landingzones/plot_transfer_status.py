@@ -6,8 +6,12 @@ import argparse
 import html
 import os
 import re
+import sys
 
-import pandas as pd
+try:
+    import pandas as pd
+except ModuleNotFoundError:
+    pd = None
 
 from landingzones.config import config
 from landingzones.transfer_loading import (
@@ -41,6 +45,19 @@ def normalize_directory_suffix(value):
     if "/" in text:
         return text.rsplit("/", 1)[-1]
     return text
+
+
+def require_pandas():
+    """Return False and print a clear message when report dependencies are missing."""
+    if pd is not None:
+        return True
+    print(
+        "Report generation was skipped because pandas is not installed.\n"
+        "Install the reporting extra with `pip install 'landingzones[report]'` "
+        "or refresh the local Pixi environment, then rerun `landingzones report transfers`.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def parse_window_spec(window, anchor_time):
@@ -817,6 +834,8 @@ def resolve_report_input_path(input_path=None, config_file=None, transfers_file=
 
 def main(argv=None):
     """CLI entrypoint."""
+    if not require_pandas():
+        return 2
     parser = argparse.ArgumentParser(
         description="Generate a transfer health dashboard from a shared TSV log",
     )

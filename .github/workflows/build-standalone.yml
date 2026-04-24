@@ -1,0 +1,53 @@
+name: Build Standalone Bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      python-version:
+        description: "python-build-standalone Python version"
+        required: false
+        default: "3.12"
+      architecture:
+        description: "Optional python-build-standalone architecture override"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-linux:
+    name: Build Linux standalone bundle
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Pixi
+        uses: prefix-dev/setup-pixi@v0.8.14
+        with:
+          pixi-version: v0.41.4
+          cache: true
+          manifest-path: pixi.toml
+
+      - name: Run packaging tests
+        run: pixi run test-packaging
+
+      - name: Build standalone bundle
+        env:
+          PBS_PYTHON_VERSION: ${{ github.event.inputs.python-version || '3.12' }}
+          PBS_ARCHITECTURE: ${{ github.event.inputs.architecture }}
+        run: pixi run build-standalone
+
+      - name: Verify bundle CLI
+        run: ./packaging/dist/landingzones-standalone/landingzones --help
+
+      - name: Upload standalone bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: landingzones-standalone-linux
+          path: packaging/dist/landingzones-standalone.tar.gz
+          if-no-files-found: error

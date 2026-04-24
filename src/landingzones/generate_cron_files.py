@@ -9,11 +9,12 @@ Creates a .cron file for each system-user combination with rsync commands.
 import os
 import sys
 import argparse
+import csv
 import re
 import shlex
-import pandas as pd
 
 from landingzones.config import config
+from landingzones.table import TransferTable
 from landingzones.transfer_definitions import (
     definitions_from_dataframe,
     normalize_tags_text,
@@ -39,14 +40,27 @@ def normalize_bool_text(value):
 
 
 def ensure_text_column(df, column_name, default=''):
-    """Ensure a normalized text column exists on the transfer DataFrame."""
+    """Ensure a normalized text column exists on a transfer table."""
     if column_name not in df.columns:
         df[column_name] = default
-    df[column_name] = df[column_name].fillna(default).astype(str)
+    df[column_name] = [
+        clean_tsv_value(value, default=default)
+        for value in df[column_name]
+    ]
+
+
+def clean_tsv_value(value, default=''):
+    """Normalize an optional TSV value to stripped text."""
+    if value is None:
+        return default
+    text = str(value).strip()
+    if text == 'nan':
+        return default
+    return text
 
 
 def parse_transfers_file(filename, require_runtime_files=True):
-    """Parse the transfers.tsv file and return a normalized DataFrame.
+    """Parse the transfers.tsv file and return normalized transfer records.
 
     Args:
         filename: Path to a transfers.tsv file.
@@ -54,94 +68,110 @@ def parse_transfers_file(filename, require_runtime_files=True):
             requires fields such as log_file. When False, parse only the shared
             transfer metadata needed for reporting/analysis.
     """
-    # Read the TSV file with pandas - now with proper header line
-    df = pd.read_csv(filename, sep='\t')
-    
-    # Filter out commented lines (rows where system starts with #)
-    df = df[~df['system'].astype(str).str.startswith('#')]
-    
-    # Filter by enabled column if present - only process rows where enabled is TRUE
-    if 'enabled' in df.columns:
-        df['enabled'] = df['enabled'].astype(str).str.strip().str.upper()
-        df = df[df['enabled'] == 'TRUE']
+    with open(filename, 'r', newline='') as handle:
+        reader = csv.DictReader(handle, delimiter='\t')
+        columns = list(reader.fieldnames or [])
+        rows = [
+            {
+                column: clean_tsv_value(row.get(column, ''))
+                for column in columns
+            }
+            for row in reader
+        ]
 
-    if 'identifiers' not in df.columns:
-        df.insert(0, 'identifiers', [
-            "transfer_{0:03d}".format(i) for i in range(1, len(df) + 1)
-        ])
-    
-    # Clean up any extra whitespace in string columns
-    for col in df.select_dtypes(include=['object']).columns:
-        df[col] = df[col].astype(str).str.strip()
+    rows = [
+        row for row in rows
+        if not clean_tsv_value(row.get('system', '')).startswith('#')
+    ]
 
-    df = expand_transfer_endpoint_variables(df)
-    
-    # Create system_user combination column
-    df['system_user'] = df['system'] + '.' + df['users']
-    
-    # Handle empty columns and convert destination_port to string
-    ensure_text_column(df, 'rsync_options')
-    ensure_text_column(df, 'log_file')
-    ensure_text_column(df, 'flock_file')
-    ensure_text_column(df, 'io_nice')
-    
-    # Handle frequency column - use default if not present or empty
-    ensure_text_column(df, 'frequency')
+    if 'enabled' in columns:
+        rows = [
+            row for row in rows
+            if clean_tsv_value(row.get('enabled', '')).upper() == 'TRUE'
+        ]
 
-    ensure_text_column(df, 'flow_group')
-    df['flow_group'] = df['flow_group'].str.strip()
-    ensure_text_column(df, 'tags')
-    df['tags'] = df['tags'].apply(normalize_tags_text)
+    if 'identifiers' not in columns:
+        columns.insert(0, 'identifiers')
+        for index, row in enumerate(rows, start=1):
+            row['identifiers'] = "transfer_{0:03d}".format(index)
 
-    for bool_column in (
-        'is_entry_point',
-        'is_end_point',
-        'notify_on_success',
-        'notify_on_error',
-    ):
-        if bool_column not in df.columns:
-            df[bool_column] = 'FALSE'
-        df[bool_column] = df[bool_column].apply(normalize_bool_text)
-    
-    # Handle destination_port and source_port specially (may be numeric)
-    ensure_text_column(df, 'destination_port')
-    
-    # Handle source_port if it exists, otherwise create empty column
-    ensure_text_column(df, 'source_port')
-    
-    # Remove rows where columns contain 'nan' (from NaN values)
-    df['rsync_options'] = df['rsync_options'].replace('nan', '')
-    df['log_file'] = df['log_file'].replace('nan', '')
-    df['destination_port'] = df['destination_port'].replace('nan', '')
-    df['source_port'] = df['source_port'].replace('nan', '')
-    df['flock_file'] = df['flock_file'].replace('nan', '')
-    df['frequency'] = df['frequency'].replace('nan', '')
-    df['io_nice'] = df['io_nice'].replace('nan', '')
-    df['identifiers'] = df['identifiers'].replace('nan', '')
-    
-    # Clean up destination_port - remove .0 if it's a whole number
-    df['destination_port'] = df['destination_port'].str.replace(
-        r'\.0$', '', regex=True)
+    text_columns = (
+        'rsync_options',
+        'log_file',
+        'flock_file',
+        'io_nice',
+        'frequency',
+        'flow_group',
+        'tags',
+        'destination_port',
+        'source_port',
+    )
+    for column in text_columns:
+        if column not in columns:
+            columns.append(column)
+        for row in rows:
+            row[column] = clean_tsv_value(row.get(column, ''))
 
-    if (df['identifiers'] == '').any():
+    for row in rows:
+        for field_name in ('source', 'destination'):
+            row[field_name] = expand_transfer_endpoint(
+                row.get(field_name, ''),
+                config.path_variables,
+                row.get('identifiers', ''),
+                field_name,
+            )
+        row['system_user'] = "{0}.{1}".format(
+            row.get('system', ''),
+            row.get('users', ''),
+        )
+        row['tags'] = normalize_tags_text(row.get('tags', ''))
+        for bool_column in (
+            'is_entry_point',
+            'is_end_point',
+            'notify_on_success',
+            'notify_on_error',
+        ):
+            if bool_column not in columns:
+                columns.append(bool_column)
+            row[bool_column] = normalize_bool_text(row.get(bool_column, 'FALSE'))
+        row['destination_port'] = re.sub(r'\.0$', '', row.get('destination_port', ''))
+
+    if 'system_user' not in columns:
+        columns.append('system_user')
+
+    identifiers = [row.get('identifiers', '') for row in rows]
+    if any(identifier == '' for identifier in identifiers):
         raise ValueError("identifiers is required for all enabled transfers")
-    if require_runtime_files and (df['log_file'] == '').any():
+    if require_runtime_files and any(row.get('log_file', '') == '' for row in rows):
         raise ValueError("log_file is required for all enabled transfers")
 
-    sanitized_identifiers = df['identifiers'].apply(sanitize_identifier)
-    if (sanitized_identifiers == '').any():
+    sanitized_identifiers = [sanitize_identifier(identifier) for identifier in identifiers]
+    if any(identifier == '' for identifier in sanitized_identifiers):
         raise ValueError("identifiers must contain at least one filename-safe character")
-    if sanitized_identifiers.duplicated().any():
-        duplicates = sorted(df.loc[sanitized_identifiers.duplicated(keep=False), 'identifiers'].unique())
+    duplicate_sanitized = {
+        identifier for identifier in sanitized_identifiers
+        if sanitized_identifiers.count(identifier) > 1
+    }
+    if duplicate_sanitized:
+        duplicates = sorted({
+            row.get('identifiers', '')
+            for row, sanitized in zip(rows, sanitized_identifiers)
+            if sanitized in duplicate_sanitized
+        })
         raise ValueError(
             "identifiers must be unique after filename sanitization: {0}".format(
                 ', '.join(duplicates)
             )
         )
 
+    for row, sanitized in zip(rows, sanitized_identifiers):
+        row['script_name'] = "{0}.sh".format(sanitized)
+    if 'script_name' not in columns:
+        columns.append('script_name')
+
+    df = TransferTable(rows, columns=columns)
     validate_transfer_endpoints(df)
     validate_flow_metadata(df)
-    df['script_name'] = sanitized_identifiers + '.sh'
     df = resolve_transfer_file_paths(df)
     df.attrs['shared_file_pair_warnings'] = audit_shared_file_pairs(df)
     
@@ -277,15 +307,15 @@ def expand_transfer_endpoint_variables(df):
     df = df.copy()
     variables = config.path_variables
     for field_name in ('source', 'destination'):
-        df[field_name] = df.apply(
-            lambda row: expand_transfer_endpoint(
+        df[field_name] = [
+            expand_transfer_endpoint(
                 row.get(field_name, ''),
                 variables,
                 row.get('identifiers', ''),
                 field_name,
-            ),
-            axis=1,
-        )
+            )
+            for _, row in df.iterrows()
+        ]
     return df
 
 
@@ -471,18 +501,18 @@ def build_promote_command(destination_dir, staging_dir, remote=None, port=''):
 def resolve_transfer_file_paths(df):
     """Resolve per-system log and flock file names into full paths."""
     df = df.copy()
-    df['log_file'] = df.apply(
-        lambda row: config.resolve_managed_file_path(
+    df['log_file'] = [
+        config.resolve_managed_file_path(
             row['system'], row['log_file'], 'log'
-        ),
-        axis=1
-    )
-    df['flock_file'] = df.apply(
-        lambda row: config.resolve_managed_file_path(
+        )
+        for _, row in df.iterrows()
+    ]
+    df['flock_file'] = [
+        config.resolve_managed_file_path(
             row['system'], row['flock_file'], 'flock'
-        ),
-        axis=1
-    )
+        )
+        for _, row in df.iterrows()
+    ]
     return df
 
 

@@ -16,8 +16,6 @@ import subprocess
 import shutil
 import argparse
 
-import pandas as pd
-
 from landingzones.config import config
 from landingzones.generate_cron_files import (
     parse_transfers_file,

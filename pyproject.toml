@@ -25,16 +25,20 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "pandas>=1.0.0",
     "pyyaml>=5.0.0",
 ]
 
 [project.optional-dependencies]
+report = [
+    "pandas>=1.0.0",
+]
 test = [
+    "pandas>=1.0.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
 ]
 dev = [
+    "pandas>=1.0.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "flake8",

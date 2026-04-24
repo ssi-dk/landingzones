@@ -196,7 +196,7 @@ def main(argv=None):
         args.tag,
     )
     print_separation_report(args.tag, tagged_df, other_df, findings)
-    return 0
+    return 1 if findings else 0
 
 
 if __name__ == "__main__":

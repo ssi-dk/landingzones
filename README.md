@@ -99,7 +99,7 @@ landingzones report transfers output/log/Landing_Zone_calc.transfers.tsv
 
 ```bash
 # Development mode
-pip install -e .
+pip install -e ".[report]"
 
 # With test dependencies
 pip install -e ".[test]"
@@ -107,6 +107,70 @@ pip install -e ".[test]"
 # Production
 pip install .
 ```
+
+### Lab Sequencer Bundle
+
+For lab machines where a managed Python environment is awkward, build a
+relocatable bundle using a `python-build-standalone` runtime. Build it on a
+machine that matches the lab sequencer OS, architecture, and libc family.
+
+Download or provide a python-build-standalone `install_only` archive, then run:
+
+```bash
+cd app
+python scripts/build_python_standalone_bundle.py --python-archive /path/to/cpython-*-install_only.tar.*
+```
+
+If you already extracted the runtime, point at its Python executable instead:
+
+```bash
+python scripts/build_python_standalone_bundle.py --python-bin /path/to/python/install/bin/python3
+```
+
+With Pixi, the app includes a packaging task that downloads a matching
+python-build-standalone runtime using `getpybs`:
+
+```bash
+cd app
+pixi run build-standalone
+```
+
+The standalone bundle installs the core operator CLI without pandas, so it is
+intended for `build`, `validate`, and `deploy` on locked-down lab machines.
+`landingzones report transfers` remains a reporting extra and should run from
+an environment with `landingzones[report]` installed.
+
+The same bundle can be produced by the GitHub Actions workflow
+`Build Standalone Bundle`. Run it manually from Actions, or push a `v*` tag.
+It uploads `landingzones-standalone-linux` containing:
+
+```text
+landingzones-standalone.tar.gz
+```
+
+The bundle is written to:
+
+```text
+app/packaging/dist/landingzones-standalone/
+app/packaging/dist/landingzones-standalone.tar.gz
+```
+
+Copy the tarball to the lab machine, extract it, and run it like the normal CLI:
+
+```bash
+./landingzones --config config/config.yaml build
+./landingzones --config config/config.yaml validate deployment
+```
+
+For offline builds, pass `--wheelhouse /path/to/wheels` so dependencies are
+installed from local wheels. The legacy shell wrapper still works:
+
+```bash
+./scripts/build_python_standalone_bundle.sh --python-archive /path/to/cpython-*-install_only.tar.*
+```
+
+The bundle carries Python and Python packages only; the target machine still
+needs system tools such as `rsync`, `ssh`, `flock`, `curl`, and `cron`.
 
 ## Testing
 
@@ -257,5 +321,6 @@ landingzones --help
 ## Requirements
 
 - Python >= 3.8
-- pandas >= 1.0.0
+- PyYAML >= 5.0.0
+- pandas >= 1.0.0 only for `landingzones report transfers` / `landingzones[report]`
 - System: rsync, ssh, flock

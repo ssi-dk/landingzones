@@ -146,7 +146,7 @@ def test_print_separation_report_handles_no_tag_match(capsys):
     assert "No matching tagged transfers found for tags: missing-tag" in captured.out
 
 
-def test_main_returns_zero_and_prints_warnings(tmp_path, capsys):
+def test_main_returns_nonzero_and_prints_warnings(tmp_path, capsys):
     transfers_file = tmp_path / "transfers.tsv"
     transfers_file.write_text(
         "\n".join(
@@ -165,6 +165,6 @@ def test_main_returns_zero_and_prints_warnings(tmp_path, capsys):
     ])
     captured = capsys.readouterr()
 
-    assert rc == 0
+    assert rc == 1
     assert "Separation check for tags: heartbeat" in captured.out
     assert "Found 2 collision(s)." in captured.out

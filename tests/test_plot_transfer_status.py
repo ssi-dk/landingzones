@@ -53,6 +53,18 @@ def test_normalize_directory_suffix_handles_paths_and_remote_prefixes():
     assert pts.normalize_directory_suffix("calck:/home/kimn/Landing_Zone/Illumina_TransferTest") == "Illumina_TransferTest"
 
 
+def test_main_skips_report_without_pandas(monkeypatch, capsys):
+    """Missing optional reporting dependency should not raise a traceback."""
+    monkeypatch.setattr(pts, "pd", None)
+
+    rc = pts.main(["input.tsv"])
+    captured = capsys.readouterr()
+
+    assert rc == 2
+    assert "Report generation was skipped because pandas is not installed" in captured.err
+    assert "landingzones[report]" in captured.err
+
+
 def test_load_transfer_log_supports_rich_event_schema(tmp_path):
     path = tmp_path / "Landing_Zone_test_local.transfers.tsv"
     path.write_text(
