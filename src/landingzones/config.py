@@ -267,7 +267,7 @@ class Config:
     @property
     def test_data(self):
         """Path to toy data used by --test-with-data."""
-        return self._get_value('test_data', 'LZ_TEST_DATA', 'tests/toy_data')
+        return self._get_value('test_data', 'LZ_TEST_DATA', 'tests/data')
     
     @property
     def log_dir(self):

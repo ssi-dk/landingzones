@@ -1049,6 +1049,34 @@ class TestTestWithData:
         assert seed_plan[0]['toy_data_dir'] == str(toy_data_root)
         assert seed_plan[0]['entry_names'] == ['Nanopore_TransferTest']
 
+    def test_build_test_with_data_seed_plan_uses_direct_fixture_root(
+        self, tmp_path
+    ):
+        """Direct tests/data/<fixture> layouts should work with fixture filters."""
+        toy_data_root = tmp_path / 'tests' / 'data'
+        toy_data_root.mkdir(parents=True)
+        (toy_data_root / 'Illumina_TransferTest').mkdir()
+        (toy_data_root / 'Nanopore_TransferTest').mkdir()
+
+        test_plan = {
+            'initial_sources': [
+                {
+                    'value': str(tmp_path / 'source' / 'corefacility') + '/',
+                    'port': '',
+                    'test_fixture_names': ['Illumina_TransferTest'],
+                }
+            ]
+        }
+
+        seed_plan = cdr.build_test_with_data_seed_plan(
+            test_plan,
+            str(toy_data_root),
+            str(tmp_path),
+        )
+
+        assert seed_plan[0]['toy_data_dir'] == str(toy_data_root)
+        assert seed_plan[0]['entry_names'] == ['Illumina_TransferTest']
+
     def test_run_generated_scripts_enables_debug_cli(self, tmp_path, monkeypatch):
         """Generated scripts should run with debug logging enabled in test-with-data."""
         script = tmp_path / 'sample.sh'

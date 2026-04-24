@@ -105,12 +105,6 @@ def build_cli_parser():
     validate_hop_parser.add_argument('--config', '-c', default=None)
     validate_hop_parser.add_argument('--validation-scripts-dir', default=None)
     validate_hop_parser.add_argument('flow_group')
-    validate_hop_parser.add_argument(
-        'action',
-        nargs='?',
-        choices=('preflight', 'run'),
-        default='run',
-    )
     validate_hop_parser.set_defaults(handler=handle_validate_hop)
 
     validate_separation_parser = validate_subparsers.add_parser(
@@ -280,7 +274,10 @@ def handle_validate_hop(args, extra_args):
     wrapper_args = list(extra_args)
     if wrapper_args and wrapper_args[0] == '--':
         wrapper_args = wrapper_args[1:]
-    command = [wrapper_path, args.action] + wrapper_args
+    action = 'run'
+    if wrapper_args and wrapper_args[0] in ('preflight', 'run'):
+        action = wrapper_args.pop(0)
+    command = [wrapper_path, action] + wrapper_args
     return subprocess.call(command)
 
 

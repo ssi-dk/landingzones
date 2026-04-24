@@ -292,6 +292,12 @@ def resolve_test_data_dir(endpoint, toy_data_root, test_tree_root):
         if os.path.isdir(toy_dir):
             return toy_dir
 
+    fixture_names = endpoint.get('test_fixture_names', [])
+    if fixture_names:
+        available = set(list_visible_directories(toy_data_root))
+        if all(fixture_name in available for fixture_name in fixture_names):
+            return toy_data_root
+
     available = list_visible_directories(toy_data_root)
     if len(available) == 1:
         # Allow fixture bundles to be wrapped in one or more single-directory
