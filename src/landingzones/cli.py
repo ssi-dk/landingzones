@@ -365,7 +365,11 @@ def handle_validate_chain(args, extra_args):
     append_option(report_argv, '--title', args.title)
     for tag in args.tag:
         append_option(report_argv, '--tag', tag)
-    return normalize_exit_code(pts.main(report_argv))
+    rc = normalize_exit_code(pts.main(report_argv))
+    if rc == getattr(pts, 'REPORT_SKIPPED_EXIT_CODE', 2):
+        print("Validation chain completed; report generation was skipped.")
+        return 0
+    return rc
 
 
 def handle_report_transfers(args, extra_args):

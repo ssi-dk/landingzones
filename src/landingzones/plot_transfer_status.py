@@ -6,6 +6,7 @@ import argparse
 import html
 import os
 import re
+import socket
 import sys
 
 try:
@@ -14,6 +15,7 @@ except ModuleNotFoundError:
     pd = None
 
 from landingzones.config import config
+from landingzones import generate_cron_files as gcf
 from landingzones.transfer_loading import (
     definitions_for_system,
     load_reporting_transfers,
@@ -32,6 +34,7 @@ WINDOW_SPECS = (
     ("30d", "Last 30 days"),
 )
 RUN_LIST_WINDOW = "7d"
+REPORT_SKIPPED_EXIT_CODE = 2
 
 
 def normalize_directory_suffix(value):
@@ -58,6 +61,26 @@ def require_pandas():
         file=sys.stderr,
     )
     return False
+
+
+def print_missing_report_input_message(input_path=None):
+    """Print a clear report-skip message when no log input is configured."""
+    if input_path:
+        print(
+            "Report generation was skipped because the transfer log does not exist: {0}\n"
+            "Pass an input TSV to `landingzones report transfers`, pass "
+            "`--report-input` to `landingzones validate chain`, or set "
+            "`report_transfer_log_file` in config.".format(input_path),
+            file=sys.stderr,
+        )
+        return
+    print(
+        "Report generation was skipped because no transfer log path was configured.\n"
+        "Pass an input TSV to `landingzones report transfers`, pass "
+        "`--report-input` to `landingzones validate chain`, or set "
+        "`report_transfer_log_file` in config.",
+        file=sys.stderr,
+    )
 
 
 def parse_window_spec(window, anchor_time):
@@ -824,18 +847,47 @@ def load_transfers_for_reporting(config_file=None, transfers_file=None):
     )
 
 
-def resolve_report_input_path(input_path=None, config_file=None, transfers_file=None):
+def infer_report_system(config_file=None, transfers_file=None):
+    """Infer a system for default report-log resolution without prompting."""
+    hostname = socket.gethostname().lower()
+    try:
+        transfers_df = load_reporting_transfers(
+            config_file=config_file,
+            transfers_file=transfers_file,
+        )
+        for system in transfers_df["system"].unique():
+            if str(system).lower() in hostname:
+                return system
+    except Exception:
+        pass
+    return hostname
+
+
+def resolve_report_input_path(
+    input_path=None,
+    config_file=None,
+    transfers_file=None,
+    system=None,
+):
     """Resolve the default report TSV path from CLI input or config."""
     if input_path:
         return input_path
     config.load_config(config_file=config_file, transfers_file=transfers_file)
-    return config.report_transfer_log_file
+    if config.report_transfer_log_file:
+        return config.report_transfer_log_file
+    report_system = system or infer_report_system(
+        config_file=config_file,
+        transfers_file=transfers_file,
+    )
+    if report_system:
+        return gcf.get_common_status_log_file(report_system)
+    return ""
 
 
 def main(argv=None):
     """CLI entrypoint."""
     if not require_pandas():
-        return 2
+        return REPORT_SKIPPED_EXIT_CODE
     parser = argparse.ArgumentParser(
         description="Generate a transfer health dashboard from a shared TSV log",
     )
@@ -897,11 +949,14 @@ def main(argv=None):
         input_path=args.input,
         config_file=args.config,
         transfers_file=args.transfers_file,
+        system=args.system,
     )
     if not input_path:
-        parser.error(
-            "missing transfer log path: pass INPUT or set report_transfer_log_file in config"
-        )
+        print_missing_report_input_message()
+        return REPORT_SKIPPED_EXIT_CODE
+    if not os.path.exists(input_path):
+        print_missing_report_input_message(input_path)
+        return REPORT_SKIPPED_EXIT_CODE
 
     system = args.system or infer_system_from_log_path(input_path)
     output_path = args.output or build_default_output_path(input_path)

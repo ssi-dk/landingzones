@@ -65,6 +65,30 @@ def test_main_skips_report_without_pandas(monkeypatch, capsys):
     assert "landingzones[report]" in captured.err
 
 
+def test_main_skips_report_when_input_is_missing(tmp_path, capsys):
+    """Missing report input should be an operator message, not argparse usage."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("transfers_file: /tmp/transfers.tsv\n")
+
+    rc = pts.main(["--config", str(config_file)])
+    captured = capsys.readouterr()
+
+    assert rc == pts.REPORT_SKIPPED_EXIT_CODE
+    assert "Report generation was skipped because the transfer log does not exist" in captured.err
+    assert "usage:" not in captured.err
+
+
+def test_resolve_report_input_falls_back_to_system_status_log(monkeypatch):
+    """Report input should default to the generated per-system shared status log."""
+    monkeypatch.setattr(
+        pts.gcf,
+        "get_common_status_log_file",
+        lambda system: "/tmp/Landing_Zone_{0}.transfers.tsv".format(system),
+    )
+
+    assert pts.resolve_report_input_path(system="calc") == "/tmp/Landing_Zone_calc.transfers.tsv"
+
+
 def test_load_transfer_log_supports_rich_event_schema(tmp_path):
     path = tmp_path / "Landing_Zone_test_local.transfers.tsv"
     path.write_text(
@@ -104,6 +128,7 @@ def test_load_transfer_log_normalizes_tags_column(tmp_path):
 def test_main_uses_configured_report_transfer_log_file_when_input_omitted(tmp_path, monkeypatch):
     config_file = tmp_path / "config.yaml"
     log_path = tmp_path / "Landing_Zone_test_local.transfers.tsv"
+    log_path.write_text("placeholder\n")
     config_file.write_text(
         "transfers_file: /tmp/transfers.tsv\n"
         "report_transfer_log_file: {0}\n".format(log_path)

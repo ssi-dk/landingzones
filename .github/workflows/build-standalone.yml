@@ -43,11 +43,14 @@ jobs:
         run: pixi run build-standalone
 
       - name: Verify bundle CLI
-        run: ./packaging/dist/landingzones-standalone/landingzones --help
+        run: |
+          file ./packaging/dist/landingzones-standalone/python/bin/python3
+          ./packaging/dist/landingzones-standalone/python/bin/python3 -c "import platform, sys; print(platform.system(), platform.machine(), sys.version)"
+          ./packaging/dist/landingzones-standalone/landingzones --help
 
       - name: Upload standalone bundle
         uses: actions/upload-artifact@v4
         with:
-          name: landingzones-standalone-linux
+          name: landingzones-standalone-linux-x86_64
           path: packaging/dist/landingzones-standalone.tar.gz
           if-no-files-found: error

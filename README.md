@@ -135,6 +135,17 @@ cd app
 pixi run build-standalone
 ```
 
+Build the lab Linux artifact on Linux. A bundle built on macOS contains a macOS
+Python runtime and will fail on the sequencer with `cannot execute binary file`.
+Before copying a tarball to the lab host, verify the bundled runtime:
+
+```bash
+file packaging/dist/landingzones-standalone/python/bin/python3
+packaging/dist/landingzones-standalone/python/bin/python3 -c "import platform; print(platform.system(), platform.machine())"
+```
+
+Expected for the current lab machines is Linux/x86_64.
+
 The standalone bundle installs the core operator CLI without pandas, so it is
 intended for `build`, `validate`, and `deploy` on locked-down lab machines.
 `landingzones report transfers` remains a reporting extra and should run from
@@ -142,7 +153,7 @@ an environment with `landingzones[report]` installed.
 
 The same bundle can be produced by the GitHub Actions workflow
 `Build Standalone Bundle`. Run it manually from Actions, or push a `v*` tag.
-It uploads `landingzones-standalone-linux` containing:
+It uploads `landingzones-standalone-linux-x86_64` containing:
 
 ```text
 landingzones-standalone.tar.gz

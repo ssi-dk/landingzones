@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import platform
 from pathlib import Path
 
 
@@ -20,6 +21,18 @@ def run(command, **kwargs):
     """Run a command, failing with the child process exit code."""
     print("+ {0}".format(" ".join(str(part) for part in command)))
     subprocess.run(command, check=True, **kwargs)
+
+
+def capture(command, **kwargs):
+    """Run a command and return stripped stdout."""
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        **kwargs,
+    )
+    return result.stdout.strip()
 
 
 def build_parser():
@@ -147,6 +160,57 @@ def find_python_bin(root):
     raise SystemExit("Could not find a Python executable under {0}".format(root))
 
 
+def describe_python_runtime(python_bin):
+    """Return basic compatibility metadata for the bundled Python runtime."""
+    script = (
+        "import platform, sys; "
+        "print(platform.system()); "
+        "print(platform.machine()); "
+        "print(sys.version.split()[0])"
+    )
+    output = capture([str(python_bin), "-c", script])
+    system, machine, version = output.splitlines()[:3]
+    return {
+        "system": system,
+        "machine": machine,
+        "version": version,
+    }
+
+
+def validate_runtime_matches_host(python_bin):
+    """Fail early when the downloaded runtime cannot execute on this host."""
+    try:
+        metadata = describe_python_runtime(python_bin)
+    except Exception as exc:
+        raise SystemExit(
+            "The selected python-build-standalone runtime could not execute on "
+            "this build host: {0}. This usually means the archive architecture "
+            "or OS target does not match the machine running the build.".format(exc)
+        )
+
+    host_system = platform.system()
+    host_machine = platform.machine()
+    print(
+        "Selected runtime: Python {version} for {system}/{machine}".format(
+            **metadata
+        )
+    )
+    print("Build host: {0}/{1}".format(host_system, host_machine))
+    if metadata["system"] != host_system:
+        raise SystemExit(
+            "Runtime OS mismatch: selected {0}, build host is {1}. Build the "
+            "Linux lab bundle on Linux, or pass a Linux python-build-standalone "
+            "archive to a Linux build job.".format(metadata["system"], host_system)
+        )
+    if metadata["machine"] != host_machine:
+        raise SystemExit(
+            "Runtime architecture mismatch: selected {0}, build host is {1}.".format(
+                metadata["machine"], host_machine
+            )
+        )
+    return metadata
+
+
 def ensure_pip(python_bin):
     """Ensure pip is available in the bundled runtime."""
     result = subprocess.run(
@@ -244,6 +308,7 @@ def main(argv=None):
         )
     if not python_bin.is_file() or not os.access(python_bin, os.X_OK):
         raise SystemExit("Python executable is not executable: {0}".format(python_bin))
+    validate_runtime_matches_host(python_bin)
 
     python_root = python_bin.parent.parent
     shutil.copytree(python_root, dist_root / "python", symlinks=True)

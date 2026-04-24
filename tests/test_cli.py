@@ -255,6 +255,42 @@ class TestOperatorCli:
         assert captured['readiness'] == [[], ['--test-with-data']]
         assert captured['report'] == [[]]
 
+    def test_validate_chain_treats_missing_report_as_nonfatal(self, monkeypatch, capsys):
+        """Report-skipped exits should not fail a completed validation chain."""
+        captured = {
+            'separation': 0,
+            'readiness': [],
+            'report': [],
+        }
+
+        def fake_separation(argv=None):
+            captured['separation'] += 1
+            return 0
+
+        def fake_readiness(argv=None):
+            captured['readiness'].append(argv)
+            return 0
+
+        def fake_report(argv=None):
+            captured['report'].append(argv)
+            return cli.pts.REPORT_SKIPPED_EXIT_CODE
+
+        monkeypatch.setattr(cli.vsep, 'main', fake_separation)
+        monkeypatch.setattr(cli.cdr, 'main', fake_readiness)
+        monkeypatch.setattr(cli.pts, 'main', fake_report)
+
+        rc = cli.main([
+            'validate',
+            'chain',
+        ])
+        captured_output = capsys.readouterr()
+
+        assert rc == 0
+        assert captured['separation'] == 1
+        assert captured['readiness'] == [[], ['--test-with-data']]
+        assert captured['report'] == [[]]
+        assert "Validation chain completed; report generation was skipped." in captured_output.out
+
     def test_validate_chain_fails_fast_on_deployment_failure(self, monkeypatch):
         """`landingzones validate chain` should stop when an earlier step fails."""
         captured = {
