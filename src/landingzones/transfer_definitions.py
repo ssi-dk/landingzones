@@ -75,6 +75,7 @@ class TransferDefinition:
     notify_on_error: bool = False
     tags: tuple = ()
     script_name: str = ""
+    runtime_id: str = ""
     system_user: str = ""
 
     @classmethod
@@ -100,7 +101,8 @@ class TransferDefinition:
             notify_on_error=str(row.get("notify_on_error", "FALSE") or "").upper() == "TRUE",
             tags=normalize_tags(row.get("tags", "")),
             script_name=str(row.get("script_name", "") or ""),
-            system_user=str(row.get("system_user", "") or ""),
+            runtime_id=str(row.get("runtime_id", "") or ""),
+            system_user=str(row.get("system_user", row.get("runtime_id", "")) or ""),
         )
 
 

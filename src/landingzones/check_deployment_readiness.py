@@ -715,6 +715,11 @@ def generate_test_scripts(transfers_df, scripts_dir, crontab_dir, validation_scr
         scripts_dir, transfers_df['script_name'].dropna().tolist()
     )
     gcf.remove_stale_validation_scripts(validation_scripts_dir, transfers_df)
+    expected_cron_names = [
+        gcf.cron_file_name(system_user)
+        for system_user in transfers_df['system_user'].dropna().unique()
+    ]
+    gcf.remove_stale_cron_files(crontab_dir, expected_cron_names)
     gcf.write_validation_scripts(validation_scripts_dir, transfers_df)
 
     grouped = transfers_df.groupby('system_user')
@@ -723,14 +728,16 @@ def generate_test_scripts(transfers_df, scripts_dir, crontab_dir, validation_scr
             script_path = os.path.join(scripts_dir, transfer['script_name'])
             script_content = gcf.generate_script_content(transfer)
             with open(script_path, 'w') as handle:
-                handle.write(script_content)
+                handle.write(gcf.add_owner_marker(script_content))
             os.chmod(script_path, 0o755)
 
-        cron_path = os.path.join(
-            crontab_dir, "{0}.Landing_Zone.cron".format(system_user)
-        )
+        cron_path = os.path.join(crontab_dir, gcf.cron_file_name(system_user))
         with open(cron_path, 'w') as handle:
-            handle.write(gcf.generate_cron_file(system_user, group_df, scripts_dir))
+            handle.write(
+                gcf.add_owner_marker(
+                    gcf.generate_cron_file(system_user, group_df, scripts_dir)
+                )
+            )
 
     return transfers_df
 

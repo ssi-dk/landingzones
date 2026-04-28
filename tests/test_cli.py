@@ -26,6 +26,7 @@ class TestOperatorCli:
             '--config', 'config.yaml',
             '--scripts-dir', 'scripts',
             '--validation-scripts-dir', 'validation_scripts',
+            '--runtime-id', 'calc_prod.user1',
         ])
 
         assert rc == 0
@@ -33,6 +34,7 @@ class TestOperatorCli:
             '--config', 'config.yaml',
             '--scripts-dir', 'scripts',
             '--validation-scripts-dir', 'validation_scripts',
+            '--runtime-id', 'calc_prod.user1',
         ]
 
     def test_global_config_routes_to_build(self, monkeypatch):

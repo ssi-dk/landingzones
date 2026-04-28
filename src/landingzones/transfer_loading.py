@@ -45,6 +45,11 @@ def filter_transfers_by_system_user(transfers_df, system, user):
     ].copy()
 
 
+def filter_transfers_by_runtime_ids(transfers_df, runtime_ids):
+    """Return only transfers matching exact runtime_id values."""
+    return gcf.filter_transfers_by_runtime_ids(transfers_df, runtime_ids)
+
+
 def filter_transfers_by_tags(transfers_df, requested_tags):
     """Return transfers matching any requested tag."""
     if not requested_tags:

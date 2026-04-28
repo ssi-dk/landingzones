@@ -33,8 +33,50 @@ localhost_main\tlocalhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.l
         assert len(df) == 2
         assert df.iloc[0]['system'] == 'server1'
         assert df.iloc[0]['users'] == 'user1'
+        assert df.iloc[0]['runtime_id'] == 'server1.user1'
+        assert df.iloc[0]['system_user'] == 'server1.user1'
         assert df.iloc[0]['identifiers'] == 'server1_main'
         assert df.iloc[1]['system'] == 'localhost'
+
+    def test_parse_uses_stored_runtime_id(self, tmp_path):
+        """runtime_id is the stored runtime/artifact identity."""
+        tsv_content = """identifiers\truntime_id\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\tserver1_prod.user1\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t22\t-av\t\t/tmp/log.txt\t/tmp/lock.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        df = gcf.parse_transfers_file(str(test_file))
+
+        assert df.iloc[0]['runtime_id'] == 'server1_prod.user1'
+        assert df.iloc[0]['system_user'] == 'server1_prod.user1'
+
+    def test_parse_rejects_missing_runtime_id_when_column_exists(self, tmp_path):
+        """Blank runtime_id values are invalid once the column exists."""
+        tsv_content = """identifiers\truntime_id\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\t\tserver1\tuser1\t/srv/data/src/\tuser@host:/dest/\t22\t-av\t\t/tmp/log.txt\t/tmp/lock.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        with pytest.raises(ValueError):
+            gcf.parse_transfers_file(str(test_file))
+
+    def test_filter_transfers_by_runtime_ids_requires_exact_matches(self, tmp_path):
+        """runtime filters select exact runtime_id values and reject typos."""
+        tsv_content = """identifiers\truntime_id\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+one\tserver1_prod.user1\tserver1\tuser1\t/src1/\t/dest1/\t\t\t\t/tmp/log1.txt\t/tmp/lock1.txt
+two\tserver2_prod.user2\tserver2\tuser2\t/src2/\t/dest2/\t\t\t\t/tmp/log2.txt\t/tmp/lock2.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        df = gcf.parse_transfers_file(str(test_file))
+        filtered = gcf.filter_transfers_by_runtime_ids(df, ['server1_prod.user1'])
+
+        assert filtered['identifiers'].tolist() == ['one']
+        with pytest.raises(ValueError):
+            gcf.filter_transfers_by_runtime_ids(df, ['missing_prod.user'])
     
     def test_parse_filters_comments(self, tmp_path):
         """Test that lines starting with # are filtered out"""
@@ -135,6 +177,23 @@ sample_name\tTRUE\tserver1\tuser1\t/srv/data/src2/\tuser@host:/dest2/\t\t\t\t/tm
 
         with pytest.raises(ValueError):
             gcf.parse_transfers_file(str(test_file))
+
+    def test_parse_applies_artifact_prefix_to_script_names(self, tmp_path):
+        """Configured artifact prefixes should isolate generated script names."""
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+sample\tserver1\tuser1\t/src/\t/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        snapshot = gcf.config.snapshot_state()
+        gcf.config.load_config(artifact_prefix="prod calc")
+        try:
+            df = gcf.parse_transfers_file(str(test_file))
+        finally:
+            gcf.config.restore_state(snapshot)
+
+        assert df.iloc[0]["script_name"] == "prod_calc__sample.sh"
 
     def test_parse_resolves_log_and_flock_filenames(self, tmp_path):
         """Test that filename-only log and flock values resolve via config."""
@@ -546,6 +605,60 @@ class TestGenerateRsyncCommand:
         assert keep.exists()
         assert not stale.exists()
         assert note.exists()
+
+    def test_remove_stale_generated_scripts_respects_owner_markers(self, tmp_path):
+        """Shared cleanup should only remove files owned by the current app."""
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        owned_stale = scripts_dir / "owned.sh"
+        other_stale = scripts_dir / "other.sh"
+        unowned_stale = scripts_dir / "unowned.sh"
+        owned_stale.write_text("#!/bin/sh\n# landingzones-owner: deploy:app\n")
+        other_stale.write_text("#!/bin/sh\n# landingzones-owner: other:app\n")
+        unowned_stale.write_text("#!/bin/sh\n")
+
+        snapshot = gcf.config.snapshot_state()
+        gcf.config.load_config(artifact_owner_id="deploy:app")
+        try:
+            gcf.remove_stale_generated_scripts(str(scripts_dir), [])
+        finally:
+            gcf.config.restore_state(snapshot)
+
+        assert not owned_stale.exists()
+        assert other_stale.exists()
+        assert unowned_stale.exists()
+
+    def test_prefixed_validation_wrappers_are_discoverable_by_flow(self, tmp_path):
+        """Artifact prefixes should not change the operator-facing flow key."""
+        test_data_root = tmp_path / "toy_data"
+        fixture_dir = test_data_root / "lab_machine_1" / "FixtureRun"
+        fixture_dir.mkdir(parents=True)
+        (fixture_dir / "payload.txt").write_text("payload")
+        entry_dir = tmp_path / "tests" / "test_local" / "lab_machine_1" / "Landing_Zone" / "to_calc"
+        entry_dir.mkdir(parents=True)
+        next_hop = tmp_path / "next_hop"
+        next_hop.mkdir()
+        transfers_file = tmp_path / "transfers.tsv"
+        transfers_file.write_text(
+            "identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tflow_group\tis_entry_point\n"
+            "stage\tserver1\tuser1\t{0}/\t{1}/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt\tflow_a\tTRUE\n".format(
+                entry_dir, next_hop
+            )
+        )
+
+        snapshot = gcf.config.snapshot_state()
+        gcf.config.load_config(
+            artifact_prefix="prod-calc",
+            test_data=str(test_data_root),
+        )
+        try:
+            transfers_df = gcf.parse_transfers_file(str(transfers_file))
+            names = gcf.validation_script_names(transfers_df)
+        finally:
+            gcf.config.restore_state(snapshot)
+
+        assert "lz_run_validation_prod-calc.sh" in names
+        assert "lz_run_validation_prod-calc__flow_a.sh" in names
 
     def test_remove_stale_validation_scripts_preserves_validation_outputs(self, tmp_path):
         """Validation helper scripts should be preserved in the validation output dir."""

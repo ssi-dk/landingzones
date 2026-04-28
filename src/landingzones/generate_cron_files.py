@@ -24,6 +24,7 @@ from landingzones.transfer_definitions import (
 VALIDATION_HELPER_NAME = 'lz_run_validation.sh'
 VALIDATION_WRAPPER_PREFIX = 'lz_run_validation_'
 VALIDATION_TEMPLATE_NAME = 'lz_run_validation.sh'
+OWNER_MARKER_PREFIX = '# landingzones-owner:'
 PATH_VARIABLE_PATTERN = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}')
 
 
@@ -59,7 +60,55 @@ def clean_tsv_value(value, default=''):
     return text
 
 
-def parse_transfers_file(filename, require_runtime_files=True):
+def legacy_runtime_id(row):
+    """Return the legacy runtime identity derived from system and user columns."""
+    system = clean_tsv_value(row.get('system', ''))
+    user = clean_tsv_value(row.get('users', row.get('user', '')))
+    if system and user:
+        return "{0}.{1}".format(system, user)
+    return system or user
+
+
+def ensure_runtime_id_column(rows, columns):
+    """Ensure every row has a stored runtime_id identity."""
+    if 'runtime_id' not in columns:
+        insert_at = columns.index('identifiers') + 1 if 'identifiers' in columns else 0
+        columns.insert(insert_at, 'runtime_id')
+        for row in rows:
+            row['runtime_id'] = legacy_runtime_id(row)
+    else:
+        for row in rows:
+            row['runtime_id'] = clean_tsv_value(row.get('runtime_id', ''))
+
+
+def validate_runtime_ids(rows):
+    """Validate runtime_id values used for artifact grouping and filtering."""
+    missing = [
+        row.get('identifiers', '<unknown>')
+        for row in rows
+        if not clean_tsv_value(row.get('runtime_id', ''))
+    ]
+    if missing:
+        raise ValueError(
+            "runtime_id is required for all enabled transfers: {0}".format(
+                ', '.join(missing)
+            )
+        )
+
+    invalid = sorted({
+        row.get('runtime_id', '')
+        for row in rows
+        if sanitize_identifier(row.get('runtime_id', '')) != row.get('runtime_id', '')
+    })
+    if invalid:
+        raise ValueError(
+            "runtime_id values must be filename-safe: {0}".format(
+                ', '.join(invalid)
+            )
+        )
+
+
+def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None):
     """Parse the transfers.tsv file and return normalized transfer records.
 
     Args:
@@ -67,6 +116,8 @@ def parse_transfers_file(filename, require_runtime_files=True):
         require_runtime_files: When True, keep generator/runtime validation that
             requires fields such as log_file. When False, parse only the shared
             transfer metadata needed for reporting/analysis.
+        runtime_ids: Optional exact runtime_id values to include before runtime
+            path validation and artifact generation.
     """
     with open(filename, 'r', newline='') as handle:
         reader = csv.DictReader(handle, delimiter='\t')
@@ -81,7 +132,8 @@ def parse_transfers_file(filename, require_runtime_files=True):
 
     rows = [
         row for row in rows
-        if not clean_tsv_value(row.get('system', '')).startswith('#')
+        if not clean_tsv_value(row.get('runtime_id', '')).startswith('#')
+        and not clean_tsv_value(row.get('system', '')).startswith('#')
     ]
 
     if 'enabled' in columns:
@@ -95,7 +147,28 @@ def parse_transfers_file(filename, require_runtime_files=True):
         for index, row in enumerate(rows, start=1):
             row['identifiers'] = "transfer_{0:03d}".format(index)
 
+    ensure_runtime_id_column(rows, columns)
+    validate_runtime_ids(rows)
+
+    requested_runtime_ids = normalize_runtime_id_filters(runtime_ids)
+    if requested_runtime_ids:
+        available = set(row.get('runtime_id', '') for row in rows)
+        missing = sorted(set(requested_runtime_ids) - available)
+        if missing:
+            raise ValueError(
+                "runtime_id filter matched no transfer rows for: {0}".format(
+                    ', '.join(missing)
+                )
+            )
+        rows = [
+            row for row in rows
+            if row.get('runtime_id', '') in requested_runtime_ids
+        ]
+        if not rows:
+            raise ValueError("runtime_id filter produced no transfer rows")
+
     text_columns = (
+        'runtime_id',
         'rsync_options',
         'log_file',
         'flock_file',
@@ -120,10 +193,7 @@ def parse_transfers_file(filename, require_runtime_files=True):
                 row.get('identifiers', ''),
                 field_name,
             )
-        row['system_user'] = "{0}.{1}".format(
-            row.get('system', ''),
-            row.get('users', ''),
-        )
+        row['system_user'] = row.get('runtime_id', '')
         row['tags'] = normalize_tags_text(row.get('tags', ''))
         for bool_column in (
             'is_entry_point',
@@ -165,7 +235,7 @@ def parse_transfers_file(filename, require_runtime_files=True):
         )
 
     for row, sanitized in zip(rows, sanitized_identifiers):
-        row['script_name'] = "{0}.sh".format(sanitized)
+        row['script_name'] = "{0}.sh".format(prefixed_artifact_stem(sanitized))
     if 'script_name' not in columns:
         columns.append('script_name')
 
@@ -176,6 +246,39 @@ def parse_transfers_file(filename, require_runtime_files=True):
     df.attrs['shared_file_pair_warnings'] = audit_shared_file_pairs(df)
     
     return df
+
+
+def normalize_runtime_id_filters(runtime_ids):
+    """Normalize CLI-provided runtime_id filters."""
+    if not runtime_ids:
+        return []
+    normalized = []
+    for runtime_id in runtime_ids:
+        value = clean_tsv_value(runtime_id)
+        if value:
+            normalized.append(value)
+    return normalized
+
+
+def filter_transfers_by_runtime_ids(transfers_df, runtime_ids):
+    """Return only transfers matching exact runtime_id values."""
+    requested = normalize_runtime_id_filters(runtime_ids)
+    if not requested:
+        return transfers_df.copy()
+
+    available = set(str(value) for value in transfers_df['runtime_id'].dropna())
+    missing = sorted(set(requested) - available)
+    if missing:
+        raise ValueError(
+            "runtime_id filter matched no transfer rows for: {0}".format(
+                ', '.join(missing)
+            )
+        )
+
+    filtered = transfers_df[transfers_df['runtime_id'].isin(requested)].copy()
+    if filtered.empty:
+        raise ValueError("runtime_id filter produced no transfer rows")
+    return filtered
 
 
 def normalize_source_path(source):
@@ -217,6 +320,55 @@ def sanitize_identifier(identifier):
         return ''
     value = re.sub(r'[^A-Za-z0-9._-]+', '_', value)
     return value.strip('._-')
+
+
+def configured_artifact_prefix():
+    """Return the sanitized configured generated-artifact prefix."""
+    return sanitize_identifier(config.artifact_prefix)
+
+
+def prefixed_artifact_stem(stem):
+    """Apply the configured artifact prefix to a filename stem."""
+    prefix = configured_artifact_prefix()
+    if not prefix:
+        return stem
+    return "{0}__{1}".format(prefix, stem)
+
+
+def current_artifact_owner_id():
+    """Return the configured artifact owner marker for shared output cleanup."""
+    return str(config.artifact_owner_id or '').strip()
+
+
+def add_owner_marker(content):
+    """Insert the generated-artifact owner marker into file content."""
+    owner_id = current_artifact_owner_id()
+    if not owner_id:
+        return content
+
+    marker = "{0} {1}\n".format(OWNER_MARKER_PREFIX, owner_id)
+    lines = content.splitlines(True)
+    if lines and lines[0].startswith('#!'):
+        return ''.join([lines[0], marker] + lines[1:])
+    return marker + content
+
+
+def file_has_current_owner_marker(path):
+    """Return True when a generated file belongs to the current owner context."""
+    owner_id = current_artifact_owner_id()
+    if not owner_id:
+        return True
+    try:
+        with open(path, 'r') as handle:
+            for _ in range(8):
+                line = handle.readline()
+                if not line:
+                    break
+                if line.strip() == "{0} {1}".format(OWNER_MARKER_PREFIX, owner_id):
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def package_root():
@@ -1749,7 +1901,26 @@ def validation_wrapper_script_name(flow_group):
                 flow_group
             )
         )
-    return "{0}{1}.sh".format(VALIDATION_WRAPPER_PREFIX, sanitized_flow_group)
+    return "{0}{1}.sh".format(
+        VALIDATION_WRAPPER_PREFIX,
+        prefixed_artifact_stem(sanitized_flow_group),
+    )
+
+
+def validation_wrapper_file_prefix():
+    """Return the filename prefix used by generated validation wrappers."""
+    prefix = configured_artifact_prefix()
+    if not prefix:
+        return VALIDATION_WRAPPER_PREFIX
+    return "{0}{1}__".format(VALIDATION_WRAPPER_PREFIX, prefix)
+
+
+def validation_helper_name():
+    """Return the generated validation helper filename."""
+    prefix = configured_artifact_prefix()
+    if not prefix:
+        return VALIDATION_HELPER_NAME
+    return "lz_run_validation_{0}.sh".format(prefix)
 
 
 def build_validation_wrapper_specs(transfers_df):
@@ -1856,7 +2027,7 @@ fi
 
 exec "$HELPER_SCRIPT" "$@"
 """.format(
-        helper_name=VALIDATION_HELPER_NAME,
+        helper_name=validation_helper_name(),
         fixture_dir=shlex.quote(spec['fixture_dir']),
         entry_dir=shlex.quote(spec['entry_dir']),
         next_hop=shlex.quote(next_hop_default),
@@ -1873,7 +2044,7 @@ def generate_validation_script_content():
 
 def validation_script_names(transfers_df=None):
     """Return generated validation helper and wrapper filenames."""
-    names = {VALIDATION_HELPER_NAME}
+    names = {validation_helper_name()}
     names.update(
         spec['script_name'] for spec in build_validation_wrapper_specs(transfers_df)
     )
@@ -1884,15 +2055,15 @@ def write_validation_scripts(validation_scripts_dir, transfers_df=None):
     """Write shared helper shell scripts into the validation scripts directory."""
     if not os.path.isdir(validation_scripts_dir):
         os.makedirs(validation_scripts_dir)
-    validation_script_path = os.path.join(validation_scripts_dir, VALIDATION_HELPER_NAME)
+    validation_script_path = os.path.join(validation_scripts_dir, validation_helper_name())
     with open(validation_script_path, 'w') as handle:
-        handle.write(generate_validation_script_content())
+        handle.write(add_owner_marker(generate_validation_script_content()))
     os.chmod(validation_script_path, 0o755)
 
     for spec in build_validation_wrapper_specs(transfers_df):
         wrapper_path = os.path.join(validation_scripts_dir, spec['script_name'])
         with open(wrapper_path, 'w') as handle:
-            handle.write(generate_validation_wrapper_content(spec))
+            handle.write(add_owner_marker(generate_validation_wrapper_content(spec)))
         os.chmod(wrapper_path, 0o755)
 
 
@@ -1907,7 +2078,35 @@ def remove_stale_generated_scripts(scripts_dir, expected_script_names):
             continue
         if entry in expected:
             continue
-        os.remove(os.path.join(scripts_dir, entry))
+        path = os.path.join(scripts_dir, entry)
+        if not file_has_current_owner_marker(path):
+            continue
+        os.remove(path)
+
+
+def cron_file_name(runtime_id):
+    """Return the generated cron filename for a runtime_id group."""
+    prefix = configured_artifact_prefix()
+    if prefix:
+        return "{0}.{1}.Landing_Zone.cron".format(prefix, runtime_id)
+    return "{0}.Landing_Zone.cron".format(runtime_id)
+
+
+def remove_stale_cron_files(crontab_dir, expected_cron_names):
+    """Delete stale owned cron files from the output directory."""
+    if not current_artifact_owner_id() or not os.path.isdir(crontab_dir):
+        return
+
+    expected = set(expected_cron_names)
+    for entry in os.listdir(crontab_dir):
+        if not entry.endswith('.cron'):
+            continue
+        if entry in expected:
+            continue
+        path = os.path.join(crontab_dir, entry)
+        if not file_has_current_owner_marker(path):
+            continue
+        os.remove(path)
 
 
 def remove_stale_validation_scripts(validation_scripts_dir, transfers_df=None):
@@ -1921,10 +2120,13 @@ def remove_stale_validation_scripts(validation_scripts_dir, transfers_df=None):
             continue
         if entry in expected:
             continue
-        os.remove(os.path.join(validation_scripts_dir, entry))
+        path = os.path.join(validation_scripts_dir, entry)
+        if not file_has_current_owner_marker(path):
+            continue
+        os.remove(path)
 
 
-def generate_cron_file(system_user, transfers_df, scripts_dir):
+def generate_cron_file(runtime_id, transfers_df, scripts_dir):
     """Generate complete cron file content from DataFrame subset"""
     # Get the first row to extract system and user info
     first_transfer = transfers_df.iloc[0]
@@ -1984,6 +2186,12 @@ def main(argv=None):
         default=None,
         help='Output directory for generated validation wrapper scripts (default: output/validation_scripts)'
     )
+    parser.add_argument(
+        '--runtime-id',
+        action='append',
+        default=[],
+        help='Exact runtime_id to include. May be passed multiple times.'
+    )
     args = parser.parse_args(argv)
     
     # Load configuration from file and/or command line arguments
@@ -2021,7 +2229,11 @@ def main(argv=None):
         os.makedirs(validation_scripts_dir)
     
     # Parse transfers into DataFrame using pandas
-    transfers_df = parse_transfers_file(transfers_file)
+    try:
+        transfers_df = parse_transfers_file(transfers_file, runtime_ids=args.runtime_id)
+    except ValueError as exc:
+        print("Error: {0}".format(exc))
+        return 1
     
     if transfers_df.empty:
         print("No transfers found in the file")
@@ -2053,26 +2265,31 @@ def main(argv=None):
         transfers_df['script_name'].dropna().tolist(),
     )
     remove_stale_validation_scripts(validation_scripts_dir, transfers_df)
+    expected_cron_names = [
+        cron_file_name(runtime_id)
+        for runtime_id in transfers_df['runtime_id'].dropna().unique()
+    ]
+    remove_stale_cron_files(output_dir, expected_cron_names)
     write_validation_scripts(validation_scripts_dir, transfers_df)
 
-    # Group by system_user and generate cron files
-    grouped = transfers_df.groupby('system_user')
+    # Group by runtime_id and generate cron files
+    grouped = transfers_df.groupby('runtime_id')
 
-    for system_user, group_df in grouped:
+    for runtime_id, group_df in grouped:
         for _, transfer in group_df.iterrows():
             script_path = os.path.join(scripts_dir, transfer['script_name'])
             script_content = generate_script_content(transfer)
             with open(script_path, 'w') as file:
-                file.write(script_content)
+                file.write(add_owner_marker(script_content))
             os.chmod(script_path, 0o755)
 
-        filename = "{0}.Landing_Zone.cron".format(system_user)
-        content = generate_cron_file(system_user, group_df, scripts_dir)
+        filename = cron_file_name(runtime_id)
+        content = generate_cron_file(runtime_id, group_df, scripts_dir)
         
         # Write the cron file
         output_path = os.path.join(output_dir, filename)
         with open(output_path, 'w') as file:
-            file.write(content)
+            file.write(add_owner_marker(content))
         
         # Get unique log files for this group
         log_files = group_df['log_file'].dropna().unique()
@@ -2092,11 +2309,12 @@ def main(argv=None):
     # Print summary statistics
     print("\nSummary:")
     print("Total transfers: {0}".format(len(transfers_df)))
-    unique_combinations = transfers_df['system_user'].nunique()
-    print("Unique system-user combinations: {0}".format(
-        unique_combinations))
-    print("Systems: {0}".format(', '.join(transfers_df['system'].unique())))
-    print("Users: {0}".format(', '.join(transfers_df['users'].unique())))
+    unique_combinations = transfers_df['runtime_id'].nunique()
+    print("Unique runtime IDs: {0}".format(unique_combinations))
+    if 'system' in transfers_df.columns:
+        print("Systems: {0}".format(', '.join(transfers_df['system'].unique())))
+    if 'users' in transfers_df.columns:
+        print("Users: {0}".format(', '.join(transfers_df['users'].unique())))
     print("Validation scripts: {0}".format(validation_scripts_dir))
     
     # Show log file information

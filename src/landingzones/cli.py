@@ -64,6 +64,7 @@ def build_cli_parser():
     build_parser.add_argument('--log-dir', '-l', default=None)
     build_parser.add_argument('--scripts-dir', '-s', default=None)
     build_parser.add_argument('--validation-scripts-dir', default=None)
+    build_parser.add_argument('--runtime-id', action='append', default=[])
     build_parser.set_defaults(handler=handle_build)
 
     validate_parser = subparsers.add_parser(
@@ -204,7 +205,7 @@ def discover_validation_wrappers(validation_scripts_dir):
     wrappers = {}
     if not os.path.isdir(validation_scripts_dir):
         return wrappers
-    prefix = gcf.VALIDATION_WRAPPER_PREFIX
+    prefix = gcf.validation_wrapper_file_prefix()
     for entry in sorted(os.listdir(validation_scripts_dir)):
         if not entry.startswith(prefix) or not entry.endswith('.sh'):
             continue
@@ -224,6 +225,8 @@ def handle_build(args, extra_args):
     append_option(argv, '--log-dir', args.log_dir)
     append_option(argv, '--scripts-dir', args.scripts_dir)
     append_option(argv, '--validation-scripts-dir', args.validation_scripts_dir)
+    for runtime_id in args.runtime_id:
+        append_option(argv, '--runtime-id', runtime_id)
     return normalize_exit_code(gcf.main(argv))
 
 

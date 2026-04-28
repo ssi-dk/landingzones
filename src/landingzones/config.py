@@ -22,8 +22,8 @@ Example config.yaml:
     flock_paths:
       localhost: /usr/bin/flock
     rit_managed_folder_structure:
-      sh_output: scripts/landingzones/deploy/prod/output/scripts/
-      crontabs: scripts/landingzones/deploy/prod/output/crontab.d/
+      sh_output: scripts/landingzones/deploy/calc_prod.f041664/output/scripts/
+      crontabs: scripts/landingzones/deploy/calc_prod.f041664/output/crontab.d/
       log: log/
       flock: flock/
     input_dir: input
@@ -124,6 +124,8 @@ class Config:
         - LZ_CONFIG_FILE: Path to config.yaml file
         - LZ_TRANSFERS_FILE: Path to transfers.tsv
         - LZ_TEST_DATA: Path to toy test data for --test-with-data
+        - LZ_ARTIFACT_OWNER_ID: Owner marker for generated artifacts
+        - LZ_ARTIFACT_PREFIX: Filename prefix for generated artifacts
         - LZ_REPORT_TRANSFER_LOG_FILE: Path to the default transfer TSV used for reporting
         - LZ_LOCK_FILE: Path to default lock file
         - LZ_LOG_DIR: Default log directory
@@ -302,6 +304,16 @@ class Config:
         )
 
     @property
+    def artifact_owner_id(self):
+        """Owner marker for generated files in shared artifact directories."""
+        return self._get_value('artifact_owner_id', 'LZ_ARTIFACT_OWNER_ID', '')
+
+    @property
+    def artifact_prefix(self):
+        """Optional filename prefix for generated scripts, crons, and wrappers."""
+        return self._get_value('artifact_prefix', 'LZ_ARTIFACT_PREFIX', '')
+
+    @property
     def rit_managed_locations(self):
         """Configured rit_managed base locations for each system."""
         runtime_value = self._runtime_config.get('rit_managed_locations')
@@ -441,6 +453,8 @@ class Config:
             'input_dir': self.input_dir,
             'crontab_dir': self.crontab_dir,
             'validation_scripts_dir': self.validation_scripts_dir,
+            'artifact_owner_id': self.artifact_owner_id,
+            'artifact_prefix': self.artifact_prefix,
             'rit_managed_locations': self.rit_managed_locations,
             'flock_paths': self.flock_paths,
             'notifications': self.notifications,

@@ -52,8 +52,9 @@ The system is configured via a tab-separated `transfers.tsv` file:
 | Column | Description | Example |
 |--------|-------------|---------|
 | `identifiers` | Unique transfer ID used for generated shell script names | `transfer_001`, `gridion_to_calc` |
-| `system` | Source system identifier | `server1`, `localhost` |
-| `users` | System user for transfer | `user1`, `local` |
+| `runtime_id` | Required deploy/artifact identity used for cron grouping and filtering | `calc_prod.f041664` |
+| `system` | Configured system key used for managed paths and flock settings | `server1`, `localhost` |
+| `users` | Optional user/account context for review and generated headers | `user1`, `local` |
 | `source` | Source directory path | `/srv/data/src/` |
 | `source_port` | SSH port for remote sources (optional) | `2222` |
 | `destination` | Destination (local or remote) | `user@host:/dest/` |
@@ -66,8 +67,8 @@ The system is configured via a tab-separated `transfers.tsv` file:
 ### Example
 
 ```tsv
-identifiers	system	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file
-local_copy	localhost	testuser	input/*		output/				transfers.log	landingzones.lock
+identifiers	runtime_id	system	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file
+local_copy	localhost_test.testuser	localhost	testuser	input/*		output/				transfers.log	landingzones.lock
 ```
 
 ## CLI Commands
@@ -75,6 +76,9 @@ local_copy	localhost	testuser	input/*		output/				transfers.log	landingzones.loc
 ```bash
 # Generate cron files with defaults
 landingzones build
+
+# Generate only selected runtime IDs from a shared transfers.tsv
+landingzones build --runtime-id calc_prod.f041664 --runtime-id calc_prod.F041668
 
 # Check deployment readiness
 landingzones validate deployment
