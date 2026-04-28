@@ -19,6 +19,8 @@ jobs:
   build-linux:
     name: Build Linux standalone bundle
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     defaults:
       run:
         working-directory: .
@@ -48,9 +50,21 @@ jobs:
           ./packaging/dist/landingzones-standalone/python/bin/python3 -c "import platform, sys; print(platform.system(), platform.machine(), sys.version)"
           ./packaging/dist/landingzones-standalone/landingzones --help
 
+      - name: Prepare release asset
+        run: cp packaging/dist/landingzones-standalone.tar.gz packaging/dist/landingzones-standalone-linux-x86_64.tar.gz
+
       - name: Upload standalone bundle
         uses: actions/upload-artifact@v4
         with:
           name: landingzones-standalone-linux-x86_64
-          path: packaging/dist/landingzones-standalone.tar.gz
+          path: packaging/dist/landingzones-standalone-linux-x86_64.tar.gz
           if-no-files-found: error
+
+      - name: Publish standalone bundle to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "Landing Zones $GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" packaging/dist/landingzones-standalone-linux-x86_64.tar.gz --clobber

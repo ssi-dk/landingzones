@@ -160,8 +160,11 @@ The same bundle can be produced by the GitHub Actions workflow
 It uploads `landingzones-standalone-linux-x86_64` containing:
 
 ```text
-landingzones-standalone.tar.gz
+landingzones-standalone-linux-x86_64.tar.gz
 ```
+
+For `v*` tags, the workflow also creates or updates the matching GitHub Release
+and uploads `landingzones-standalone-linux-x86_64.tar.gz` as a release asset.
 
 The bundle is written to:
 

@@ -1050,6 +1050,9 @@ def ask_yes_no(prompt_text):
     try:
         response = input().strip().lower()
         return response in ['y', 'yes']
+    except EOFError:
+        print()
+        return False
     except KeyboardInterrupt:
         print("\n{0}Operation cancelled.{1}".format(Colors.YELLOW, Colors.END))
         return False

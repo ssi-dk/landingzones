@@ -358,6 +358,9 @@ def check_lock_file_directory(lock_file=None):
 
 def _select_from_transfer_values(prompt_label, values, current_value=''):
     """Prompt for one value from a parsed transfer-definition column."""
+    if len(values) == 1:
+        return values[0]
+
     print("\n{0}{1}: {2}{3}".format(Colors.YELLOW, prompt_label, current_value, Colors.END))
     for index, value in enumerate(values, 1):
         marker = " (current)" if value == current_value else ""
@@ -415,6 +418,8 @@ def get_current_system():
         for system in systems:
             if system.lower() in hostname:
                 return system
+        if len(systems) == 1:
+            return systems[0]
     except Exception:
         pass
 

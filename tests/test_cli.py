@@ -11,6 +11,16 @@ from landingzones import cli
 class TestOperatorCli:
     """Test routing for the top-level `landingzones` CLI."""
 
+    def test_version_prints_package_version(self, capsys):
+        """`landingzones --version` should print the package version."""
+        try:
+            cli.main(['--version'])
+        except SystemExit as exc:
+            assert exc.code == 0
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == 'landingzones {0}'.format(cli.__version__)
+
     def test_build_routes_to_generator(self, monkeypatch):
         """`landingzones build` should forward arguments to the generator."""
         captured = {}

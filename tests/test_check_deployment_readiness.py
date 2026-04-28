@@ -10,6 +10,7 @@ import pytest
 import pandas as pd
 
 from landingzones import check_deployment_readiness as cdr
+from landingzones import readiness_ops as ro
 
 
 class TestParseRemoteDestination:
@@ -87,6 +88,12 @@ class TestRunRemoteShell:
 class TestCronDeploymentPrompt:
     """Test explicit cron deployment prompting."""
 
+    def test_ask_yes_no_treats_eof_as_no(self, monkeypatch):
+        """Non-interactive prompts should not crash on EOF."""
+        monkeypatch.setattr('builtins.input', lambda: (_ for _ in ()).throw(EOFError()))
+
+        assert cdr.ask_yes_no("Create directories?") is False
+
     def test_main_routes_deploy_cron_prompt(self, monkeypatch):
         """`--deploy-cron` should bypass readiness checks and run the prompt flow."""
         monkeypatch.setattr(cdr.config, 'load_config', lambda **kwargs: None)
@@ -95,6 +102,28 @@ class TestCronDeploymentPrompt:
         result = cdr.main(['--deploy-cron'])
 
         assert result is True
+
+
+class TestRuntimeIdentityDetection:
+    """Test system/user selection from filtered runtime transfer inventories."""
+
+    def test_get_current_system_auto_selects_single_transfer_system(self, monkeypatch):
+        """A one-system runtime should not prompt when hostname does not match."""
+        df = pd.DataFrame([{'system': 'Promethion_1'}])
+        config_snapshot = ro.config.snapshot_state()
+
+        monkeypatch.setattr(ro.socket, 'gethostname', lambda: 'developer-mac.local')
+        monkeypatch.setattr(ro, 'load_runtime_transfers', lambda transfers_file=None: df)
+        monkeypatch.setattr(
+            'builtins.input',
+            lambda prompt='': pytest.fail('single-system runtime should not prompt'),
+        )
+
+        try:
+            ro.config.load_config(transfers_file='input/transfers.tsv')
+            assert ro.get_current_system() == 'Promethion_1'
+        finally:
+            ro.config.restore_state(config_snapshot)
 
 
 class TestCheckLocalDirectory:

@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 
+from landingzones import __version__
 from landingzones.config import config
 from landingzones import check_deployment_readiness as cdr
 from landingzones import generate_cron_files as gcf
@@ -51,6 +52,11 @@ def build_cli_parser():
         dest='global_config',
         default=None,
         help='Optional config.yaml path. When omitted, landingzones auto-detects ./config.yaml or ./config/config.yaml when present.',
+    )
+    parser.add_argument(
+        '--version',
+        action='version',
+        version='landingzones {0}'.format(__version__),
     )
     subparsers = parser.add_subparsers(dest='command', required=True)
 
