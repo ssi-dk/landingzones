@@ -31,9 +31,12 @@ jobs:
       - name: Set up Pixi
         uses: prefix-dev/setup-pixi@v0.8.14
         with:
-          pixi-version: v0.41.4
+          pixi-version: v0.45.0
           cache: true
           manifest-path: pixi.toml
+
+      - name: Show Pixi version
+        run: pixi --version
 
       - name: Run packaging tests
         run: pixi run test-packaging
