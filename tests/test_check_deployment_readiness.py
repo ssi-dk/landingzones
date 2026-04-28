@@ -10,6 +10,7 @@ import pytest
 import pandas as pd
 
 from landingzones import check_deployment_readiness as cdr
+from landingzones import readiness_ops as ro
 
 
 class TestParseRemoteDestination:
@@ -54,6 +55,75 @@ class TestParseRemoteDestination:
         assert user is None
         assert host == 'remotealias'
         assert path == '$HOME/Landing_Zone/'
+
+
+class TestRunRemoteShell:
+    """Test remote shell invocation details."""
+
+    def test_run_remote_shell_uses_error_log_level(self, monkeypatch):
+        """Remote readiness checks should suppress SSH warning noise."""
+        captured = {}
+
+        class DummyProcess:
+            def __init__(self, args, stdout=None, stderr=None):
+                captured['args'] = args
+                self.returncode = 0
+
+            def communicate(self):
+                return b'EXISTS\n', b''
+
+        monkeypatch.setattr(cdr.subprocess, 'Popen', DummyProcess)
+
+        rc, stdout, stderr = cdr.run_remote_shell(
+            'tester', 'remotehost', 'echo EXISTS', '2222'
+        )
+
+        assert rc == 0
+        assert stdout == 'EXISTS\n'
+        assert stderr == ''
+        assert '-o' in captured['args']
+        assert 'LogLevel=ERROR' in captured['args']
+
+
+class TestCronDeploymentPrompt:
+    """Test explicit cron deployment prompting."""
+
+    def test_ask_yes_no_treats_eof_as_no(self, monkeypatch):
+        """Non-interactive prompts should not crash on EOF."""
+        monkeypatch.setattr('builtins.input', lambda: (_ for _ in ()).throw(EOFError()))
+
+        assert cdr.ask_yes_no("Create directories?") is False
+
+    def test_main_routes_deploy_cron_prompt(self, monkeypatch):
+        """`--deploy-cron` should bypass readiness checks and run the prompt flow."""
+        monkeypatch.setattr(cdr.config, 'load_config', lambda **kwargs: None)
+        monkeypatch.setattr(cdr, 'run_cron_deployment_prompt', lambda: True)
+
+        result = cdr.main(['--deploy-cron'])
+
+        assert result is True
+
+
+class TestRuntimeIdentityDetection:
+    """Test system/user selection from filtered runtime transfer inventories."""
+
+    def test_get_current_system_auto_selects_single_transfer_system(self, monkeypatch):
+        """A one-system runtime should not prompt when hostname does not match."""
+        df = pd.DataFrame([{'system': 'Promethion_1'}])
+        config_snapshot = ro.config.snapshot_state()
+
+        monkeypatch.setattr(ro.socket, 'gethostname', lambda: 'developer-mac.local')
+        monkeypatch.setattr(ro, 'load_runtime_transfers', lambda transfers_file=None: df)
+        monkeypatch.setattr(
+            'builtins.input',
+            lambda prompt='': pytest.fail('single-system runtime should not prompt'),
+        )
+
+        try:
+            ro.config.load_config(transfers_file='input/transfers.tsv')
+            assert ro.get_current_system() == 'Promethion_1'
+        finally:
+            ro.config.restore_state(config_snapshot)
 
 
 class TestCheckLocalDirectory:
@@ -148,6 +218,18 @@ class TestCheckLocalDirectory:
         
         assert result is True
 
+    def test_inspect_local_directory_normalizes_redundant_slashes(self, tmp_path):
+        """Repeated slashes should collapse to a single normalized path."""
+        test_dir = tmp_path / "double" / "slashes"
+        test_dir.mkdir(parents=True)
+
+        raw_path = str(tmp_path) + "//double//slashes/"
+        info = cdr.inspect_local_directory(raw_path, check_writable=False)
+
+        assert info['ok'] is True
+        assert info['path'] == str(test_dir)
+        assert '//' not in info['path']
+
 
 class TestCheckLogDirectory:
     """Test the check_log_directory function"""
@@ -203,7 +285,7 @@ class TestCheckFlockCommand:
         """Test that an existing flock binary path passes."""
         monkeypatch.setattr(cdr.config, 'get_flock_path', lambda system: '/bin/sh')
 
-        result = cdr.check_flock_command('calc')
+        result = cdr.check_flock_command('server1')
 
         assert result is True
 
@@ -211,9 +293,47 @@ class TestCheckFlockCommand:
         """Test that a missing flock binary path fails."""
         monkeypatch.setattr(cdr.config, 'get_flock_path', lambda system: '/no/such/flock')
 
-        result = cdr.check_flock_command('calc')
+        result = cdr.check_flock_command('server1')
 
         assert result is False
+
+
+class TestCheckRemoteDirectory:
+    """Test the remote directory inspection helper."""
+
+    def test_inspect_remote_directory_builds_quoted_ssh_command(self, monkeypatch):
+        """Remote probes should keep variable expansion on the remote side."""
+        captured = {}
+
+        class DummyProcess:
+            def __init__(self, args, stdout=None, stderr=None):
+                captured['args'] = args
+                self.returncode = 0
+
+            def communicate(self):
+                return b'DIR_OK\n', b''
+
+        monkeypatch.setattr(cdr.subprocess, 'Popen', DummyProcess)
+
+        info = cdr.inspect_remote_directory(
+            'user',
+            'host',
+            '$HOME/test path//nested/',
+            port='2222',
+            check_writable=False,
+        )
+
+        assert info['ok'] is True
+        remote_command = captured['args'][-1]
+        assert captured['args'][:6] == [
+            'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-p'
+        ]
+        assert captured['args'][6] == '2222'
+        assert captured['args'][7] == 'user@host'
+        assert remote_command.startswith("sh -c ")
+        assert 'target_path="$HOME/test path/nested"' in remote_command
+        assert '$1' not in remote_command
+        assert 'syntax error near unexpected token' not in remote_command
 
 
 class TestColors:
@@ -445,6 +565,7 @@ class TestTestWithData:
             config_file=str(config_file),
             transfers_file=str(transfers_file),
         )
+        runtime_root = rit_managed / 'test_with_data_runtime' / 'testbox.runner'
 
         assert result is True
         assert cdr.list_visible_entries(str(source_root)) == []
@@ -452,8 +573,9 @@ class TestTestWithData:
         assert cdr.list_visible_directories(str(final_root)) == ['flow_one', 'flow_two']
         assert (final_root / 'flow_one' / 'payload.txt').read_text() == 'flow_one'
         assert (final_root / 'flow_two' / 'payload.txt').read_text() == 'flow_two'
-        assert (rit_managed / 'scripts' / 'step1.sh').exists()
-        assert (rit_managed / 'scripts' / 'step2.sh').exists()
+        assert (runtime_root / 'scripts' / 'step1.sh').exists()
+        assert (runtime_root / 'scripts' / 'step2.sh').exists()
+        assert (runtime_root / 'validation_scripts' / 'lz_run_validation.sh').exists()
         assert (rit_managed / 'log' / 'step1.log').exists()
         assert (rit_managed / 'flock' / 'step1.lock').exists()
 
@@ -483,13 +605,122 @@ class TestTestWithData:
             config_file=str(config_file),
             transfers_file=str(transfers_file),
         )
+        runtime_root = rit_managed / 'test_with_data_runtime' / 'testbox.runner'
 
         assert result is True
         assert cdr.list_visible_entries(str(source_root)) == []
         assert cdr.list_visible_entries(str(transit_root)) == []
         assert cdr.list_visible_entries(str(final_root)) == []
+        assert not runtime_root.exists()
         assert not (rit_managed / 'log' / 'step1.log').exists()
         assert not (rit_managed / 'flock' / 'step1.lock').exists()
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_blocker_cleanup_leaves_destination_extras(
+        self, tmp_path, monkeypatch
+    ):
+        """Blocker cleanup should preserve unrelated destination leftovers."""
+        (
+            config_file,
+            transfers_file,
+            source_root,
+            transit_root,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        (source_root / 'old_run').mkdir()
+        (source_root / 'old_run' / 'payload.txt').write_text('stale')
+        (final_root / 'archived_run').mkdir()
+        (final_root / '.staging').mkdir()
+
+        responses = iter(['b', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+
+        assert result is True
+        assert not (source_root / 'old_run').exists()
+        assert cdr.list_visible_entries(str(transit_root)) == []
+        assert cdr.list_visible_entries(str(final_root)) == [
+            'archived_run',
+            'flow_one',
+            'flow_two',
+        ]
+        assert not (final_root / '.staging').exists()
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_all_cleanup_removes_destination_extras(
+        self, tmp_path, monkeypatch
+    ):
+        """Full cleanup should remove optional stale entries before seeding."""
+        (
+            config_file,
+            transfers_file,
+            _,
+            _,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        (final_root / 'archived_run').mkdir()
+
+        responses = iter(['a', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+
+        assert result is True
+        assert cdr.list_visible_entries(str(final_root)) == ['flow_one', 'flow_two']
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_leave_rejects_remaining_blockers(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Leaving blocking entries in place should fail before seeding."""
+        (
+            config_file,
+            transfers_file,
+            source_root,
+            _,
+            _,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        (source_root / 'old_run').mkdir()
+
+        responses = iter(['l'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+        captured = capsys.readouterr()
+
+        assert result is False
+        assert "Blocking entries left in place" in captured.out
 
     def test_build_run_test_plan_identifies_initial_and_terminal_roots(self, tmp_path):
         """Intermediate destinations should not be treated as initial or terminal."""
@@ -500,6 +731,7 @@ class TestTestWithData:
                 'source_port': '',
                 'destination': str(tmp_path / 'mid') + '/',
                 'destination_port': '',
+                'test_fixture_names': 'fixture_one',
             },
             {
                 'identifiers': 'step2',
@@ -515,9 +747,143 @@ class TestTestWithData:
         assert [cdr.get_endpoint_root(item) for item in plan['initial_sources']] == [
             str(tmp_path / 'source')
         ]
+        assert plan['initial_sources'][0]['test_fixture_names'] == ['fixture_one']
         assert [cdr.get_endpoint_root(item) for item in plan['terminal_destinations']] == [
             str(tmp_path / 'final')
         ]
+
+    def test_build_run_test_plan_prefers_explicit_entry_points_for_seed_sources(
+        self, tmp_path
+    ):
+        """Explicit entry-point metadata should exclude inherited remote sources from seeding."""
+        df = pd.DataFrame([
+            {
+                'identifiers': 'entry_local',
+                'source': str(tmp_path / 'server1' / 'Landing_Zone' / 'to_server2') + '/',
+                'source_port': '',
+                'destination': 'sshdat@server2:/users/data/Landing_Zone/from_server1/',
+                'destination_port': '',
+                'test_fixture_names': 'fixture_one',
+                'is_entry_point': 'TRUE',
+            },
+            {
+                'identifiers': 'return_remote',
+                'source': 'sshdat@server2:/users/data/Landing_Zone/to_server1/',
+                'source_port': '',
+                'destination': str(tmp_path / 'server1' / 'Landing_Zone' / 'from_server2') + '/',
+                'destination_port': '',
+                'test_fixture_names': '',
+                'is_entry_point': 'FALSE',
+            },
+        ])
+
+        plan = cdr.build_run_test_plan(df)
+
+        assert len(plan['initial_sources']) == 1
+        assert plan['initial_sources'][0]['value'] == str(
+            tmp_path / 'server1' / 'Landing_Zone' / 'to_server2'
+        ) + '/'
+
+    def test_dev_server1_seed_plan_scopes_fixtures_per_entry_flow(self, tmp_path):
+        """The dev server1 subset should not seed every fixture into every entry flow."""
+        config_file = tmp_path / 'config.yaml'
+        transfers_file = tmp_path / 'transfers.tsv'
+        base_dir = tmp_path
+        snapshot = cdr.config.snapshot_state()
+
+        config_file.write_text(
+            "\n".join([
+                "transfers_file: {0}".format(transfers_file),
+                "test_data: tests/data/",
+                "path_variables:",
+                "  LZ_DEV_SERVER1_LAB_ROOT: /srv/tests/dev/server1/labnet/",
+                "  LZ_DEV_SERVER1_LANDING_ZONE_ROOT: /srv/tests/dev/server1/Landing_Zone/",
+                "  LZ_DEV_SERVER3_REGION_ROOT: /srv/tests/dev/server3/region/",
+                "",
+            ])
+        )
+        transfers_file.write_text(
+            "\n".join([
+                "identifiers\tenabled\tsystem\tnotes\tusers\tsource\tsource_port\tdestination\tdestination_port\ttest_fixture_names\trsync_options\tio_nice\tlog_file\tflock_file\tfrequency\tflow_group\tis_entry_point",
+                "dev_lab_to_server1\tTRUE\tserver1\t\tuser1\t${LZ_DEV_SERVER1_LAB_ROOT}/corefacility/\t\t${LZ_DEV_SERVER1_LANDING_ZONE_ROOT}/from_labnet/\t\tIllumina_TransferTest\t\t\tdev_lab_to_server1.log\tdev_lab_to_server1.lock\t* * * * *\tdev_lab_to_server1\tTRUE",
+                "dev_server1_to_server2\tTRUE\tserver1\t\tuser1\t${LZ_DEV_SERVER1_LANDING_ZONE_ROOT}/to_server2/Projects/dev_shadow/proj/Landing_Zone/\t\tserver2:${LZ_DEV_SERVER1_LANDING_ZONE_ROOT}/from_server1/Projects/dev_shadow/proj/Landing_Zone/\t\tIllumina_TransferTest\t\t\tdev_server1_to_server2.log\tdev_server1_to_server2.lock\t* * * * *\tdev_server1_to_server2\tTRUE",
+                "dev_server1_to_server3\tTRUE\tserver1\t\tuser1\t${LZ_DEV_SERVER1_LANDING_ZONE_ROOT}/regionh/to_server3/\t\tserver3:${LZ_DEV_SERVER3_REGION_ROOT}/to_server3/\t\tIllumina_TransferTest\t\t\tdev_server1_to_server3.log\tdev_server1_to_server3.lock\t* * * * *\tdev_server1_to_server3\tTRUE",
+                "",
+            ])
+        )
+
+        try:
+            cdr.config.load_config(config_file=str(config_file))
+            transfers_df = cdr.load_test_with_data_transfers(
+                str(transfers_file),
+                'server1',
+                'user1',
+                str(base_dir),
+            )
+            plan = cdr.build_run_test_plan(transfers_df)
+        finally:
+            cdr.config.restore_state(snapshot)
+
+        fixture_by_root = {
+            cdr.get_endpoint_root(endpoint): endpoint['test_fixture_names']
+            for endpoint in plan['initial_sources']
+        }
+
+        assert fixture_by_root == {
+            '/srv/tests/dev/server1/labnet//corefacility': [
+                'Illumina_TransferTest'
+            ],
+            '/srv/tests/dev/server1/Landing_Zone//to_server2/Projects/dev_shadow/proj/Landing_Zone': [
+                'Illumina_TransferTest'
+            ],
+            '/srv/tests/dev/server1/Landing_Zone//regionh/to_server3': [
+                'Illumina_TransferTest'
+            ],
+        }
+
+    def test_build_test_with_data_existing_state_classifies_blockers(self, tmp_path):
+        """Existing endpoint contents should distinguish blockers from extras."""
+        source_root = tmp_path / 'source_root'
+        destination_root = tmp_path / 'destination_root'
+        source_root.mkdir()
+        destination_root.mkdir()
+
+        (source_root / 'old_run').mkdir()
+        (source_root / '.cache').mkdir()
+        (source_root / '.staging').mkdir()
+        (destination_root / 'flow_one').mkdir()
+        (destination_root / 'archived_run').mkdir()
+        (destination_root / '.staging').mkdir()
+
+        test_plan = {
+            'all_sources': [
+                {'value': str(source_root) + '/', 'port': ''},
+            ],
+            'all_destinations': [
+                {'value': str(destination_root) + '/', 'port': ''},
+            ],
+        }
+
+        existing_state = cdr.build_test_with_data_existing_state(
+            test_plan,
+            ['flow_one', 'flow_two'],
+        )
+
+        state_by_root = {
+            cdr.get_endpoint_root(item['endpoint']): item
+            for item in existing_state
+        }
+
+        assert state_by_root[str(source_root)]['blockers'] == [
+            '.staging',
+            'old_run',
+        ]
+        assert state_by_root[str(source_root)]['extras'] == ['.cache']
+        assert state_by_root[str(destination_root)]['blockers'] == [
+            '.staging',
+            'flow_one',
+        ]
+        assert state_by_root[str(destination_root)]['extras'] == ['archived_run']
 
     def test_load_test_with_data_transfers_preserves_env_var_paths(self, tmp_path):
         """test-with-data should keep env-var based paths unchanged."""
@@ -536,6 +902,122 @@ class TestTestWithData:
 
         assert subset_df['source'].tolist() == ['$LZ_TEST_ROOT/source/']
         assert subset_df['destination'].tolist() == ['$LZ_TEST_ROOT/dest/']
+
+    def test_build_test_with_data_handoffs_identifies_next_system_user(self, tmp_path):
+        """A destination that feeds another system should produce a handoff hint."""
+        all_transfers_df = pd.DataFrame([
+            {
+                'identifiers': 'step1',
+                'system': 'server1',
+                'users': 'runner',
+                'source': str(tmp_path / 'source') + '/',
+                'destination': str(tmp_path / 'handoff') + '/',
+                'flow_group': 'flow_a',
+            },
+            {
+                'identifiers': 'step2',
+                'system': 'server2',
+                'users': 'corfac',
+                'source': str(tmp_path / 'handoff') + '/',
+                'destination': str(tmp_path / 'final') + '/',
+                'flow_group': 'flow_a',
+            },
+        ])
+
+        current_transfers_df = all_transfers_df.iloc[[0]].copy()
+
+        handoffs = cdr.build_test_with_data_handoffs(
+            all_transfers_df,
+            current_transfers_df,
+            slow=True,
+        )
+
+        assert len(handoffs) == 1
+        assert handoffs[0]['system'] == 'server2'
+        assert handoffs[0]['user'] == 'corfac'
+        assert handoffs[0]['command'] == 'landingzones validate integration --slow'
+        assert handoffs[0]['transfers'][0]['identifier'] == 'step2'
+        assert handoffs[0]['transfers'][0]['source'] == str(tmp_path / 'handoff') + '/'
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_reports_handoff_and_skips_cleanup_prompt(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Intermediate system runs should print handoff guidance and keep state."""
+        config_file = tmp_path / 'config.yaml'
+        transfers_file = tmp_path / 'transfers.tsv'
+        source_root = tmp_path / 'tests' / 'toy_data' / 'producer_a'
+        handoff_root = tmp_path / 'handoff'
+        final_root = tmp_path / 'final'
+        rit_managed = tmp_path / 'rit_managed'
+
+        source_root.mkdir(parents=True)
+        handoff_root.mkdir()
+        final_root.mkdir()
+        rit_managed.mkdir()
+        run_dir = source_root / 'flow_one'
+        run_dir.mkdir()
+        (run_dir / 'payload.txt').write_text('flow_one')
+
+        config_file.write_text(
+            "\n".join([
+                "transfers_file: {0}".format(transfers_file),
+                "test_data: {0}".format(tmp_path / 'tests' / 'toy_data'),
+                "rit_managed_locations:",
+                "  server1: {0}".format(rit_managed),
+                "flock_paths:",
+                "  server1: /usr/bin/true",
+                "rit_managed_folder_structure:",
+                "  log: log/",
+                "  flock: flock/",
+                "  sh_output: scripts/",
+                "  crontabs: crontab.d/",
+                "",
+            ])
+        )
+        transfers_file.write_text(
+            "\n".join([
+                "identifiers\tenabled\tsystem\tnotes\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tfrequency",
+                "step1\tTRUE\tserver1\t''\trunner\t{0}/\t\t{1}/\t\t--out-format='%t %o %i %n%L'\t\tstep1.log\tstep1.lock\t* * * * *".format(
+                    tmp_path / 'producer_a', handoff_root
+                ),
+                "step2\tTRUE\tserver2\t''\tcorfac\t{0}/\t\t{1}/\t\t--out-format='%t %o %i %n%L'\t\tstep2.log\tstep2.lock\t* * * * *".format(
+                    handoff_root, final_root
+                ),
+                "",
+            ])
+        )
+
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'server1')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        cleanup_prompts = []
+        monkeypatch.setattr(
+            cdr,
+            'ask_yes_no',
+            lambda prompt_text: cleanup_prompts.append(prompt_text) or False,
+        )
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+            slow=True,
+        )
+        captured = capsys.readouterr()
+        runtime_root = rit_managed / 'test_with_data_runtime' / 'server1.runner'
+
+        assert result is True
+        assert cleanup_prompts == []
+        assert cdr.list_visible_entries(str(handoff_root)) == ['flow_one']
+        assert cdr.list_visible_entries(str(final_root)) == []
+        assert (runtime_root / 'scripts').exists()
+        assert "Next System Handoff" in captured.out
+        assert "Switch to corfac@server2" in captured.out
+        assert "landingzones validate integration --slow" in captured.out
+        assert "step2" in captured.out
 
     def test_build_test_with_data_seed_plan_uses_only_available_toy_data_directory(
         self, tmp_path
@@ -559,6 +1041,90 @@ class TestTestWithData:
 
         assert seed_plan[0]['toy_data_dir'] == str(toy_data_root)
         assert seed_plan[0]['entry_names'] == ['flow_one']
+
+    def test_build_test_with_data_seed_plan_unwraps_nested_single_dir_fixture_tree(
+        self, tmp_path
+    ):
+        """Nested single-directory fixture wrappers should resolve to the run container."""
+        run_container = (
+            tmp_path / 'tests' / 'toy_data' / 'data' / 'lab_machine_1'
+        )
+        (run_container / 'Illumina_TransferTest').mkdir(parents=True)
+        (run_container / 'Nanopore_TransferTest').mkdir()
+
+        test_plan = {
+            'initial_sources': [
+                {'value': str(tmp_path / 'somewhere' / 'corefacility') + '/', 'port': ''}
+            ]
+        }
+
+        seed_plan = cdr.build_test_with_data_seed_plan(
+            test_plan,
+            str(tmp_path / 'tests' / 'toy_data'),
+            str(tmp_path),
+        )
+
+        assert seed_plan[0]['toy_data_dir'] == str(run_container)
+        assert seed_plan[0]['entry_names'] == [
+            'Illumina_TransferTest',
+            'Nanopore_TransferTest',
+        ]
+
+    def test_build_test_with_data_seed_plan_filters_configured_fixtures(
+        self, tmp_path
+    ):
+        """Configured fixture names should restrict which toy-data runs get seeded."""
+        toy_data_root = tmp_path / 'tests' / 'toy_data' / 'shared_seed'
+        toy_data_root.mkdir(parents=True)
+        (toy_data_root / 'Illumina_TransferTest').mkdir()
+        (toy_data_root / 'Nanopore_TransferTest').mkdir()
+
+        test_plan = {
+            'initial_sources': [
+                {
+                    'value': str(tmp_path / 'somewhere' / 'source_root') + '/',
+                    'port': '',
+                    'test_fixture_names': ['Nanopore_TransferTest'],
+                }
+            ]
+        }
+
+        seed_plan = cdr.build_test_with_data_seed_plan(
+            test_plan,
+            str(tmp_path / 'tests' / 'toy_data'),
+            str(tmp_path),
+        )
+
+        assert seed_plan[0]['toy_data_dir'] == str(toy_data_root)
+        assert seed_plan[0]['entry_names'] == ['Nanopore_TransferTest']
+
+    def test_build_test_with_data_seed_plan_uses_direct_fixture_root(
+        self, tmp_path
+    ):
+        """Direct tests/data/<fixture> layouts should work with fixture filters."""
+        toy_data_root = tmp_path / 'tests' / 'data'
+        toy_data_root.mkdir(parents=True)
+        (toy_data_root / 'Illumina_TransferTest').mkdir()
+        (toy_data_root / 'Nanopore_TransferTest').mkdir()
+
+        test_plan = {
+            'initial_sources': [
+                {
+                    'value': str(tmp_path / 'source' / 'corefacility') + '/',
+                    'port': '',
+                    'test_fixture_names': ['Illumina_TransferTest'],
+                }
+            ]
+        }
+
+        seed_plan = cdr.build_test_with_data_seed_plan(
+            test_plan,
+            str(toy_data_root),
+            str(tmp_path),
+        )
+
+        assert seed_plan[0]['toy_data_dir'] == str(toy_data_root)
+        assert seed_plan[0]['entry_names'] == ['Illumina_TransferTest']
 
     def test_run_generated_scripts_enables_debug_cli(self, tmp_path, monkeypatch):
         """Generated scripts should run with debug logging enabled in test-with-data."""
@@ -596,6 +1162,196 @@ class TestTestWithData:
 
         assert results[0]['returncode'] == 0
         assert captured['env']['LZ_DEBUG_CLI'] == '1'
+
+    def test_validate_script_test_results_reports_unavailable_terminal_root(
+        self, monkeypatch
+    ):
+        """Validation should distinguish an unavailable terminal root from a missing run."""
+        test_plan = {
+            'terminal_destinations': [
+                {'value': '/tmp/final/', 'port': ''}
+            ]
+        }
+        expected_contents = {
+            cdr.endpoint_key('/tmp/final/'): {'flow_one'}
+        }
+
+        monkeypatch.setattr(
+            cdr,
+            'endpoint_root_ready',
+            lambda endpoint: (False, '/tmp/final'),
+        )
+
+        errors = cdr.validate_script_test_results(test_plan, expected_contents)
+
+        assert errors == ['Terminal destination root unavailable: /tmp/final']
+
+    def test_validate_script_test_results_reports_missing_run_under_ready_root(
+        self, monkeypatch
+    ):
+        """Validation should report missing runs only after root readiness succeeds."""
+        test_plan = {
+            'terminal_destinations': [
+                {'value': '/tmp/final/', 'port': ''}
+            ]
+        }
+        expected_contents = {
+            cdr.endpoint_key('/tmp/final/'): {'flow_one'}
+        }
+
+        monkeypatch.setattr(
+            cdr,
+            'endpoint_root_ready',
+            lambda endpoint: (True, '/tmp/final'),
+        )
+        monkeypatch.setattr(
+            cdr,
+            'endpoint_directory_exists',
+            lambda endpoint, directory_name: (
+                False, '/tmp/final/{0}'.format(directory_name)
+            ),
+        )
+
+        errors = cdr.validate_script_test_results(test_plan, expected_contents)
+
+        assert errors == [
+            'Expected test directory missing under terminal destination root: /tmp/final/flow_one'
+        ]
+
+    def test_run_generated_scripts_slow_mode_pauses_between_steps(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Slow mode should print a step summary and wait before the next script."""
+        for name in ('first.sh', 'second.sh'):
+            script = tmp_path / name
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+
+        first_log = tmp_path / 'first.log'
+        first_log.write_text("line one\nline two\n")
+
+        transfers_df = pd.DataFrame([
+            {
+                'identifiers': 'first',
+                'script_name': 'first.sh',
+                'log_file': str(first_log),
+            },
+            {
+                'identifiers': 'second',
+                'script_name': 'second.sh',
+                'log_file': str(tmp_path / 'second.log'),
+            },
+        ])
+
+        process_calls = []
+        prompts = []
+
+        class DummyProcess:
+            def __init__(self, args, stdout=None, stderr=None, env=None, cwd=None):
+                process_calls.append(args[1])
+                self.returncode = 0
+
+            def communicate(self):
+                script_name = os.path.basename(process_calls[-1])
+                return (
+                    "stdout from {0}\n".format(script_name).encode('utf-8'),
+                    b'',
+                )
+
+        monkeypatch.setattr(cdr.subprocess, 'Popen', DummyProcess)
+        monkeypatch.setattr(
+            'builtins.input',
+            lambda: prompts.append('continue') or '',
+        )
+
+        results = cdr.run_generated_scripts(
+            transfers_df,
+            str(tmp_path),
+            slow=True,
+        )
+        captured = capsys.readouterr()
+
+        assert [result['identifier'] for result in results] == ['first', 'second']
+        assert prompts == ['continue']
+        assert "Integration Step 1/2: first" in captured.out
+        assert "stdout from first.sh" in captured.out
+        assert "log tail:" in captured.out
+        assert "Press Enter to continue to the next step (second)" in captured.out
+
+    def test_main_passes_slow_flag_to_test_with_data(self, monkeypatch):
+        """The readiness CLI should forward --slow to test-with-data execution."""
+        captured = {}
+
+        monkeypatch.setattr(cdr.config, 'load_config', lambda **kwargs: None)
+
+        def fake_run_test_with_data(
+            config_file=None, transfers_file=None, slow=False
+        ):
+            captured['config_file'] = config_file
+            captured['transfers_file'] = transfers_file
+            captured['slow'] = slow
+            return True
+
+        monkeypatch.setattr(cdr, 'run_test_with_data', fake_run_test_with_data)
+
+        result = cdr.main([
+            '--config', 'config.yaml',
+            '--transfers', 'transfers.tsv',
+            '--test-with-data',
+            '--slow',
+        ])
+
+        assert result is True
+        assert captured == {
+            'config_file': 'config.yaml',
+            'transfers_file': 'transfers.tsv',
+            'slow': True,
+        }
+
+    def test_main_lists_and_creates_missing_directories(self, tmp_path, monkeypatch, capsys):
+        """Missing local directories should be summarized and created on confirmation."""
+        transfers_file = tmp_path / 'transfers.tsv'
+        transfers_file.write_text("placeholder\n")
+        source_dir = tmp_path / 'server1' / 'Landing_Zone' / 'from_labnet'
+        destination_dir = tmp_path / 'server1' / 'Landing_Zone' / 'to_server2'
+        log_file = tmp_path / 'log' / 'transfer.log'
+        flock_file = tmp_path / 'flock' / 'transfer.lock'
+
+        df = pd.DataFrame([
+            {
+                'source': str(tmp_path) + '//server1//Landing_Zone//from_labnet/',
+                'source_port': '',
+                'destination': str(tmp_path) + '//server1//Landing_Zone//to_server2/',
+                'destination_port': '',
+                'log_file': str(log_file),
+                'flock_file': str(flock_file),
+                'system': 'server1',
+                'users': 'runner',
+            }
+        ])
+
+        monkeypatch.setattr(cdr, 'check_required_tools', lambda: True)
+        monkeypatch.setattr(cdr, 'check_flock_command', lambda system: True)
+        monkeypatch.setattr(cdr, 'load_runtime_transfers', lambda transfers_file=None: df)
+        monkeypatch.setattr(
+            cdr,
+            'filter_transfers_by_system_user',
+            lambda loaded_df, system, user: loaded_df,
+        )
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'server1')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+        monkeypatch.setattr(cdr, 'ask_yes_no', lambda prompt_text: True)
+
+        result = cdr.main(['--transfers', str(transfers_file)])
+        captured = capsys.readouterr()
+
+        assert result is False
+        assert source_dir.is_dir()
+        assert destination_dir.is_dir()
+        assert "Missing Directories" in captured.out
+        assert str(source_dir) in captured.out
+        assert str(destination_dir) in captured.out
+        assert "Directory creation" in captured.out
 
 
 if __name__ == '__main__':

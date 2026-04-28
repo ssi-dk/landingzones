@@ -1,0 +1,19 @@
+[workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64"]
+
+[dependencies]
+python = ">=3.11,<3.13"
+pip = "*"
+pandas = ">=1.0.0"
+pyyaml = ">=5.0.0"
+pytest = ">=7.0.0"
+
+[pypi-dependencies]
+landingzones = { path = ".", editable = true }
+getpybs = ">=0.1.0"
+
+[tasks]
+test = "pytest"
+test-packaging = "pytest tests/test_python_standalone_packaging.py"
+build-standalone = "python scripts/build_python_standalone_bundle.py --download-python"

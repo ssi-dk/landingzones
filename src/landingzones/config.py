@@ -13,6 +13,7 @@ Configuration priority (highest to lowest):
 
 Example config.yaml:
     transfers_file: config/transfers.tsv
+    report_transfer_log_file: output/log/Landing_Zone_test_local.transfers.tsv
     log_dir: log
     output_dir: output
     crontab_dir: output/crontab.d
@@ -21,13 +22,22 @@ Example config.yaml:
     flock_paths:
       localhost: /usr/bin/flock
     rit_managed_folder_structure:
-      sh_output: scripts/landingzones/deploy/prod/output/scripts/
-      crontabs: scripts/landingzones/deploy/prod/output/crontab.d/
+      sh_output: scripts/landingzones/deploy/calc_prod.f041664/output/scripts/
+      crontabs: scripts/landingzones/deploy/calc_prod.f041664/output/crontab.d/
       log: log/
       flock: flock/
     input_dir: input
     default_lock_file: /tmp/landingzones.lock
     default_cron_frequency: "*/15 * * * *"
+    validation_scripts_dir: output/validation_scripts
+    notifications:
+      endpoint: https://example.org/landingzones/events
+      token_env: LANDINGZONES_NOTIFY_TOKEN
+      title: Landing Zone transfer event
+      body: A Landing Zone transfer emitted a notifiable event.
+      timeout_seconds: 5
+      status_file: Landing_Zone_notifications.tsv
+      status_lock_file: Landing_Zone_notifications.lock
 """
 
 import os
@@ -48,6 +58,15 @@ DEFAULT_RIT_MANAGED_FOLDER_STRUCTURE = {
     'crontabs': 'crontab.d',
     'log': 'log',
     'flock': 'flock',
+}
+DEFAULT_NOTIFICATIONS = {
+    'endpoint': '',
+    'token_env': '',
+    'title': 'Landing Zone transfer event',
+    'body': 'A Landing Zone transfer emitted a notifiable event.',
+    'timeout_seconds': '5',
+    'status_file': '',
+    'status_lock_file': '',
 }
 
 
@@ -105,12 +124,18 @@ class Config:
         - LZ_CONFIG_FILE: Path to config.yaml file
         - LZ_TRANSFERS_FILE: Path to transfers.tsv
         - LZ_TEST_DATA: Path to toy test data for --test-with-data
+        - LZ_ARTIFACT_OWNER_ID: Owner marker for generated artifacts
+        - LZ_ARTIFACT_PREFIX: Filename prefix for generated artifacts
+        - LZ_REPORT_TRANSFER_LOG_FILE: Path to the default transfer TSV used for reporting
         - LZ_LOCK_FILE: Path to default lock file
         - LZ_LOG_DIR: Default log directory
         - LZ_OUTPUT_DIR: Default output directory
         - LZ_INPUT_DIR: Default input directory
         - LZ_CRONTAB_DIR: Default crontab output directory
+        - LZ_VALIDATION_SCRIPTS_DIR: Default validation wrapper output directory
         - LZ_CRON_FREQUENCY: Default cron schedule expression
+        - LZ_NOTIFICATION_ENDPOINT: Optional notification API endpoint
+        - LZ_NOTIFICATION_TOKEN_ENV: Optional env var name containing bearer token
     """
     
     def __init__(self):
@@ -140,6 +165,7 @@ class Config:
                 - log_dir
                 - output_dir
                 - crontab_dir
+                - validation_scripts_dir
                 - rit_managed_locations
                 - flock_paths
                 - rit_managed_folder_structure
@@ -161,6 +187,20 @@ class Config:
         for key, value in kwargs.items():
             if value is not None:
                 self._runtime_config[key] = value
+
+    def snapshot_state(self):
+        """Capture internal config state for temporary override workflows."""
+        return {
+            'yaml_config': dict(self._yaml_config),
+            'runtime_config': dict(self._runtime_config),
+            'config_file': self._config_file,
+        }
+
+    def restore_state(self, snapshot):
+        """Restore a snapshot created by snapshot_state()."""
+        self._yaml_config = dict(snapshot['yaml_config'])
+        self._runtime_config = dict(snapshot['runtime_config'])
+        self._config_file = snapshot['config_file']
     
     def _get_value(self, key, env_var, default):
         """Get configuration value with priority: runtime > env > yaml > default."""
@@ -189,6 +229,37 @@ class Config:
     def transfers_file(self):
         """Path to the transfers.tsv configuration file"""
         return self._get_value('transfers_file', 'LZ_TRANSFERS_FILE', 'config/transfers.tsv')
+
+    @property
+    def report_transfer_log_file(self):
+        """Path to the default transfer TSV input used for reporting commands."""
+        value = self._get_value(
+            'report_transfer_log_file',
+            'LZ_REPORT_TRANSFER_LOG_FILE',
+            '',
+        )
+        if value:
+            return value
+
+        # Backward compatibility for pre-rename config and automation setups.
+        legacy_env_value = os.environ.get('LZ_TRANSFER_LOG_FILE')
+        if legacy_env_value:
+            return _expand_path(legacy_env_value)
+
+        legacy_yaml_value = self._yaml_config.get('transfer_log_file')
+        if legacy_yaml_value:
+            return _expand_path(legacy_yaml_value)
+
+        legacy_runtime_value = self._runtime_config.get('transfer_log_file')
+        if legacy_runtime_value:
+            return _expand_path(legacy_runtime_value)
+
+        return ''
+
+    @property
+    def transfer_log_file(self):
+        """Backward-compatible alias for older callers."""
+        return self.report_transfer_log_file
     
     @property
     def default_lock_file(self):
@@ -198,7 +269,7 @@ class Config:
     @property
     def test_data(self):
         """Path to toy data used by --test-with-data."""
-        return self._get_value('test_data', 'LZ_TEST_DATA', 'tests/toy_data')
+        return self._get_value('test_data', 'LZ_TEST_DATA', 'tests/data')
     
     @property
     def log_dir(self):
@@ -221,6 +292,26 @@ class Config:
         # Special case: crontab_dir defaults to output_dir/crontab.d
         default = os.path.join(self.output_dir, 'crontab.d')
         return self._get_value('crontab_dir', 'LZ_CRONTAB_DIR', default)
+
+    @property
+    def validation_scripts_dir(self):
+        """Default output directory for generated validation wrapper scripts."""
+        default = os.path.join(self.output_dir, 'validation_scripts')
+        return self._get_value(
+            'validation_scripts_dir',
+            'LZ_VALIDATION_SCRIPTS_DIR',
+            default,
+        )
+
+    @property
+    def artifact_owner_id(self):
+        """Owner marker for generated files in shared artifact directories."""
+        return self._get_value('artifact_owner_id', 'LZ_ARTIFACT_OWNER_ID', '')
+
+    @property
+    def artifact_prefix(self):
+        """Optional filename prefix for generated scripts, crons, and wrappers."""
+        return self._get_value('artifact_prefix', 'LZ_ARTIFACT_PREFIX', '')
 
     @property
     def rit_managed_locations(self):
@@ -260,6 +351,49 @@ class Config:
             return dict(yaml_value)
 
         return {}
+
+    @property
+    def notifications(self):
+        """Configured notification API and delivery-log settings."""
+        values = dict(DEFAULT_NOTIFICATIONS)
+
+        yaml_value = self._yaml_config.get('notifications')
+        if yaml_value is not None:
+            values.update(dict(yaml_value))
+
+        runtime_value = self._runtime_config.get('notifications')
+        if runtime_value is not None:
+            values.update(dict(runtime_value))
+
+        env_endpoint = os.environ.get('LZ_NOTIFICATION_ENDPOINT')
+        if env_endpoint:
+            values['endpoint'] = env_endpoint
+
+        env_token_env = os.environ.get('LZ_NOTIFICATION_TOKEN_ENV')
+        if env_token_env:
+            values['token_env'] = env_token_env
+
+        for key in ('endpoint', 'token_env', 'title', 'body', 'status_file', 'status_lock_file'):
+            values[key] = _expand_path(str(values.get(key, '') or ''))
+        values['timeout_seconds'] = str(values.get('timeout_seconds', '') or '5')
+        return values
+
+    @property
+    def path_variables(self):
+        """Configured ${VAR} placeholder values used in transfers.tsv paths."""
+        values = dict(os.environ)
+
+        yaml_value = self._yaml_config.get('path_variables')
+        if yaml_value is not None:
+            for key, value in yaml_value.items():
+                values[str(key)] = _expand_path(value)
+
+        runtime_value = self._runtime_config.get('path_variables')
+        if runtime_value is not None:
+            for key, value in runtime_value.items():
+                values[str(key)] = _expand_path(value)
+
+        return values
 
     def get_rit_managed_location(self, system):
         """Return the rit_managed base location for a system."""
@@ -311,14 +445,20 @@ class Config:
         return {
             'config_file': self.config_file,
             'transfers_file': self.transfers_file,
+            'report_transfer_log_file': self.report_transfer_log_file,
             'test_data': self.test_data,
             'default_lock_file': self.default_lock_file,
             'log_dir': self.log_dir,
             'output_dir': self.output_dir,
             'input_dir': self.input_dir,
             'crontab_dir': self.crontab_dir,
+            'validation_scripts_dir': self.validation_scripts_dir,
+            'artifact_owner_id': self.artifact_owner_id,
+            'artifact_prefix': self.artifact_prefix,
             'rit_managed_locations': self.rit_managed_locations,
             'flock_paths': self.flock_paths,
+            'notifications': self.notifications,
+            'path_variables': self.path_variables,
             'rit_managed_folder_structure': self.rit_managed_folder_structure,
             'default_cron_frequency': self.default_cron_frequency,
         }

@@ -1,0 +1,70 @@
+name: Build Standalone Bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      python-version:
+        description: "python-build-standalone Python version"
+        required: false
+        default: "3.12"
+      architecture:
+        description: "Optional python-build-standalone architecture override"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-linux:
+    name: Build Linux standalone bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Pixi
+        uses: prefix-dev/setup-pixi@v0.8.14
+        with:
+          pixi-version: v0.41.4
+          cache: true
+          manifest-path: pixi.toml
+
+      - name: Run packaging tests
+        run: pixi run test-packaging
+
+      - name: Build standalone bundle
+        env:
+          PBS_PYTHON_VERSION: ${{ github.event.inputs.python-version || '3.12' }}
+          PBS_ARCHITECTURE: ${{ github.event.inputs.architecture }}
+        run: pixi run build-standalone
+
+      - name: Verify bundle CLI
+        run: |
+          file ./packaging/dist/landingzones-standalone/python/bin/python3
+          ./packaging/dist/landingzones-standalone/python/bin/python3 -c "import platform, sys; print(platform.system(), platform.machine(), sys.version)"
+          ./packaging/dist/landingzones-standalone/landingzones --help
+
+      - name: Prepare release asset
+        run: cp packaging/dist/landingzones-standalone.tar.gz packaging/dist/landingzones-standalone-linux-x86_64.tar.gz
+
+      - name: Upload standalone bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: landingzones-standalone-linux-x86_64
+          path: packaging/dist/landingzones-standalone-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+      - name: Publish standalone bundle to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "Landing Zones $GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" packaging/dist/landingzones-standalone-linux-x86_64.tar.gz --clobber

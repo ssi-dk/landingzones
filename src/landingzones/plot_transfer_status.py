@@ -6,10 +6,26 @@ import argparse
 import html
 import os
 import re
+import socket
+import sys
 
-import pandas as pd
+try:
+    import pandas as pd
+except ModuleNotFoundError:
+    pd = None
 
 from landingzones.config import config
+from landingzones import generate_cron_files as gcf
+from landingzones.transfer_loading import (
+    definitions_for_system,
+    load_reporting_transfers,
+)
+from landingzones.transfer_definitions import (
+    normalize_tags,
+    normalize_tags_text,
+    normalize_transfer_path,
+    tags_match_any,
+)
 
 
 WINDOW_SPECS = (
@@ -18,6 +34,7 @@ WINDOW_SPECS = (
     ("30d", "Last 30 days"),
 )
 RUN_LIST_WINDOW = "7d"
+REPORT_SKIPPED_EXIT_CODE = 2
 
 
 def normalize_directory_suffix(value):
@@ -33,23 +50,37 @@ def normalize_directory_suffix(value):
     return text
 
 
-def normalize_transfer_path(path, strip_wildcard=False):
-    """Normalize a source or destination path for graph matching."""
-    value = str(path).strip() if path is not None else ""
-    if not value or value == "nan":
-        return ""
-    remote = ""
-    inner = value
-    if ":" in value:
-        remote, inner = value.split(":", 1)
-    if strip_wildcard and inner.endswith("/*"):
-        inner = inner[:-2]
-    elif strip_wildcard and inner.endswith("*"):
-        inner = inner[:-1]
-    inner = inner.rstrip("/")
-    if remote:
-        return "{0}:{1}".format(remote, inner)
-    return inner
+def require_pandas():
+    """Return False and print a clear message when report dependencies are missing."""
+    if pd is not None:
+        return True
+    print(
+        "Report generation was skipped because pandas is not installed.\n"
+        "Install the reporting extra with `pip install 'landingzones[report]'` "
+        "or refresh the local Pixi environment, then rerun `landingzones report transfers`.",
+        file=sys.stderr,
+    )
+    return False
+
+
+def print_missing_report_input_message(input_path=None):
+    """Print a clear report-skip message when no log input is configured."""
+    if input_path:
+        print(
+            "Report generation was skipped because the transfer log does not exist: {0}\n"
+            "Pass an input TSV to `landingzones report transfers`, pass "
+            "`--report-input` to `landingzones validate chain`, or set "
+            "`report_transfer_log_file` in config.".format(input_path),
+            file=sys.stderr,
+        )
+        return
+    print(
+        "Report generation was skipped because no transfer log path was configured.\n"
+        "Pass an input TSV to `landingzones report transfers`, pass "
+        "`--report-input` to `landingzones validate chain`, or set "
+        "`report_transfer_log_file` in config.",
+        file=sys.stderr,
+    )
 
 
 def parse_window_spec(window, anchor_time):
@@ -70,28 +101,45 @@ def load_transfer_log(path):
     if df.empty:
         return df
     df = df.copy()
-    df["datetime"] = pd.to_datetime(df["datetime"], format="%Y-%m-%d %H:%M:%S%z")
-    for column in ("identifier", "directory", "source", "destination", "status"):
+    column_aliases = {
+        "event_time_utc": "datetime",
+        "transfer_identifier": "identifier",
+        "source_path": "source",
+        "destination_path": "destination",
+    }
+    for source_column, target_column in column_aliases.items():
+        if source_column in df.columns and target_column not in df.columns:
+            df[target_column] = df[source_column]
+    if "directory" not in df.columns and "run_name" in df.columns:
+        df["directory"] = df["run_name"]
+
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    for column in ("identifier", "directory", "source", "destination", "status", "tags"):
         if column in df.columns:
             df[column] = df[column].fillna("").astype(str).str.strip()
+    if "tags" in df.columns:
+        df["tags"] = df["tags"].apply(normalize_tags_text)
+    else:
+        df["tags"] = ""
+    if "run_id" in df.columns:
+        df["run_id"] = df["run_id"].fillna("").astype(str).str.strip()
+    else:
+        df["run_id"] = ""
+    if "run_name" in df.columns:
+        df["run_name"] = df["run_name"].fillna("").astype(str).str.strip()
+    else:
+        df["run_name"] = df["directory"]
     df["directory_suffix"] = df["directory"].apply(normalize_directory_suffix)
+    df["run_group"] = df["run_id"]
+    empty_run_group = df["run_group"] == ""
+    df.loc[empty_run_group, "run_group"] = df.loc[empty_run_group, "directory_suffix"]
     df = df.sort_values(["datetime", "identifier", "directory"]).reset_index(drop=True)
     return df
 
 
 def load_transfer_metadata(transfers_file):
-    """Load transfer definitions needed to infer the flow graph."""
-    df = pd.read_csv(transfers_file, sep="\t")
-    df = df.copy()
-    if "system" in df.columns:
-        df = df[~df["system"].astype(str).str.startswith("#")]
-    if "enabled" in df.columns:
-        df["enabled"] = df["enabled"].fillna("").astype(str).str.strip().str.upper()
-        df = df[df["enabled"] == "TRUE"]
-    for column in ("identifiers", "system", "source", "destination"):
-        if column in df.columns:
-            df[column] = df[column].fillna("").astype(str).str.strip()
-    return df
+    """Load shared transfer definitions through the main parser pipeline."""
+    return load_reporting_transfers(transfers_file=transfers_file)
 
 
 def infer_system_from_log_path(path):
@@ -109,25 +157,28 @@ def build_flow_graph(transfers_df, system):
     system_df = transfers_df[transfers_df["system"] == system].copy()
     if system_df.empty:
         raise ValueError(
-            "No enabled transfers found for system '{0}' in {1}".format(
-                system,
-                config.transfers_file,
-            )
+            "No enabled transfers found for system '{0}'".format(system)
         )
-    system_df["source_root"] = system_df["source"].apply(
-        lambda value: normalize_transfer_path(value, strip_wildcard=True)
-    )
-    system_df["destination_root"] = system_df["destination"].apply(
-        lambda value: normalize_transfer_path(value, strip_wildcard=False)
-    )
-
-    edges = {identifier: set() for identifier in system_df["identifiers"]}
-    for _, upstream in system_df.iterrows():
-        for _, downstream in system_df.iterrows():
-            if upstream["identifiers"] == downstream["identifiers"]:
+    system_definitions = definitions_for_system(transfers_df, system)
+    edges = {
+        definition.identifier: set() for definition in system_definitions
+    }
+    for upstream in system_definitions:
+        upstream_destination = normalize_transfer_path(
+            upstream.destination,
+            strip_wildcard=False,
+        )
+        if not upstream_destination:
+            continue
+        for downstream in system_definitions:
+            if upstream.identifier == downstream.identifier:
                 continue
-            if upstream["destination_root"] and upstream["destination_root"] == downstream["source_root"]:
-                edges[upstream["identifiers"]].add(downstream["identifiers"])
+            downstream_source = normalize_transfer_path(
+                downstream.source,
+                strip_wildcard=True,
+            )
+            if upstream_destination == downstream_source:
+                edges[upstream.identifier].add(downstream.identifier)
 
     terminal_identifiers = sorted(
         identifier for identifier, children in edges.items() if not children
@@ -150,6 +201,54 @@ def format_timedelta(delta):
         parts.append("{0}h".format(hours))
     parts.append("{0}m".format(minutes))
     return " ".join(parts)
+
+
+def describe_state_logic(state, warning_hours):
+    """Return a human-readable explanation of the dashboard state heuristic."""
+    threshold_text = "{0:g}h".format(warning_hours)
+    descriptions = {
+        "success": (
+            "Success: a completed event exists on a terminal transfer and is "
+            "newer than any error event."
+        ),
+        "failed": "Failed: the most recent decisive event is an error event.",
+        "warning": (
+            "Warning: no newer terminal success or error exists, and the latest "
+            "initiated event is older than the {0} threshold."
+        ).format(threshold_text),
+        "in_progress": (
+            "In progress: no newer terminal success or error exists, and the "
+            "latest initiated event is within the {0} threshold."
+        ).format(threshold_text),
+    }
+    return descriptions.get(
+        state,
+        "State is derived from recent initiated, completed, and error events.",
+    )
+
+
+def render_status_badge(state, warning_hours):
+    """Render a status badge with hover text describing the classification."""
+    return (
+        '<span class="status {state}" title="{title}">{label}</span>'.format(
+            state=html.escape(str(state)),
+            title=html.escape(describe_state_logic(state, warning_hours)),
+            label=html.escape(str(state).replace("_", " ")),
+        )
+    )
+
+
+def render_metric_label(label, warning_hours):
+    """Render a metric label, including hover text for state-based metrics."""
+    normalized = str(label).strip().lower().replace(" ", "_")
+    if normalized in {"success", "failed", "warning", "in_progress"}:
+        return (
+            '<span title="{0}">{1}</span>'.format(
+                html.escape(describe_state_logic(normalized, warning_hours)),
+                html.escape(label),
+            )
+        )
+    return "<span>{0}</span>".format(html.escape(label))
 
 
 def _select_state_row(rows, terminal_identifiers, latest_start, anchor_time, warning_hours):
@@ -184,10 +283,23 @@ def aggregate_runs(log_df, terminal_identifiers, anchor_time=None, warning_hours
     """Aggregate event rows into run-level health records."""
     if log_df.empty:
         return pd.DataFrame()
+    log_df = log_df.copy()
+    if "run_id" not in log_df.columns:
+        log_df["run_id"] = ""
+    if "run_name" not in log_df.columns:
+        log_df["run_name"] = log_df.get("directory", "")
+    if "directory_suffix" not in log_df.columns:
+        log_df["directory_suffix"] = log_df["directory"].apply(normalize_directory_suffix)
+    if "run_group" not in log_df.columns:
+        log_df["run_group"] = log_df["run_id"].fillna("").astype(str).str.strip()
+        empty_run_group = log_df["run_group"] == ""
+        log_df.loc[empty_run_group, "run_group"] = log_df.loc[
+            empty_run_group, "directory_suffix"
+        ]
     anchor = anchor_time or log_df["datetime"].max()
     records = []
 
-    for directory_suffix, run_rows in log_df.groupby("directory_suffix", sort=False):
+    for run_group, run_rows in log_df.groupby("run_group", sort=False):
         rows = run_rows.sort_values("datetime").reset_index(drop=True)
         initiated_rows = rows[rows["status"] == "initiated"].sort_values("datetime")
         started_at = (
@@ -209,7 +321,10 @@ def aggregate_runs(log_df, terminal_identifiers, anchor_time=None, warning_hours
         )
         records.append(
             {
-                "run": directory_suffix,
+                "run": rows.iloc[-1].get("run_name") or rows.iloc[-1]["directory_suffix"],
+                "run_group": run_group,
+                "run_id": rows.iloc[-1].get("run_id", ""),
+                "tags": normalize_tags_text(rows["tags"].tolist()),
                 "started_at": started_at,
                 "latest_start": latest_start,
                 "last_event_time": latest_row["datetime"],
@@ -244,6 +359,24 @@ def windowed_runs(runs_df, window, anchor_time):
     return filtered, label
 
 
+def filter_runs_by_tags(runs_df, requested_tags):
+    """Return only runs matching any requested tag."""
+    if runs_df.empty or not requested_tags:
+        return runs_df.copy()
+    return runs_df[runs_df["tags"].apply(
+        lambda value: tags_match_any(value, requested_tags)
+    )].copy()
+
+
+def build_tag_summary(runs_df):
+    """Return tag counts across filtered runs."""
+    counts = {}
+    for value in runs_df.get("tags", []):
+        for tag in normalize_tags(value):
+            counts[tag] = counts.get(tag, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+
 def build_metric_cards(runs_df, anchor_time):
     """Summarize run health in multiple time windows."""
     cards = []
@@ -274,7 +407,14 @@ def select_run_list(runs_df, statuses, window, anchor_time, max_runs, sort_colum
     return filtered.head(max_runs), overflow, label
 
 
-def dashboard_context(log_df, transfers_df, system, warning_hours=2, max_runs=10):
+def dashboard_context(
+    log_df,
+    transfers_df,
+    system,
+    warning_hours=2,
+    max_runs=10,
+    filter_tags=None,
+):
     """Build all data needed to render the HTML dashboard."""
     if log_df.empty:
         raise ValueError("Transfer log is empty: no rows to report")
@@ -286,9 +426,10 @@ def dashboard_context(log_df, transfers_df, system, warning_hours=2, max_runs=10
         anchor_time=anchor_time,
         warning_hours=warning_hours,
     )
-    metric_cards = build_metric_cards(runs_df, anchor_time)
+    filtered_runs_df = filter_runs_by_tags(runs_df, filter_tags or [])
+    metric_cards = build_metric_cards(filtered_runs_df, anchor_time)
     unfinished_runs, unfinished_overflow, unfinished_label = select_run_list(
-        runs_df,
+        filtered_runs_df,
         statuses=("failed", "warning", "in_progress"),
         window=RUN_LIST_WINDOW,
         anchor_time=anchor_time,
@@ -296,7 +437,7 @@ def dashboard_context(log_df, transfers_df, system, warning_hours=2, max_runs=10
         sort_column="last_event_time",
     )
     success_runs, success_overflow, success_label = select_run_list(
-        runs_df,
+        filtered_runs_df,
         statuses=("success",),
         window=RUN_LIST_WINDOW,
         anchor_time=anchor_time,
@@ -305,7 +446,7 @@ def dashboard_context(log_df, transfers_df, system, warning_hours=2, max_runs=10
     )
     return {
         "anchor_time": anchor_time,
-        "runs_df": runs_df,
+        "runs_df": filtered_runs_df,
         "metric_cards": metric_cards,
         "unfinished_runs": unfinished_runs,
         "unfinished_overflow": unfinished_overflow,
@@ -316,10 +457,12 @@ def dashboard_context(log_df, transfers_df, system, warning_hours=2, max_runs=10
         "terminal_identifiers": terminal_identifiers,
         "system": system,
         "warning_hours": warning_hours,
+        "filter_tags": normalize_tags_text(filter_tags or []),
+        "tag_summary": build_tag_summary(filtered_runs_df),
     }
 
 
-def render_run_table(rows_df, empty_message):
+def render_run_table(rows_df, empty_message, warning_hours):
     """Render a run table as HTML."""
     if rows_df.empty:
         return '<p class="empty">{0}</p>'.format(html.escape(empty_message))
@@ -327,7 +470,7 @@ def render_run_table(rows_df, empty_message):
     header = (
         "<tr>"
         "<th>Run</th><th>Status</th><th>Last identifier</th><th>Last event</th>"
-        "<th>Age</th><th>Source</th><th>Destination</th>"
+        "<th>Age</th><th>Tags</th><th>Source</th><th>Destination</th>"
         "</tr>"
     )
     body_rows = []
@@ -335,21 +478,22 @@ def render_run_table(rows_df, empty_message):
         body_rows.append(
             "<tr>"
             "<td>{run}</td>"
-            "<td><span class=\"status {state}\">{state_label}</span></td>"
+            "<td>{status_badge}</td>"
             "<td>{identifier}</td>"
             "<td>{last_event}</td>"
             "<td>{age}</td>"
+            "<td>{tags}</td>"
             "<td class=\"path\">{source}</td>"
             "<td class=\"path\">{destination}</td>"
             "</tr>".format(
                 run=html.escape(str(row["run"])),
-                state=html.escape(str(row["state"])),
-                state_label=html.escape(str(row["state"]).replace("_", " ")),
+                status_badge=render_status_badge(row["state"], warning_hours),
                 identifier=html.escape(str(row["last_identifier"])),
                 last_event=html.escape(
                     row["last_event_time"].strftime("%Y-%m-%d %H:%M:%S%z")
                 ),
                 age=html.escape(format_timedelta(row["age"])),
+                tags=html.escape(str(row.get("tags", "") or "(none)")),
                 source=html.escape(str(row["source"])),
                 destination=html.escape(str(row["destination"])),
             )
@@ -369,19 +513,27 @@ def render_dashboard(context, output_path, title=None):
             <section class="metric-card">
               <h3>{label}</h3>
               <div class="metric-grid">
-                <div><span>Total</span><strong>{total}</strong></div>
-                <div><span>Success</span><strong>{success}</strong></div>
-                <div><span>Failed</span><strong>{failed}</strong></div>
-                <div><span>Warning</span><strong>{warning}</strong></div>
-                <div><span>In progress</span><strong>{in_progress}</strong></div>
+                <div>{total_label}<strong>{total}</strong></div>
+                <div>{success_label}<strong>{success}</strong></div>
+                <div>{failed_label}<strong>{failed}</strong></div>
+                <div>{warning_label}<strong>{warning}</strong></div>
+                <div>{in_progress_label}<strong>{in_progress}</strong></div>
               </div>
             </section>
             """.format(
                 label=html.escape(card["label"]),
+                total_label=render_metric_label("Total", context["warning_hours"]),
                 total=card["total"],
+                success_label=render_metric_label("Success", context["warning_hours"]),
                 success=card["success"],
+                failed_label=render_metric_label("Failed", context["warning_hours"]),
                 failed=card["failed"],
+                warning_label=render_metric_label("Warning", context["warning_hours"]),
                 warning=card["warning"],
+                in_progress_label=render_metric_label(
+                    "In progress",
+                    context["warning_hours"],
+                ),
                 in_progress=card["in_progress"],
             )
         )
@@ -398,6 +550,28 @@ def render_dashboard(context, output_path, title=None):
         success_more = (
             '<p class="overflow">Showing 10 most recent successes; '
             'and {0} more.</p>'.format(context["success_overflow"])
+        )
+
+    tag_summary = ""
+    if context["tag_summary"]:
+        tag_rows = "".join(
+            "<tr><td>{0}</td><td>{1}</td></tr>".format(
+                html.escape(tag),
+                count,
+            )
+            for tag, count in context["tag_summary"]
+        )
+        tag_summary = (
+            '<section class="section">'
+            '<h2>Tag Summary</h2>'
+            '<table><thead><tr><th>Tag</th><th>Runs</th></tr></thead>'
+            '<tbody>{0}</tbody></table>'
+            '</section>'.format(tag_rows)
+        )
+    else:
+        tag_summary = (
+            '<section class="section"><h2>Tag Summary</h2>'
+            '<p class="empty">No tags present in the filtered runs.</p></section>'
         )
 
     document = """<!DOCTYPE html>
@@ -571,6 +745,8 @@ def render_dashboard(context, output_path, title=None):
         <span>System: {system}</span>
         <span>Terminal identifiers: {terminal_ids}</span>
         <span>Warning threshold: {warning_hours}h</span>
+        <span>Tag filter: {filter_tags}</span>
+        <span>Hover a status label for classification logic</span>
       </div>
     </section>
     <section class="section">
@@ -579,6 +755,7 @@ def render_dashboard(context, output_path, title=None):
         {metric_cards}
       </div>
     </section>
+    {tag_summary}
     <section class="section">
       <h2>Unfinished Runs ({unfinished_label})</h2>
       {unfinished_table}
@@ -605,17 +782,21 @@ def render_dashboard(context, output_path, title=None):
         system=html.escape(context["system"]),
         terminal_ids=html.escape(", ".join(context["terminal_identifiers"]) or "(none)"),
         warning_hours=context["warning_hours"],
+        filter_tags=html.escape(context["filter_tags"] or "(none)"),
         metric_cards="".join(metric_cards),
+        tag_summary=tag_summary,
         unfinished_label=html.escape(context["unfinished_label"]),
         unfinished_table=render_run_table(
             context["unfinished_runs"],
             "No unfinished runs in this window.",
+            context["warning_hours"],
         ),
         unfinished_more=unfinished_more,
         success_label=html.escape(context["success_label"]),
         success_table=render_run_table(
             context["success_runs"],
             "No successful runs in this window.",
+            context["warning_hours"],
         ),
         success_more=success_more,
     )
@@ -633,6 +814,7 @@ def create_transfer_dashboard(
     warning_hours=2,
     max_runs=10,
     title=None,
+    filter_tags=None,
 ):
     """Create a self-contained HTML dashboard."""
     context = dashboard_context(
@@ -641,6 +823,7 @@ def create_transfer_dashboard(
         system=system,
         warning_hours=warning_hours,
         max_runs=max_runs,
+        filter_tags=filter_tags,
     )
     return render_dashboard(context, output_path, title=title)
 
@@ -658,16 +841,62 @@ def build_default_output_path(input_path):
 
 def load_transfers_for_reporting(config_file=None, transfers_file=None):
     """Load enabled transfers after resolving config defaults."""
+    return load_reporting_transfers(
+        config_file=config_file,
+        transfers_file=transfers_file,
+    )
+
+
+def infer_report_system(config_file=None, transfers_file=None):
+    """Infer a system for default report-log resolution without prompting."""
+    hostname = socket.gethostname().lower()
+    try:
+        transfers_df = load_reporting_transfers(
+            config_file=config_file,
+            transfers_file=transfers_file,
+        )
+        for system in transfers_df["system"].unique():
+            if str(system).lower() in hostname:
+                return system
+    except Exception:
+        pass
+    return hostname
+
+
+def resolve_report_input_path(
+    input_path=None,
+    config_file=None,
+    transfers_file=None,
+    system=None,
+):
+    """Resolve the default report TSV path from CLI input or config."""
+    if input_path:
+        return input_path
     config.load_config(config_file=config_file, transfers_file=transfers_file)
-    return load_transfer_metadata(config.transfers_file)
+    if config.report_transfer_log_file:
+        return config.report_transfer_log_file
+    report_system = system or infer_report_system(
+        config_file=config_file,
+        transfers_file=transfers_file,
+    )
+    if report_system:
+        return gcf.get_common_status_log_file(report_system)
+    return ""
 
 
-def main():
+def main(argv=None):
     """CLI entrypoint."""
+    if not require_pandas():
+        return REPORT_SKIPPED_EXIT_CODE
     parser = argparse.ArgumentParser(
         description="Generate a transfer health dashboard from a shared TSV log",
     )
-    parser.add_argument("input", help="Path to the shared transfer TSV log")
+    parser.add_argument(
+        "input",
+        nargs="?",
+        default=None,
+        help="Path to the transfer TSV report input (defaults to report_transfer_log_file from config)",
+    )
     parser.add_argument(
         "--output",
         "-o",
@@ -708,11 +937,30 @@ def main():
         default=None,
         help="Optional dashboard title override",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        help="Filter runs to those matching any requested tag; repeatable",
+    )
+    args = parser.parse_args(argv)
 
-    system = args.system or infer_system_from_log_path(args.input)
-    output_path = args.output or build_default_output_path(args.input)
-    log_df = load_transfer_log(args.input)
+    input_path = resolve_report_input_path(
+        input_path=args.input,
+        config_file=args.config,
+        transfers_file=args.transfers_file,
+        system=args.system,
+    )
+    if not input_path:
+        print_missing_report_input_message()
+        return REPORT_SKIPPED_EXIT_CODE
+    if not os.path.exists(input_path):
+        print_missing_report_input_message(input_path)
+        return REPORT_SKIPPED_EXIT_CODE
+
+    system = args.system or infer_system_from_log_path(input_path)
+    output_path = args.output or build_default_output_path(input_path)
+    log_df = load_transfer_log(input_path)
     transfers_df = load_transfers_for_reporting(
         config_file=args.config,
         transfers_file=args.transfers_file,
@@ -725,6 +973,7 @@ def main():
         warning_hours=args.warning_hours,
         max_runs=args.max_runs,
         title=args.title,
+        filter_tags=args.tag,
     )
     print("Wrote dashboard to {0}".format(output_path))
     return 0

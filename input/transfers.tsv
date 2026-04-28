@@ -1,4 +1,4 @@
-identifiers	enabled	system	notes	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file	frequency
+identifiers	enabled	system	notes	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file	frequency	flow_group	is_entry_point	is_end_point	notify_on_success	notify_on_error	test_fixture_names	tags
 # Example transfer configurations
 # Uncomment and modify the lines below, or add your own
 #
@@ -9,13 +9,21 @@ identifiers	enabled	system	notes	users	source	source_port	destination	destinatio
 #   notes            - Optional notes/comments about this transfer
 #   users            - Username running the cron job
 #   source           - Source path (supports wildcards like input/*)
+#   source_port      - SSH port for remote sources (leave empty for default 22)
 #   destination      - Destination path (local or remote user@host:/path/)
 #   destination_port - SSH port for remote destinations (leave empty for default 22)
 #   rsync_options    - Additional rsync options (e.g., --chown=:group --chmod=Du=rwx)
 #   io_nice          - Optional ionice args/command for rsync (e.g. -c2 -n7; empty skips ionice)
 #   log_file         - Log file name under the system log folder (e.g. transfers.log)
 #   flock_file       - Lock file name under the system flock folder (required)
-#   frequency        - Cron schedule (default: */15 * * * * = every 15 minutes)
+#   frequency         - Cron schedule (default: */15 * * * * = every 15 minutes)
+#   flow_group        - Optional flow identifier for portable run tracking and validation wrappers
+#   is_entry_point    - TRUE when this transfer is the first hop that creates flow metadata
+#   is_end_point      - TRUE when this transfer is a terminal hop in a tracked flow
+#   notify_on_success - TRUE to send a notification when this transfer completes, if notifications.endpoint is configured
+#   notify_on_error   - TRUE to send a notification when this transfer errors, if notifications.endpoint is configured
+#   test_fixture_names - Optional comma-separated fixture directories used by integration validation
+#   tags              - Optional comma-separated labels for reporting and separation validation
 #
 # Frequency examples:
 #   */5 * * * *   - every 5 minutes
@@ -25,7 +33,7 @@ identifiers	enabled	system	notes	users	source	source_port	destination	destinatio
 #   0 */6 * * *   - every 6 hours
 #
 # Local transfer example (uncomment to use):
-transfer_001	TRUE	localhost	''	testuser	input/*		output/				transfers.log	landingzones.lock	*/15 * * * *
+transfer_001	TRUE	localhost	''	testuser	input/*		output/				transfers.log	landingzones.lock	*/15 * * * *		FALSE	FALSE	FALSE	TRUE		example,local
 #
 # Remote transfer example (enable and modify):
-transfer_002	FALSE	myserver	''	datauser	/srv/data/outgoing/*		remoteuser@remote.host:/srv/data/incoming/	22			remote_transfer.log	remote_transfer.lock	*/15 * * * *
+transfer_002	FALSE	myserver	''	datauser	/srv/data/outgoing/*		remoteuser@remote.host:/srv/data/incoming/	22			remote_transfer.log	remote_transfer.lock	*/15 * * * *		FALSE	FALSE	FALSE	TRUE		remote

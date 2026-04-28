@@ -9,95 +9,276 @@ Creates a .cron file for each system-user combination with rsync commands.
 import os
 import sys
 import argparse
+import csv
 import re
 import shlex
-import pandas as pd
 
 from landingzones.config import config
+from landingzones.table import TransferTable
+from landingzones.transfer_definitions import (
+    definitions_from_dataframe,
+    normalize_tags_text,
+)
 
 
-def parse_transfers_file(filename):
-    """Parse the transfers.tsv file and return a pandas DataFrame"""
-    # Read the TSV file with pandas - now with proper header line
-    df = pd.read_csv(filename, sep='\t')
-    
-    # Filter out commented lines (rows where system starts with #)
-    df = df[~df['system'].astype(str).str.startswith('#')]
-    
-    # Filter by enabled column if present - only process rows where enabled is TRUE
-    if 'enabled' in df.columns:
-        df['enabled'] = df['enabled'].astype(str).str.strip().str.upper()
-        df = df[df['enabled'] == 'TRUE']
+VALIDATION_HELPER_NAME = 'lz_run_validation.sh'
+VALIDATION_WRAPPER_PREFIX = 'lz_run_validation_'
+VALIDATION_TEMPLATE_NAME = 'lz_run_validation.sh'
+OWNER_MARKER_PREFIX = '# landingzones-owner:'
+PATH_VARIABLE_PATTERN = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}')
 
-    if 'identifiers' not in df.columns:
-        df.insert(0, 'identifiers', [
-            "transfer_{0:03d}".format(i) for i in range(1, len(df) + 1)
-        ])
-    
-    # Clean up any extra whitespace in string columns
-    for col in df.select_dtypes(include=['object']).columns:
-        df[col] = df[col].astype(str).str.strip()
-    
-    # Create system_user combination column
-    df['system_user'] = df['system'] + '.' + df['users']
-    
-    # Handle empty columns and convert destination_port to string
-    df['rsync_options'] = df['rsync_options'].fillna('').astype(str)
-    df['log_file'] = df['log_file'].fillna('').astype(str)
-    df['flock_file'] = df['flock_file'].fillna('').astype(str)
-    if 'io_nice' not in df.columns:
-        df['io_nice'] = ''
-    df['io_nice'] = df['io_nice'].fillna('').astype(str)
-    
-    # Handle frequency column - use default if not present or empty
-    if 'frequency' not in df.columns:
-        df['frequency'] = ''
-    df['frequency'] = df['frequency'].fillna('').astype(str)
-    
-    # Handle destination_port and source_port specially (may be numeric)
-    df['destination_port'] = df['destination_port'].fillna('').astype(str)
-    
-    # Handle source_port if it exists, otherwise create empty column
-    if 'source_port' not in df.columns:
-        df['source_port'] = ''
-    df['source_port'] = df['source_port'].fillna('').astype(str)
-    
-    # Remove rows where columns contain 'nan' (from NaN values)
-    df['rsync_options'] = df['rsync_options'].replace('nan', '')
-    df['log_file'] = df['log_file'].replace('nan', '')
-    df['destination_port'] = df['destination_port'].replace('nan', '')
-    df['source_port'] = df['source_port'].replace('nan', '')
-    df['flock_file'] = df['flock_file'].replace('nan', '')
-    df['frequency'] = df['frequency'].replace('nan', '')
-    df['io_nice'] = df['io_nice'].replace('nan', '')
-    df['identifiers'] = df['identifiers'].replace('nan', '')
-    
-    # Clean up destination_port - remove .0 if it's a whole number
-    df['destination_port'] = df['destination_port'].str.replace(
-        r'\.0$', '', regex=True)
 
-    if (df['identifiers'] == '').any():
+def normalize_bool_text(value):
+    """Normalize common TSV boolean spellings to TRUE/FALSE strings."""
+    text = str(value).strip().upper() if value is not None else ''
+    if not text or text == 'NAN':
+        return 'FALSE'
+    if text in ('TRUE', 'T', 'YES', 'Y', '1'):
+        return 'TRUE'
+    if text in ('FALSE', 'F', 'NO', 'N', '0'):
+        return 'FALSE'
+    raise ValueError("Unsupported boolean value: {0}".format(value))
+
+
+def ensure_text_column(df, column_name, default=''):
+    """Ensure a normalized text column exists on a transfer table."""
+    if column_name not in df.columns:
+        df[column_name] = default
+    df[column_name] = [
+        clean_tsv_value(value, default=default)
+        for value in df[column_name]
+    ]
+
+
+def clean_tsv_value(value, default=''):
+    """Normalize an optional TSV value to stripped text."""
+    if value is None:
+        return default
+    text = str(value).strip()
+    if text == 'nan':
+        return default
+    return text
+
+
+def legacy_runtime_id(row):
+    """Return the legacy runtime identity derived from system and user columns."""
+    system = clean_tsv_value(row.get('system', ''))
+    user = clean_tsv_value(row.get('users', row.get('user', '')))
+    if system and user:
+        return "{0}.{1}".format(system, user)
+    return system or user
+
+
+def ensure_runtime_id_column(rows, columns):
+    """Ensure every row has a stored runtime_id identity."""
+    if 'runtime_id' not in columns:
+        insert_at = columns.index('identifiers') + 1 if 'identifiers' in columns else 0
+        columns.insert(insert_at, 'runtime_id')
+        for row in rows:
+            row['runtime_id'] = legacy_runtime_id(row)
+    else:
+        for row in rows:
+            row['runtime_id'] = clean_tsv_value(row.get('runtime_id', ''))
+
+
+def validate_runtime_ids(rows):
+    """Validate runtime_id values used for artifact grouping and filtering."""
+    missing = [
+        row.get('identifiers', '<unknown>')
+        for row in rows
+        if not clean_tsv_value(row.get('runtime_id', ''))
+    ]
+    if missing:
+        raise ValueError(
+            "runtime_id is required for all enabled transfers: {0}".format(
+                ', '.join(missing)
+            )
+        )
+
+    invalid = sorted({
+        row.get('runtime_id', '')
+        for row in rows
+        if sanitize_identifier(row.get('runtime_id', '')) != row.get('runtime_id', '')
+    })
+    if invalid:
+        raise ValueError(
+            "runtime_id values must be filename-safe: {0}".format(
+                ', '.join(invalid)
+            )
+        )
+
+
+def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None):
+    """Parse the transfers.tsv file and return normalized transfer records.
+
+    Args:
+        filename: Path to a transfers.tsv file.
+        require_runtime_files: When True, keep generator/runtime validation that
+            requires fields such as log_file. When False, parse only the shared
+            transfer metadata needed for reporting/analysis.
+        runtime_ids: Optional exact runtime_id values to include before runtime
+            path validation and artifact generation.
+    """
+    with open(filename, 'r', newline='') as handle:
+        reader = csv.DictReader(handle, delimiter='\t')
+        columns = list(reader.fieldnames or [])
+        rows = [
+            {
+                column: clean_tsv_value(row.get(column, ''))
+                for column in columns
+            }
+            for row in reader
+        ]
+
+    rows = [
+        row for row in rows
+        if not clean_tsv_value(row.get('runtime_id', '')).startswith('#')
+        and not clean_tsv_value(row.get('system', '')).startswith('#')
+    ]
+
+    if 'enabled' in columns:
+        rows = [
+            row for row in rows
+            if clean_tsv_value(row.get('enabled', '')).upper() == 'TRUE'
+        ]
+
+    if 'identifiers' not in columns:
+        columns.insert(0, 'identifiers')
+        for index, row in enumerate(rows, start=1):
+            row['identifiers'] = "transfer_{0:03d}".format(index)
+
+    ensure_runtime_id_column(rows, columns)
+    validate_runtime_ids(rows)
+
+    requested_runtime_ids = normalize_runtime_id_filters(runtime_ids)
+    if requested_runtime_ids:
+        available = set(row.get('runtime_id', '') for row in rows)
+        missing = sorted(set(requested_runtime_ids) - available)
+        if missing:
+            raise ValueError(
+                "runtime_id filter matched no transfer rows for: {0}".format(
+                    ', '.join(missing)
+                )
+            )
+        rows = [
+            row for row in rows
+            if row.get('runtime_id', '') in requested_runtime_ids
+        ]
+        if not rows:
+            raise ValueError("runtime_id filter produced no transfer rows")
+
+    text_columns = (
+        'runtime_id',
+        'rsync_options',
+        'log_file',
+        'flock_file',
+        'io_nice',
+        'frequency',
+        'flow_group',
+        'tags',
+        'destination_port',
+        'source_port',
+    )
+    for column in text_columns:
+        if column not in columns:
+            columns.append(column)
+        for row in rows:
+            row[column] = clean_tsv_value(row.get(column, ''))
+
+    for row in rows:
+        for field_name in ('source', 'destination'):
+            row[field_name] = expand_transfer_endpoint(
+                row.get(field_name, ''),
+                config.path_variables,
+                row.get('identifiers', ''),
+                field_name,
+            )
+        row['system_user'] = row.get('runtime_id', '')
+        row['tags'] = normalize_tags_text(row.get('tags', ''))
+        for bool_column in (
+            'is_entry_point',
+            'is_end_point',
+            'notify_on_success',
+            'notify_on_error',
+        ):
+            if bool_column not in columns:
+                columns.append(bool_column)
+            row[bool_column] = normalize_bool_text(row.get(bool_column, 'FALSE'))
+        row['destination_port'] = re.sub(r'\.0$', '', row.get('destination_port', ''))
+
+    if 'system_user' not in columns:
+        columns.append('system_user')
+
+    identifiers = [row.get('identifiers', '') for row in rows]
+    if any(identifier == '' for identifier in identifiers):
         raise ValueError("identifiers is required for all enabled transfers")
-    if (df['log_file'] == '').any():
+    if require_runtime_files and any(row.get('log_file', '') == '' for row in rows):
         raise ValueError("log_file is required for all enabled transfers")
 
-    sanitized_identifiers = df['identifiers'].apply(sanitize_identifier)
-    if (sanitized_identifiers == '').any():
+    sanitized_identifiers = [sanitize_identifier(identifier) for identifier in identifiers]
+    if any(identifier == '' for identifier in sanitized_identifiers):
         raise ValueError("identifiers must contain at least one filename-safe character")
-    if sanitized_identifiers.duplicated().any():
-        duplicates = sorted(df.loc[sanitized_identifiers.duplicated(keep=False), 'identifiers'].unique())
+    duplicate_sanitized = {
+        identifier for identifier in sanitized_identifiers
+        if sanitized_identifiers.count(identifier) > 1
+    }
+    if duplicate_sanitized:
+        duplicates = sorted({
+            row.get('identifiers', '')
+            for row, sanitized in zip(rows, sanitized_identifiers)
+            if sanitized in duplicate_sanitized
+        })
         raise ValueError(
             "identifiers must be unique after filename sanitization: {0}".format(
                 ', '.join(duplicates)
             )
         )
 
+    for row, sanitized in zip(rows, sanitized_identifiers):
+        row['script_name'] = "{0}.sh".format(prefixed_artifact_stem(sanitized))
+    if 'script_name' not in columns:
+        columns.append('script_name')
+
+    df = TransferTable(rows, columns=columns)
     validate_transfer_endpoints(df)
-    df['script_name'] = sanitized_identifiers + '.sh'
+    validate_flow_metadata(df)
     df = resolve_transfer_file_paths(df)
     df.attrs['shared_file_pair_warnings'] = audit_shared_file_pairs(df)
     
     return df
+
+
+def normalize_runtime_id_filters(runtime_ids):
+    """Normalize CLI-provided runtime_id filters."""
+    if not runtime_ids:
+        return []
+    normalized = []
+    for runtime_id in runtime_ids:
+        value = clean_tsv_value(runtime_id)
+        if value:
+            normalized.append(value)
+    return normalized
+
+
+def filter_transfers_by_runtime_ids(transfers_df, runtime_ids):
+    """Return only transfers matching exact runtime_id values."""
+    requested = normalize_runtime_id_filters(runtime_ids)
+    if not requested:
+        return transfers_df.copy()
+
+    available = set(str(value) for value in transfers_df['runtime_id'].dropna())
+    missing = sorted(set(requested) - available)
+    if missing:
+        raise ValueError(
+            "runtime_id filter matched no transfer rows for: {0}".format(
+                ', '.join(missing)
+            )
+        )
+
+    filtered = transfers_df[transfers_df['runtime_id'].isin(requested)].copy()
+    if filtered.empty:
+        raise ValueError("runtime_id filter produced no transfer rows")
+    return filtered
 
 
 def normalize_source_path(source):
@@ -126,6 +307,12 @@ def normalize_io_nice(io_nice):
     return "ionice {0}".format(value)
 
 
+def transfer_uses_portable_metadata(transfer):
+    """Return True when a transfer participates in portable run tracking."""
+    flow_group = str(transfer.get('flow_group', '') or '').strip()
+    return bool(flow_group and flow_group != 'nan')
+
+
 def sanitize_identifier(identifier):
     """Convert a transfer identifier into a safe shell script file name stem."""
     value = str(identifier).strip() if identifier is not None else ''
@@ -133,6 +320,82 @@ def sanitize_identifier(identifier):
         return ''
     value = re.sub(r'[^A-Za-z0-9._-]+', '_', value)
     return value.strip('._-')
+
+
+def configured_artifact_prefix():
+    """Return the sanitized configured generated-artifact prefix."""
+    return sanitize_identifier(config.artifact_prefix)
+
+
+def prefixed_artifact_stem(stem):
+    """Apply the configured artifact prefix to a filename stem."""
+    prefix = configured_artifact_prefix()
+    if not prefix:
+        return stem
+    return "{0}__{1}".format(prefix, stem)
+
+
+def current_artifact_owner_id():
+    """Return the configured artifact owner marker for shared output cleanup."""
+    return str(config.artifact_owner_id or '').strip()
+
+
+def add_owner_marker(content):
+    """Insert the generated-artifact owner marker into file content."""
+    owner_id = current_artifact_owner_id()
+    if not owner_id:
+        return content
+
+    marker = "{0} {1}\n".format(OWNER_MARKER_PREFIX, owner_id)
+    lines = content.splitlines(True)
+    if lines and lines[0].startswith('#!'):
+        return ''.join([lines[0], marker] + lines[1:])
+    return marker + content
+
+
+def file_has_current_owner_marker(path):
+    """Return True when a generated file belongs to the current owner context."""
+    owner_id = current_artifact_owner_id()
+    if not owner_id:
+        return True
+    try:
+        with open(path, 'r') as handle:
+            for _ in range(8):
+                line = handle.readline()
+                if not line:
+                    break
+                if line.strip() == "{0} {1}".format(OWNER_MARKER_PREFIX, owner_id):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def package_root():
+    """Return the package root directory for bundled templates."""
+    return os.path.dirname(__file__)
+
+
+def bundled_template_path(template_name):
+    """Return the absolute path to a bundled shell template."""
+    return os.path.join(package_root(), 'templates', template_name)
+
+
+def load_bundled_template(template_name):
+    """Read a bundled text template from the package."""
+    with open(bundled_template_path(template_name), 'r') as handle:
+        return handle.read()
+
+
+def list_visible_directories(path):
+    """List visible subdirectories under a local path."""
+    if not os.path.isdir(path):
+        return []
+    return sorted(
+        name for name in os.listdir(path)
+        if not name.startswith('.')
+        and os.path.isdir(os.path.join(path, name))
+    )
 
 
 def split_remote_path(path):
@@ -144,6 +407,68 @@ def split_remote_path(path):
     if not remote or not remote_path:
         return None, value
     return remote, remote_path
+
+
+def unresolved_path_variables(value):
+    """Return unresolved ${VAR} placeholders from a transfer path."""
+    return sorted(set(PATH_VARIABLE_PATTERN.findall(str(value or ''))))
+
+
+def expand_path_variables(text, variables, identifier, field_name):
+    """Expand ${VAR} placeholders using config-backed path variables."""
+    value = str(text).strip() if text is not None else ''
+    if not value or value == 'nan':
+        return value
+
+    missing = []
+
+    def replace(match):
+        name = match.group(1)
+        if name not in variables:
+            missing.append(name)
+            return match.group(0)
+        return str(variables[name])
+
+    expanded = PATH_VARIABLE_PATTERN.sub(replace, value)
+    remaining = unresolved_path_variables(expanded)
+    if missing or remaining:
+        unresolved = sorted(set(missing + remaining))
+        raise ValueError(
+            "Transfer '{0}' has unresolved variable(s) in {1}: {2}".format(
+                identifier,
+                field_name,
+                ', '.join(unresolved),
+            )
+        )
+    return expanded
+
+
+def expand_transfer_endpoint(endpoint, variables, identifier, field_name):
+    """Expand ${VAR} placeholders in a local or remote transfer endpoint."""
+    remote, path = split_remote_path(endpoint)
+    if remote:
+        return join_remote_path(
+            remote,
+            expand_path_variables(path, variables, identifier, field_name),
+        )
+    return expand_path_variables(endpoint, variables, identifier, field_name)
+
+
+def expand_transfer_endpoint_variables(df):
+    """Expand config-backed ${VAR} placeholders in transfer endpoints."""
+    df = df.copy()
+    variables = config.path_variables
+    for field_name in ('source', 'destination'):
+        df[field_name] = [
+            expand_transfer_endpoint(
+                row.get(field_name, ''),
+                variables,
+                row.get('identifiers', ''),
+                field_name,
+            )
+            for _, row in df.iterrows()
+        ]
+    return df
 
 
 def validate_transfer_endpoints(df):
@@ -165,11 +490,48 @@ def validate_transfer_endpoints(df):
         raise ValueError("\n".join(errors))
 
 
+def validate_flow_metadata(df):
+    """Reject inconsistent flow/portable-metadata settings."""
+    errors = []
+    for _, row in df.iterrows():
+        identifier = row.get('identifiers', '')
+        uses_portable_metadata = transfer_uses_portable_metadata(row)
+        is_entry_point = row.get('is_entry_point', 'FALSE') == 'TRUE'
+        rsync_options = str(row.get('rsync_options', '') or '')
+
+        if not uses_portable_metadata:
+            if any(
+                row.get(column, 'FALSE') == 'TRUE'
+                for column in (
+                    'is_entry_point',
+                    'is_end_point',
+                )
+            ):
+                errors.append(
+                    "Transfer '{0}' sets flow boundary booleans but has no flow_group".format(
+                        identifier
+                    )
+                )
+            continue
+
+        if "--exclude='/.*'" in rsync_options or '--exclude="/.*"' in rsync_options:
+            errors.append(
+                "Transfer '{0}' uses flow_group='{1}' but rsync_options excludes hidden "
+                "root-level entries via --exclude='/.*'; portable .landing_zones metadata "
+                "would not transfer".format(identifier, row.get('flow_group', ''))
+            )
+
+    if errors:
+        raise ValueError("\n".join(errors))
+
+
 def audit_shared_file_pairs(df):
     """Return warnings for transfers that share the same log/flock pair."""
     warnings = []
     grouped = df.groupby(['log_file', 'flock_file'], dropna=False)
     for (log_file, flock_file), group_df in grouped:
+        if not str(log_file or '').strip() and not str(flock_file or '').strip():
+            continue
         identifiers = sorted(group_df['identifiers'].tolist())
         if len(identifiers) < 2:
             continue
@@ -193,6 +555,11 @@ def join_remote_path(remote, path):
 def shell_quote(value):
     """Shell-quote a string value."""
     return shlex.quote(str(value))
+
+
+def shell_assignment_value(value):
+    """Shell-quote a value for a generated variable assignment."""
+    return shlex.quote(str(value or ''))
 
 
 def shell_path(value):
@@ -263,41 +630,41 @@ def build_staging_paths(destination, identifier):
 
 def build_promote_command(destination_dir, staging_dir, remote=None, port=''):
     """Move staged content into the final destination."""
-    move_cmd = (
-        "find {0} -mindepth 1 -maxdepth 1 ! -name '.staging' -exec mv {{}} {1}/ \\;".format(
-            shell_quote(staging_dir),
+    staging_root = os.path.dirname(staging_dir)
+    full_cmd = (
+        "if [ -d {0} ]; then "
+        "find {1} -mindepth 1 -maxdepth 1 ! -name '.staging' -exec mv {{}} {0}/ \\; && "
+        "rmdir {1}; "
+        "else "
+        "mv {1} {0}; "
+        "fi && "
+        "rmdir {2} 2>/dev/null || true".format(
             shell_quote(destination_dir),
-        )
-    )
-    cleanup_cmd = (
-        "{{ rmdir {0} 2>/dev/null || true; }} && "
-        "{{ rmdir {1} 2>/dev/null || true; }}".format(
             shell_quote(staging_dir),
-            shell_quote(os.path.dirname(staging_dir)),
+            shell_quote(staging_root),
         )
     )
-    full_cmd = "{0} && {1}".format(move_cmd, cleanup_cmd)
     if remote:
         ssh_cmd = build_ssh_command(remote, port)
-        return '{0} "{1}"'.format(ssh_cmd, full_cmd)
+        return '{0} "set -eu; {1}"'.format(ssh_cmd, full_cmd)
     return full_cmd
 
 
 def resolve_transfer_file_paths(df):
     """Resolve per-system log and flock file names into full paths."""
     df = df.copy()
-    df['log_file'] = df.apply(
-        lambda row: config.resolve_managed_file_path(
+    df['log_file'] = [
+        config.resolve_managed_file_path(
             row['system'], row['log_file'], 'log'
-        ),
-        axis=1
-    )
-    df['flock_file'] = df.apply(
-        lambda row: config.resolve_managed_file_path(
+        )
+        for _, row in df.iterrows()
+    ]
+    df['flock_file'] = [
+        config.resolve_managed_file_path(
             row['system'], row['flock_file'], 'flock'
-        ),
-        axis=1
-    )
+        )
+        for _, row in df.iterrows()
+    ]
     return df
 
 
@@ -312,6 +679,28 @@ def get_common_status_lock_file(system):
     """Return the shared per-system lock path used for TSV appends."""
     safe_system = sanitize_identifier(system) or 'system'
     filename = "Landing_Zone_{0}.transfers.lock".format(safe_system)
+    return config.resolve_managed_file_path(system, filename, 'flock')
+
+
+def get_notification_status_log_file(system):
+    """Return the shared per-system TSV notification delivery log path."""
+    notification_config = config.notifications
+    configured_file = notification_config.get('status_file', '')
+    if configured_file:
+        return config.resolve_managed_file_path(system, configured_file, 'log')
+    safe_system = sanitize_identifier(system) or 'system'
+    filename = "Landing_Zone_{0}.notifications.tsv".format(safe_system)
+    return config.resolve_managed_file_path(system, filename, 'log')
+
+
+def get_notification_status_lock_file(system):
+    """Return the shared per-system notification delivery log lock path."""
+    notification_config = config.notifications
+    configured_file = notification_config.get('status_lock_file', '')
+    if configured_file:
+        return config.resolve_managed_file_path(system, configured_file, 'flock')
+    safe_system = sanitize_identifier(system) or 'system'
+    filename = "Landing_Zone_{0}.notifications.lock".format(safe_system)
     return config.resolve_managed_file_path(system, filename, 'flock')
 
 
@@ -493,6 +882,9 @@ def build_transfer_commands(transfer):
     flock_command = config.get_flock_path(transfer['system'])
     common_status_log_file = get_common_status_log_file(transfer['system'])
     common_status_lock_file = get_common_status_lock_file(transfer['system'])
+    notification_config = config.notifications
+    notification_status_log_file = get_notification_status_log_file(transfer['system'])
+    notification_status_lock_file = get_notification_status_lock_file(transfer['system'])
 
     return {
         'prepare_cmd': prepare_cmd,
@@ -506,6 +898,13 @@ def build_transfer_commands(transfer):
         'flock_command': flock_command,
         'common_status_log_file': common_status_log_file,
         'common_status_lock_file': common_status_lock_file,
+        'notification_api_endpoint': notification_config.get('endpoint', ''),
+        'notification_token_env': notification_config.get('token_env', ''),
+        'notification_title': notification_config.get('title', ''),
+        'notification_body': notification_config.get('body', ''),
+        'notification_timeout_seconds': notification_config.get('timeout_seconds', '5'),
+        'notification_status_log_file': notification_status_log_file,
+        'notification_status_lock_file': notification_status_lock_file,
     }
 
 
@@ -567,8 +966,10 @@ def generate_iterative_script_content(transfer):
 
     io_nice_cmd = normalize_io_nice(transfer.get('io_nice', ''))
     rsync_cmd = "rsync {0}".format(base_options)
+    dry_run_rsync_cmd = "rsync --dry-run {0}".format(base_options)
     if io_nice_cmd:
         rsync_cmd = "{0} {1}".format(io_nice_cmd, rsync_cmd)
+        dry_run_rsync_cmd = "{0} {1}".format(io_nice_cmd, dry_run_rsync_cmd)
 
     if source_remote:
         remote_find_cmd = (
@@ -582,12 +983,24 @@ def generate_iterative_script_content(transfer):
             build_remote_shell_command(remote_find_cmd, source_remote, source_port),
         )
         rsync_source = '"{0}:$source_dir/"'.format(source_remote)
+        source_cleanup_preflight_cmd = (
+            'remote_ssh "$source_remote_target" "$source_remote_port" sh -c '
+            '\'find "$1" -type d -print | while IFS= read -r dir_path; do '
+            '[ -w "$dir_path" ] && [ -x "$dir_path" ] || printf "%s\\n" "$dir_path"; '
+            'done\' '
+            'sh "$source_dir"'
+        )
     else:
         source_loop = (
             'find {0} -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | '
             'while IFS= read -r source_dir; do'
         ).format(shell_path(source_root))
         rsync_source = '"$source_dir/"'
+        source_cleanup_preflight_cmd = (
+            'find "$source_dir" -type d -print | while IFS= read -r dir_path; do '
+            '[ -w "$dir_path" ] && [ -x "$dir_path" ] || printf "%s\\n" "$dir_path"; '
+            'done'
+        )
 
     remote_destination_setup = ''
     runtime_destination_root = destination_root
@@ -609,9 +1022,9 @@ def generate_iterative_script_content(transfer):
             "{0}/.staging/$dir_name".format(escaped_destination_root),
         )
         promote_cmd = (
-            '{0} "if [ -d \\"{1}/$dir_name\\" ]; then '
+            '{0} "set -eu; if [ -d \\"{1}/$dir_name\\" ]; then '
             'find \\"{1}/.staging/$dir_name\\" -mindepth 1 -maxdepth 1 ! -name \\".staging\\" -exec mv {{}} \\"{1}/$dir_name/\\" \\; && '
-            'rmdir \\"{1}/.staging/$dir_name\\" 2>/dev/null || true; '
+            'rmdir \\"{1}/.staging/$dir_name\\"; '
             'else '
             'mv \\"{1}/.staging/$dir_name\\" \\"{1}/$dir_name\\"; '
             'fi; '
@@ -624,18 +1037,29 @@ def generate_iterative_script_content(transfer):
             destination_remote,
             escaped_destination_root,
         )
+        cleanup_staging_cmd = (
+            '{0} "rmdir \\"{1}/.staging/$dir_name\\" 2>/dev/null || true; '
+            'rmdir \\"{1}/.staging\\" 2>/dev/null || true"'
+        ).format(
+            build_ssh_command(destination_remote, destination_port),
+            escaped_destination_root,
+        )
     else:
         mkdir_cmd = 'mkdir -p "{0}/.staging/$dir_name"'.format(destination_root)
         promote_cmd = (
             'if [ -d "{0}/$dir_name" ]; then '
             'find "{0}/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {{}} "{0}/$dir_name"/ \\; && '
-            'rmdir "{0}/.staging/$dir_name" 2>/dev/null || true; '
+            'rmdir "{0}/.staging/$dir_name"; '
             'else '
             'mv "{0}/.staging/$dir_name" "{0}/$dir_name"; '
             'fi; '
             'rmdir "{0}/.staging" 2>/dev/null || true'
         ).format(destination_root)
         rsync_destination = '"{0}/.staging/$dir_name/"'.format(destination_root)
+        cleanup_staging_cmd = (
+            'rmdir "{0}/.staging/$dir_name" 2>/dev/null || true; '
+            'rmdir "{0}/.staging" 2>/dev/null || true'
+        ).format(destination_root)
 
     if source_remote:
         run_source_expr = '"{0}:$source_dir"'.format(source_remote)
@@ -657,6 +1081,16 @@ def generate_iterative_script_content(transfer):
         run_destination_expr = '"{0}/$dir_name"'.format(destination_root)
         transfer_destination_label = destination_root
 
+    flow_group = str(transfer.get('flow_group', '') or '').strip()
+    transfer_tags = normalize_tags_text(transfer.get('tags', ''))
+    is_entry_point = str(transfer.get('is_entry_point', 'FALSE') or 'FALSE').strip().upper()
+    notify_on_success = str(transfer.get('notify_on_success', 'FALSE') or 'FALSE').strip().upper()
+    notify_on_error = str(transfer.get('notify_on_error', 'FALSE') or 'FALSE').strip().upper()
+    portable_metadata_enabled = '1' if transfer_uses_portable_metadata(transfer) else '0'
+    source_remote_target = source_remote or ''
+    destination_remote_target = destination_remote or ''
+    destination_root_runtime = runtime_destination_root
+
     return """#!/bin/sh
 set -eu
 
@@ -666,17 +1100,46 @@ mini_log_file="{mini_log_file}"
 flock_file="{flock_file}"
 common_status_log_file="{common_status_log_file}"
 common_status_lock_file="{common_status_lock_file}"
+notification_api_endpoint={notification_api_endpoint}
+notification_token_env={notification_token_env}
+notification_title={notification_title}
+notification_body={notification_body}
+notification_timeout_seconds={notification_timeout_seconds}
+notification_status_log_file="{notification_status_log_file}"
+notification_status_lock_file="{notification_status_lock_file}"
 transfer_identifier="{transfer_identifier}"
+transfer_system="{transfer_system}"
+flow_group="{flow_group}"
+transfer_tags="{transfer_tags}"
+portable_metadata_enabled="{portable_metadata_enabled}"
+is_entry_point="{is_entry_point}"
+notify_on_success="{notify_on_success}"
+notify_on_error="{notify_on_error}"
+source_remote_target="{source_remote_target}"
+source_remote_port="{source_remote_port}"
+destination_remote_target="{destination_remote_target}"
+destination_remote_port="{destination_remote_port}"
+destination_root_runtime="{destination_root_runtime}"
+portable_metadata_dir_name=".landing_zones"
+portable_metadata_file_name="landingzone-run-metadata.tsv"
+portable_events_file_name="landingzone-transfer-events.tsv"
 run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.rsync.XXXXXX")"
 cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.cleanup.XXXXXX")"
 promote_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.promote.XXXXXX")"
+preflight_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.preflight.XXXXXX")"
+preflight_stderr_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.preflight-stderr.XXXXXX")"
 current_run=""
+current_run_id=""
+current_run_name=""
+current_origin_system=""
+current_entry_transfer_identifier=""
+current_created_at_utc=""
 current_run_source=""
 current_run_destination=""
 current_run_completed=0
 
 cleanup() {{
-    rm -f "$run_log" "$cleanup_log" "$promote_log"
+    rm -f "$run_log" "$cleanup_log" "$promote_log" "$preflight_log" "$preflight_stderr_log"
 }}
 debug_enabled() {{
     [ -t 1 ] || [ "${{LZ_DEBUG_CLI:-0}}" = "1" ]
@@ -690,26 +1153,443 @@ sanitize_tsv_field() {{
     printf '%s' "$1" | tr '\\t\\r\\n' '   '
 }}
 
+portable_metadata_dir_for_run() {{
+    printf '%s/%s' "$1" "$portable_metadata_dir_name"
+}}
+
+portable_metadata_file_for_run() {{
+    printf '%s/%s' "$(portable_metadata_dir_for_run "$1")" "$portable_metadata_file_name"
+}}
+
+portable_events_file_for_run() {{
+    printf '%s/%s' "$(portable_metadata_dir_for_run "$1")" "$portable_events_file_name"
+}}
+
+remote_ssh() {{
+    remote_target="$1"
+    remote_port="$2"
+    shift 2
+    remote_command=""
+    for remote_arg in "$@"; do
+        quoted_remote_arg=$(printf '%s' "$remote_arg" | sed "s/'/'\\\\''/g")
+        if [ -n "$remote_command" ]; then
+            remote_command="$remote_command "
+        fi
+        remote_command="${{remote_command}}'${{quoted_remote_arg}}'"
+    done
+    if [ -n "$remote_port" ]; then
+        ssh -p "$remote_port" "$remote_target" "$remote_command"
+    else
+        ssh "$remote_target" "$remote_command"
+    fi
+}}
+
+ensure_portable_events_file_local() {{
+    metadata_dir="$1"
+    events_file="$2"
+    mkdir -p "$metadata_dir"
+    if [ ! -s "$events_file" ]; then
+        printf 'event_time_utc\\trun_id\\tflow_group\\ttransfer_identifier\\tsystem\\tstatus\\tsource_path\\tdestination_path\\tmessage\\n' >> "$events_file"
+    fi
+}}
+
+ensure_portable_events_file_remote() {{
+    remote_target="$1"
+    remote_port="$2"
+    metadata_dir="$3"
+    events_file="$4"
+    remote_ssh "$remote_target" "$remote_port" mkdir -p "$metadata_dir"
+    remote_ssh "$remote_target" "$remote_port" sh -c '
+        if [ ! -s "$1" ]; then
+            printf "%s\\n" "$2" >> "$1"
+        fi
+    ' sh "$events_file" 'event_time_utc	run_id	flow_group	transfer_identifier	system	status	source_path	destination_path	message'
+}}
+
+read_run_id_local() {{
+    metadata_file="$1"
+    awk -F '\\t' '$1 == "run_id" {{ print $2; exit }}' "$metadata_file"
+}}
+
+read_metadata_field_local() {{
+    metadata_file="$1"
+    field_name="$2"
+    grep "^$field_name" "$metadata_file" | head -n 1 | cut -f2-
+}}
+
+read_run_id_remote() {{
+    remote_target="$1"
+    remote_port="$2"
+    metadata_file="$3"
+    remote_ssh "$remote_target" "$remote_port" sh -c '
+        grep "^run_id" "$1" | head -n 1 | cut -f2-
+    ' sh "$metadata_file"
+}}
+
+read_metadata_field_remote() {{
+    remote_target="$1"
+    remote_port="$2"
+    metadata_file="$3"
+    field_name="$4"
+    remote_ssh "$remote_target" "$remote_port" sh -c '
+        grep "^$2" "$1" | head -n 1 | cut -f2-
+    ' sh "$metadata_file" "$field_name"
+}}
+
+write_run_metadata_local() {{
+    run_dir="$1"
+    metadata_dir="$(portable_metadata_dir_for_run "$run_dir")"
+    metadata_file="$(portable_metadata_file_for_run "$run_dir")"
+    created_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    mkdir -p "$metadata_dir"
+    {{
+        printf 'schema_version\\t1\\n'
+        printf 'run_id\\t%s\\n' "$(sanitize_tsv_field "$current_run_id")"
+        printf 'run_name\\t%s\\n' "$(sanitize_tsv_field "$current_run")"
+        printf 'flow_group\\t%s\\n' "$(sanitize_tsv_field "$flow_group")"
+        printf 'origin_system\\t%s\\n' "$(sanitize_tsv_field "$transfer_system")"
+        printf 'entry_transfer_identifier\\t%s\\n' "$(sanitize_tsv_field "$transfer_identifier")"
+        printf 'created_at_utc\\t%s\\n' "$(sanitize_tsv_field "$created_at_utc")"
+    }} > "$metadata_file"
+    ensure_portable_events_file_local "$metadata_dir" "$(portable_events_file_for_run "$run_dir")"
+}}
+
+write_run_metadata_remote() {{
+    remote_target="$1"
+    remote_port="$2"
+    run_dir="$3"
+    metadata_dir="$(portable_metadata_dir_for_run "$run_dir")"
+    metadata_file="$(portable_metadata_file_for_run "$run_dir")"
+    created_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    remote_ssh "$remote_target" "$remote_port" mkdir -p "$metadata_dir"
+    remote_ssh "$remote_target" "$remote_port" sh -c '
+        printf "%s\\n" "$2" "$3" "$4" "$5" "$6" "$7" "$8" > "$1"
+    ' sh "$metadata_file" \
+        'schema_version	1' \
+        "run_id	$(sanitize_tsv_field "$current_run_id")" \
+        "run_name	$(sanitize_tsv_field "$current_run")" \
+        "flow_group	$(sanitize_tsv_field "$flow_group")" \
+        "origin_system	$(sanitize_tsv_field "$transfer_system")" \
+        "entry_transfer_identifier	$(sanitize_tsv_field "$transfer_identifier")" \
+        "created_at_utc	$(sanitize_tsv_field "$created_at_utc")"
+    ensure_portable_events_file_remote "$remote_target" "$remote_port" "$metadata_dir" "$(portable_events_file_for_run "$run_dir")"
+}}
+
+append_portable_event_local() {{
+    run_dir="$1"
+    event_status="$2"
+    event_message="${{3:-}}"
+    metadata_dir="$(portable_metadata_dir_for_run "$run_dir")"
+    events_file="$(portable_events_file_for_run "$run_dir")"
+    event_time_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    ensure_portable_events_file_local "$metadata_dir" "$events_file"
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
+        "$(sanitize_tsv_field "$event_time_utc")" \
+        "$(sanitize_tsv_field "$current_run_id")" \
+        "$(sanitize_tsv_field "$flow_group")" \
+        "$(sanitize_tsv_field "$transfer_identifier")" \
+        "$(sanitize_tsv_field "$transfer_system")" \
+        "$(sanitize_tsv_field "$event_status")" \
+        "$(sanitize_tsv_field "$current_run_source")" \
+        "$(sanitize_tsv_field "$current_run_destination")" \
+        "$(sanitize_tsv_field "$event_message")" >> "$events_file"
+}}
+
+append_portable_event_remote() {{
+    remote_target="$1"
+    remote_port="$2"
+    run_dir="$3"
+    event_status="$4"
+    event_message="${{5:-}}"
+    metadata_dir="$(portable_metadata_dir_for_run "$run_dir")"
+    events_file="$(portable_events_file_for_run "$run_dir")"
+    event_time_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    ensure_portable_events_file_remote "$remote_target" "$remote_port" "$metadata_dir" "$events_file"
+    remote_ssh "$remote_target" "$remote_port" sh -c '
+        printf "%s\\n" "$2" >> "$1"
+    ' sh "$events_file" \
+        "$(sanitize_tsv_field "$event_time_utc")	$(sanitize_tsv_field "$current_run_id")	$(sanitize_tsv_field "$flow_group")	$(sanitize_tsv_field "$transfer_identifier")	$(sanitize_tsv_field "$transfer_system")	$(sanitize_tsv_field "$event_status")	$(sanitize_tsv_field "$current_run_source")	$(sanitize_tsv_field "$current_run_destination")	$(sanitize_tsv_field "$event_message")"
+}}
+
+source_metadata_exists() {{
+    if [ -n "$source_remote_target" ]; then
+        remote_ssh "$source_remote_target" "$source_remote_port" sh -c '[ -f "$1" ]' sh "$(portable_metadata_file_for_run "$source_dir")"
+    else
+        [ -f "$(portable_metadata_file_for_run "$source_dir")" ]
+    fi
+}}
+
+ensure_source_run_bundle() {{
+    if [ "$portable_metadata_enabled" != "1" ]; then
+        current_run_id=""
+        current_run_name="$current_run"
+        current_origin_system=""
+        current_entry_transfer_identifier=""
+        current_created_at_utc=""
+        return 0
+    fi
+
+    if source_metadata_exists; then
+        if [ -n "$source_remote_target" ]; then
+            current_run_id="$(read_run_id_remote "$source_remote_target" "$source_remote_port" "$(portable_metadata_file_for_run "$source_dir")")"
+            current_run_name="$(read_metadata_field_remote "$source_remote_target" "$source_remote_port" "$(portable_metadata_file_for_run "$source_dir")" "run_name")"
+            current_origin_system="$(read_metadata_field_remote "$source_remote_target" "$source_remote_port" "$(portable_metadata_file_for_run "$source_dir")" "origin_system")"
+            current_entry_transfer_identifier="$(read_metadata_field_remote "$source_remote_target" "$source_remote_port" "$(portable_metadata_file_for_run "$source_dir")" "entry_transfer_identifier")"
+            current_created_at_utc="$(read_metadata_field_remote "$source_remote_target" "$source_remote_port" "$(portable_metadata_file_for_run "$source_dir")" "created_at_utc")"
+        else
+            current_run_id="$(read_run_id_local "$(portable_metadata_file_for_run "$source_dir")")"
+            current_run_name="$(read_metadata_field_local "$(portable_metadata_file_for_run "$source_dir")" "run_name")"
+            current_origin_system="$(read_metadata_field_local "$(portable_metadata_file_for_run "$source_dir")" "origin_system")"
+            current_entry_transfer_identifier="$(read_metadata_field_local "$(portable_metadata_file_for_run "$source_dir")" "entry_transfer_identifier")"
+            current_created_at_utc="$(read_metadata_field_local "$(portable_metadata_file_for_run "$source_dir")" "created_at_utc")"
+        fi
+        [ -n "$current_run_name" ] || current_run_name="$current_run"
+        if [ -z "$current_run_id" ]; then
+            log_status "$dir_name metadata missing run_id"
+            append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination"
+            debug "$dir_name metadata missing run_id"
+            return 1
+        fi
+        return 0
+    fi
+
+    if [ "$is_entry_point" != "TRUE" ]; then
+        log_status "$dir_name missing portable metadata"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination"
+        debug "$dir_name missing portable metadata"
+        return 1
+    fi
+
+    if ! command -v uuidgen >/dev/null 2>&1; then
+        log_status "$dir_name missing uuidgen"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination"
+        debug "$dir_name missing uuidgen"
+        return 1
+    fi
+
+    current_run_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+    current_run_name="$current_run"
+    current_origin_system="$transfer_system"
+    current_entry_transfer_identifier="$transfer_identifier"
+    current_created_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    if [ -n "$source_remote_target" ]; then
+        write_run_metadata_remote "$source_remote_target" "$source_remote_port" "$source_dir"
+    else
+        write_run_metadata_local "$source_dir"
+    fi
+}}
+
+append_source_portable_event() {{
+    event_status="$1"
+    event_message="${{2:-}}"
+    [ "$portable_metadata_enabled" = "1" ] || return 0
+    [ -n "$current_run_id" ] || return 0
+    if [ -n "$source_remote_target" ]; then
+        append_portable_event_remote "$source_remote_target" "$source_remote_port" "$source_dir" "$event_status" "$event_message"
+    else
+        append_portable_event_local "$source_dir" "$event_status" "$event_message"
+    fi
+}}
+
+destination_run_exists() {{
+    destination_run_dir="$destination_root_runtime/$dir_name"
+    if [ -n "$destination_remote_target" ]; then
+        remote_ssh "$destination_remote_target" "$destination_remote_port" sh -c '[ -d "$1" ]' sh "$destination_run_dir"
+    else
+        [ -d "$destination_run_dir" ]
+    fi
+}}
+
+append_destination_portable_event() {{
+    event_status="$1"
+    event_message="${{2:-}}"
+    destination_run_dir="$destination_root_runtime/$dir_name"
+    [ "$portable_metadata_enabled" = "1" ] || return 0
+    [ -n "$current_run_id" ] || return 0
+    destination_run_exists || return 0
+    if [ -n "$destination_remote_target" ]; then
+        append_portable_event_remote "$destination_remote_target" "$destination_remote_port" "$destination_run_dir" "$event_status" "$event_message"
+    else
+        append_portable_event_local "$destination_run_dir" "$event_status" "$event_message"
+    fi
+}}
+
+append_best_effort_portable_error() {{
+    event_message="${{1:-script_error}}"
+    [ "$portable_metadata_enabled" = "1" ] || return 0
+    [ -n "$current_run_id" ] || return 0
+    if source_metadata_exists; then
+        append_source_portable_event "error" "$event_message"
+        return 0
+    fi
+    append_destination_portable_event "error" "$event_message"
+}}
+
+notification_enabled_for_status() {{
+    event_status="$1"
+    if [ "$event_status" = "completed" ] && [ "$notify_on_success" = "TRUE" ]; then
+        return 0
+    fi
+    if [ "$event_status" = "error" ] && [ "$notify_on_error" = "TRUE" ]; then
+        return 0
+    fi
+    return 1
+}}
+
+notification_token_value() {{
+    if [ -z "$notification_token_env" ]; then
+        return 0
+    fi
+    env | awk -F= -v name="$notification_token_env" '$1 == name {{ print substr($0, length(name) + 2); exit }}'
+}}
+
+json_escape() {{
+    printf '%s' "$1" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g; s/	/\\\\t/g' | tr '\\r\\n' '  '
+}}
+
+build_notification_payload() {{
+    event_status="$1"
+    event_directory="$2"
+    event_source="$3"
+    event_destination="$4"
+    event_message="$5"
+    idempotency_key="$6"
+    printf '{{"title":"%s","body":"%s","idempotency_key":"%s","transfer_identifier":"%s","system":"%s","run_id":"%s","run_name":"%s","flow_group":"%s","tags":"%s","directory":"%s","source_path":"%s","destination_path":"%s","status":"%s","message":"%s"}}' \\
+        "$(json_escape "$notification_title")" \\
+        "$(json_escape "$notification_body")" \\
+        "$(json_escape "$idempotency_key")" \\
+        "$(json_escape "$transfer_identifier")" \\
+        "$(json_escape "$transfer_system")" \\
+        "$(json_escape "$current_run_id")" \\
+        "$(json_escape "$current_run_name")" \\
+        "$(json_escape "$flow_group")" \\
+        "$(json_escape "$transfer_tags")" \\
+        "$(json_escape "$event_directory")" \\
+        "$(json_escape "$event_source")" \\
+        "$(json_escape "$event_destination")" \\
+        "$(json_escape "$event_status")" \\
+        "$(json_escape "$event_message")"
+}}
+
+notification_already_sent() {{
+    idempotency_key="$1"
+    [ -s "$notification_status_log_file" ] || return 1
+    awk -F '\\t' -v key="$idempotency_key" '$3 == key && $14 == "sent" {{ found = 1 }} END {{ exit found ? 0 : 1 }}' "$notification_status_log_file"
+}}
+
+append_notification_status() {{
+    transfer_event_time_utc="$1"
+    notification_time_utc="$2"
+    idempotency_key="$3"
+    event_directory="$4"
+    event_source="$5"
+    event_destination="$6"
+    event_status="$7"
+    notification_status="$8"
+    http_status="$9"
+    attempt="${{10}}"
+    notification_message="${{11:-}}"
+    (
+        exec 7>>"$notification_status_lock_file"
+        {flock_command} 7
+        if [ ! -s "$notification_status_log_file" ]; then
+            printf 'event_time_utc\\tnotification_time_utc\\tidempotency_key\\ttransfer_identifier\\tsystem\\trun_id\\trun_name\\tflow_group\\ttags\\tdirectory\\tsource_path\\tdestination_path\\tstatus\\tnotification_status\\thttp_status\\tattempt\\ttitle\\tbody\\tmessage\\n' >> "$notification_status_log_file"
+        fi
+        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \\
+            "$(sanitize_tsv_field "$transfer_event_time_utc")" \\
+            "$(sanitize_tsv_field "$notification_time_utc")" \\
+            "$(sanitize_tsv_field "$idempotency_key")" \\
+            "$(sanitize_tsv_field "$transfer_identifier")" \\
+            "$(sanitize_tsv_field "$transfer_system")" \\
+            "$(sanitize_tsv_field "$current_run_id")" \\
+            "$(sanitize_tsv_field "$current_run_name")" \\
+            "$(sanitize_tsv_field "$flow_group")" \\
+            "$(sanitize_tsv_field "$transfer_tags")" \\
+            "$(sanitize_tsv_field "$event_directory")" \\
+            "$(sanitize_tsv_field "$event_source")" \\
+            "$(sanitize_tsv_field "$event_destination")" \\
+            "$(sanitize_tsv_field "$event_status")" \\
+            "$(sanitize_tsv_field "$notification_status")" \\
+            "$(sanitize_tsv_field "$http_status")" \\
+            "$(sanitize_tsv_field "$attempt")" \\
+            "$(sanitize_tsv_field "$notification_title")" \\
+            "$(sanitize_tsv_field "$notification_body")" \\
+            "$(sanitize_tsv_field "$notification_message")" >> "$notification_status_log_file"
+    ) || debug "unable to append notification status row"
+}}
+
+notify_transfer_event() {{
+    transfer_event_time_utc="$1"
+    event_status="$2"
+    event_directory="${{3:-}}"
+    event_source="${{4:-}}"
+    event_destination="${{5:-}}"
+    event_message="${{6:-}}"
+    notification_enabled_for_status "$event_status" || return 0
+    [ -n "$notification_api_endpoint" ] || return 0
+    [ -n "$notification_status_log_file" ] || return 0
+    idempotency_key="$(sanitize_tsv_field "${{current_run_id}}|${{transfer_identifier}}|${{event_status}}|${{event_directory}}|${{event_source}}|${{event_destination}}")"
+    notification_already_sent "$idempotency_key" && return 0
+    notification_time_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    curl_bin="${{LANDINGZONES_CURL:-curl}}"
+    if ! command -v "$curl_bin" >/dev/null 2>&1; then
+        append_notification_status "$transfer_event_time_utc" "$notification_time_utc" "$idempotency_key" "$event_directory" "$event_source" "$event_destination" "$event_status" "failed" "curl_missing" "1" "curl command not found"
+        return 0
+    fi
+    payload="$(build_notification_payload "$event_status" "$event_directory" "$event_source" "$event_destination" "$event_message" "$idempotency_key")"
+    token_value="$(notification_token_value)"
+    if [ -n "$token_value" ]; then
+        if http_status="$("$curl_bin" -sS -o /dev/null -w '%{{http_code}}' --max-time "$notification_timeout_seconds" -H 'Content-Type: application/json' -H "Authorization: Bearer $token_value" -H "Idempotency-Key: $idempotency_key" --data "$payload" "$notification_api_endpoint" 2>/dev/null)"; then
+            :
+        else
+            http_status="curl_error"
+        fi
+    else
+        if http_status="$("$curl_bin" -sS -o /dev/null -w '%{{http_code}}' --max-time "$notification_timeout_seconds" -H 'Content-Type: application/json' -H "Idempotency-Key: $idempotency_key" --data "$payload" "$notification_api_endpoint" 2>/dev/null)"; then
+            :
+        else
+            http_status="curl_error"
+        fi
+    fi
+    case "$http_status" in
+        2*) notification_status="sent" ;;
+        *) notification_status="failed" ;;
+    esac
+    append_notification_status "$transfer_event_time_utc" "$notification_time_utc" "$idempotency_key" "$event_directory" "$event_source" "$event_destination" "$event_status" "$notification_status" "$http_status" "1" ""
+    return 0
+}}
+
 append_common_status() {{
     event_status="$1"
     event_directory="${{2:-}}"
     event_source="${{3:-}}"
     event_destination="${{4:-}}"
-    event_timestamp="$(date '+%Y-%m-%d %H:%M:%S%z')"
+    event_message="${{5:-}}"
+    event_timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     (
         exec 8>>"$common_status_lock_file"
         {flock_command} 8
         if [ ! -s "$common_status_log_file" ]; then
-            printf 'datetime\\tidentifier\\tdirectory\\tsource\\tdestination\\tstatus\\n' >> "$common_status_log_file"
+            printf 'event_time_utc\\ttransfer_identifier\\tsystem\\trun_id\\trun_name\\tflow_group\\ttags\\torigin_system\\tentry_transfer_identifier\\tcreated_at_utc\\tdirectory\\tsource_path\\tdestination_path\\tstatus\\tmessage\\n' >> "$common_status_log_file"
         fi
-        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \\
+        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \\
             "$(sanitize_tsv_field "$event_timestamp")" \\
             "$(sanitize_tsv_field "$transfer_identifier")" \\
+            "$(sanitize_tsv_field "$transfer_system")" \\
+            "$(sanitize_tsv_field "$current_run_id")" \\
+            "$(sanitize_tsv_field "$current_run_name")" \\
+            "$(sanitize_tsv_field "$flow_group")" \\
+            "$(sanitize_tsv_field "$transfer_tags")" \\
+            "$(sanitize_tsv_field "$current_origin_system")" \\
+            "$(sanitize_tsv_field "$current_entry_transfer_identifier")" \\
+            "$(sanitize_tsv_field "$current_created_at_utc")" \\
             "$(sanitize_tsv_field "$event_directory")" \\
             "$(sanitize_tsv_field "$event_source")" \\
             "$(sanitize_tsv_field "$event_destination")" \\
-            "$(sanitize_tsv_field "$event_status")" >> "$common_status_log_file"
+            "$(sanitize_tsv_field "$event_status")" \\
+            "$(sanitize_tsv_field "$event_message")" >> "$common_status_log_file"
     ) || debug "unable to append common status row"
+    notify_transfer_event "$event_timestamp" "$event_status" "$event_directory" "$event_source" "$event_destination" "$event_message" || debug "notification delivery failed"
 }}
 
 debug() {{
@@ -727,10 +1607,32 @@ dump_debug_log() {{
     fi
 }}
 
+reset_current_run_context() {{
+    current_run=""
+    current_run_id=""
+    current_run_name=""
+    current_origin_system=""
+    current_entry_transfer_identifier=""
+    current_created_at_utc=""
+    current_run_source=""
+    current_run_destination=""
+    current_run_completed=0
+}}
+
+summarize_log() {{
+    path="$1"
+    if [ ! -s "$path" ]; then
+        printf 'see log'
+        return 0
+    fi
+    awk 'NF {{ gsub(/\\t/, " "); print; exit }}' "$path"
+}}
+
 on_exit() {{
     status=$?
     if [ "$status" -ne 0 ]; then
         if [ -n "$current_run" ] && [ "$current_run_completed" -eq 0 ]; then
+            append_best_effort_portable_error "script_error"
             log_status "$current_run error"
             append_common_status "error" "$current_run" "$current_run_source" "$current_run_destination"
         else
@@ -740,13 +1642,15 @@ on_exit() {{
         dump_debug_log "run log" "$run_log"
         dump_debug_log "promote log" "$promote_log"
         dump_debug_log "cleanup log" "$cleanup_log"
+        dump_debug_log "preflight log" "$preflight_log"
+        dump_debug_log "preflight stderr log" "$preflight_stderr_log"
     fi
     cleanup
     exit "$status"
 }}
 trap on_exit EXIT HUP INT TERM
 
-mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")" "$(dirname "$common_status_log_file")" "$(dirname "$common_status_lock_file")"
+mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")" "$(dirname "$common_status_log_file")" "$(dirname "$common_status_lock_file")" "$(dirname "$notification_status_log_file")" "$(dirname "$notification_status_lock_file")"
 debug "using lock file $flock_file"
 {remote_destination_setup}
 exec 9>"$flock_file"
@@ -771,26 +1675,85 @@ fi
     current_run="$dir_name"
     current_run_source={run_source_expr}
     current_run_destination={run_destination_expr}
+    current_run_id=""
+    current_run_name="$dir_name"
+    current_origin_system=""
+    current_entry_transfer_identifier=""
+    current_created_at_utc=""
     current_run_completed=0
+    ensure_source_run_bundle || continue
     log_status "$dir_name initiated"
+    append_source_portable_event "initiated"
     append_common_status "initiated" "$dir_name" "$current_run_source" "$current_run_destination"
     debug "$dir_name initiated"
+    : >"$preflight_log"
+    : >"$preflight_stderr_log"
+    if ! {source_cleanup_preflight_cmd} >"$preflight_log" 2>"$preflight_stderr_log"; then
+        preflight_message="source cleanup preflight command failed: $(summarize_log "$preflight_stderr_log")"
+        log_status "$dir_name error"
+        append_source_portable_event "error" "$preflight_message"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$preflight_message"
+        debug "$dir_name $preflight_message"
+        reset_current_run_context
+        continue
+    fi
+    if [ -s "$preflight_log" ]; then
+        preflight_message="source cleanup preflight failed: $(summarize_log "$preflight_log")"
+        log_status "$dir_name error"
+        append_source_portable_event "error" "$preflight_message"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$preflight_message"
+        debug "$dir_name $preflight_message"
+        reset_current_run_context
+        continue
+    fi
     {mkdir_cmd} </dev/null >>"$promote_log" 2>&1
-    {rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$run_log" 2>&1
-    {promote_cmd} </dev/null >>"$promote_log" 2>&1
+    if ! {dry_run_rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$preflight_log" 2>&1; then
+        preflight_message="rsync dry-run failed: $(summarize_log "$preflight_log")"
+        {cleanup_staging_cmd} </dev/null >>"$preflight_log" 2>&1
+        log_status "$dir_name error"
+        append_source_portable_event "error" "$preflight_message"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$preflight_message"
+        debug "$dir_name $preflight_message"
+        reset_current_run_context
+        continue
+    fi
+    : >"$preflight_log"
+    if ! {rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$run_log" 2>&1; then
+        rsync_message="rsync failed: $(summarize_log "$run_log")"
+        log_status "$dir_name error"
+        append_source_portable_event "error" "$rsync_message"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$rsync_message"
+        debug "$dir_name $rsync_message"
+        reset_current_run_context
+        continue
+    fi
+    if ! ( {promote_cmd} ) </dev/null >>"$promote_log" 2>&1; then
+        promote_message="staging promote failed: see promote log"
+        log_status "$dir_name error"
+        append_source_portable_event "error" "$promote_message"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$promote_message"
+        debug "$dir_name $promote_message"
+        reset_current_run_context
+        continue
+    fi
     log_status "$dir_name completed"
+    append_destination_portable_event "completed"
     append_common_status "completed" "$dir_name" "$current_run_source" "$current_run_destination"
     debug "$dir_name completed"
     current_run_completed=1
-    current_run=""
-    current_run_source=""
-    current_run_destination=""
+    reset_current_run_context
 done
 if [ -s "$run_log" ]; then
     cat "$run_log" >> "$log_file"
 fi
 if [ -s "$promote_log" ]; then
     cat "$promote_log" >> "$log_file"
+fi
+if [ -s "$preflight_log" ]; then
+    cat "$preflight_log" >> "$log_file"
+fi
+if [ -s "$preflight_stderr_log" ]; then
+    cat "$preflight_stderr_log" >> "$log_file"
 fi
 
 {find_cmd} >"$cleanup_log" 2>&1
@@ -803,18 +1766,45 @@ if sed '/^sending incremental file list$/d; /^sent .* bytes .*$/d; /^total size 
     if [ -s "$promote_log" ]; then
         cat "$promote_log" >> "$latest_log_file"
     fi
+    if [ -s "$preflight_log" ]; then
+        cat "$preflight_log" >> "$latest_log_file"
+    fi
+    if [ -s "$preflight_stderr_log" ]; then
+        cat "$preflight_stderr_log" >> "$latest_log_file"
+    fi
     if [ -s "$cleanup_log" ]; then
         cat "$cleanup_log" >> "$latest_log_file"
     fi
 fi
-""".format(
+    """.format(
         log_file=commands['log_file'],
         latest_log_file=commands['latest_log_file'],
         mini_log_file=commands['mini_log_file'],
         flock_file=commands['flock_file'],
         common_status_log_file=commands['common_status_log_file'],
         common_status_lock_file=commands['common_status_lock_file'],
+        notification_api_endpoint=shell_assignment_value(commands['notification_api_endpoint']),
+        notification_token_env=shell_assignment_value(commands['notification_token_env']),
+        notification_title=shell_assignment_value(commands['notification_title']),
+        notification_body=shell_assignment_value(commands['notification_body']),
+        notification_timeout_seconds=shell_assignment_value(commands['notification_timeout_seconds']),
+        notification_status_log_file=commands['notification_status_log_file'],
+        notification_status_lock_file=commands['notification_status_lock_file'],
         transfer_identifier=identifier.replace('"', '\\"'),
+        transfer_system=str(transfer.get('system', '') or '').replace('"', '\\"'),
+        flow_group=flow_group.replace('"', '\\"'),
+        transfer_tags=transfer_tags.replace('"', '\\"'),
+        portable_metadata_enabled=portable_metadata_enabled,
+        is_entry_point=is_entry_point,
+        notify_on_success=notify_on_success,
+        notify_on_error=notify_on_error,
+        source_remote_target=source_remote_target.replace('"', '\\"'),
+        source_remote_port=source_port.replace('"', '\\"'),
+        destination_remote_target=destination_remote_target.replace('"', '\\"'),
+        destination_remote_port=destination_port.replace('"', '\\"'),
+        destination_root_runtime=escape_local_shell_vars(
+            str(destination_root_runtime)
+        ).replace('"', '\\"'),
         script_stem=sanitize_identifier(identifier),
         flock_command=commands['flock_command'],
         source_exists_cmd=source_exists_cmd,
@@ -823,10 +1813,13 @@ fi
         run_source_expr=run_source_expr,
         run_destination_expr=run_destination_expr,
         mkdir_cmd=mkdir_cmd,
+        source_cleanup_preflight_cmd=source_cleanup_preflight_cmd,
+        dry_run_rsync_cmd=dry_run_rsync_cmd,
         rsync_cmd=rsync_cmd,
         rsync_source=rsync_source,
         rsync_destination=rsync_destination,
         promote_cmd=promote_cmd,
+        cleanup_staging_cmd=cleanup_staging_cmd,
         find_cmd=commands['find_cmd'],
         transfer_source_label=transfer_source_label.replace('"', '\\"'),
         transfer_destination_label=transfer_destination_label.replace('"', '\\"'),
@@ -854,6 +1847,227 @@ def get_deployed_script_path(system, script_name):
     return os.path.join(script_dir, script_name)
 
 
+def get_validation_fixture_container_candidates(source_path):
+    """Return likely fixture container directory names for a local entry path."""
+    candidates = []
+    absolute_source = os.path.abspath(normalize_source_path(source_path))
+    marker = "{0}tests{0}test_local{0}".format(os.sep)
+    if marker in absolute_source:
+        relative_tail = absolute_source.split(marker, 1)[1]
+        first_segment = relative_tail.split(os.sep, 1)[0]
+        if first_segment:
+            candidates.append(first_segment)
+
+    basename = os.path.basename(absolute_source.rstrip(os.sep))
+    if basename:
+        candidates.append(basename)
+
+    result = []
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        result.append(candidate)
+    return result
+
+
+def resolve_validation_fixture_dir(transfer):
+    """Resolve the default validation fixture directory for an entry-point transfer."""
+    toy_data_root = os.path.abspath(config.test_data)
+    candidate_roots = []
+    source = transfer.source if hasattr(transfer, 'source') else transfer['source']
+    for candidate in get_validation_fixture_container_candidates(source):
+        candidate_root = os.path.join(toy_data_root, candidate)
+        if os.path.isdir(candidate_root):
+            candidate_roots.append(candidate_root)
+    candidate_roots.append(toy_data_root)
+
+    for candidate_root in candidate_roots:
+        visible_dirs = list_visible_directories(candidate_root)
+        if visible_dirs:
+            return os.path.join(candidate_root, visible_dirs[0])
+        if os.path.isdir(candidate_root):
+            return candidate_root
+
+    return toy_data_root
+
+
+def validation_wrapper_script_name(flow_group):
+    """Return the generated shell wrapper filename for a flow group."""
+    sanitized_flow_group = sanitize_identifier(flow_group)
+    if not sanitized_flow_group:
+        raise ValueError(
+            "flow_group must contain at least one filename-safe character: {0}".format(
+                flow_group
+            )
+        )
+    return "{0}{1}.sh".format(
+        VALIDATION_WRAPPER_PREFIX,
+        prefixed_artifact_stem(sanitized_flow_group),
+    )
+
+
+def validation_wrapper_file_prefix():
+    """Return the filename prefix used by generated validation wrappers."""
+    prefix = configured_artifact_prefix()
+    if not prefix:
+        return VALIDATION_WRAPPER_PREFIX
+    return "{0}{1}__".format(VALIDATION_WRAPPER_PREFIX, prefix)
+
+
+def validation_helper_name():
+    """Return the generated validation helper filename."""
+    prefix = configured_artifact_prefix()
+    if not prefix:
+        return VALIDATION_HELPER_NAME
+    return "lz_run_validation_{0}.sh".format(prefix)
+
+
+def build_validation_wrapper_specs(transfers_df):
+    """Build per-flow-group validation wrapper definitions."""
+    if transfers_df is None or transfers_df.empty:
+        return []
+
+    flow_groups = {}
+    for transfer in definitions_from_dataframe(transfers_df):
+        flow_group = transfer.flow_group.strip()
+        if not flow_group or flow_group == 'nan':
+            continue
+        if not transfer.is_entry_point:
+            continue
+        flow_groups.setdefault(flow_group, []).append(transfer)
+
+    specs = []
+    script_names = set()
+    for flow_group, entries in sorted(flow_groups.items()):
+        if len(entries) != 1:
+            identifiers = ', '.join(sorted(entry.identifier for entry in entries))
+            raise ValueError(
+                "flow_group '{0}' must have exactly one entry-point transfer to generate "
+                "a validation wrapper; found {1}: {2}".format(
+                    flow_group, len(entries), identifiers
+                )
+            )
+        transfer = entries[0]
+        script_name = validation_wrapper_script_name(flow_group)
+        if script_name in script_names:
+            raise ValueError(
+                "validation wrapper script names must be unique after sanitization: {0}".format(
+                    script_name
+                )
+            )
+        script_names.add(script_name)
+        specs.append({
+            'script_name': script_name,
+            'flow_group': flow_group,
+            'entry_dir': os.path.abspath(normalize_source_path(transfer.source)),
+            'next_hop': transfer.destination.strip(),
+            'next_hop_port': transfer.destination_port.strip(),
+            'producer': transfer.system.strip(),
+            'fixture_dir': resolve_validation_fixture_dir(transfer),
+        })
+    return specs
+
+
+def generate_validation_wrapper_content(spec):
+    """Generate a self-contained flow-group wrapper around the shared helper."""
+    next_hop_default = spec['next_hop']
+    next_hop_port_default = spec['next_hop_port']
+    return """#!/bin/sh
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+HELPER_SCRIPT="$SCRIPT_DIR/{helper_name}"
+
+FIXTURE_DIR_DEFAULT={fixture_dir}
+ENTRY_DIR_DEFAULT={entry_dir}
+NEXT_HOP_DEFAULT={next_hop}
+NEXT_HOP_PORT_DEFAULT={next_hop_port}
+FLOW_GROUP_DEFAULT={flow_group}
+PRODUCER_DEFAULT={producer}
+
+if [ "$#" -eq 0 ]; then
+    set -- run
+fi
+
+COMMAND="$1"
+
+case "$COMMAND" in
+    --help|-h|help)
+        exec "$HELPER_SCRIPT" --help
+        ;;
+    -*)
+        set -- run "$@"
+        COMMAND="$1"
+        ;;
+esac
+
+shift
+
+FIXTURE_DIR="${{LZ_VALIDATION_FIXTURE_DIR:-$FIXTURE_DIR_DEFAULT}}"
+ENTRY_DIR="${{LZ_VALIDATION_ENTRY_DIR:-$ENTRY_DIR_DEFAULT}}"
+NEXT_HOP="${{LZ_VALIDATION_NEXT_HOP:-$NEXT_HOP_DEFAULT}}"
+NEXT_HOP_PORT="${{LZ_VALIDATION_NEXT_HOP_PORT:-$NEXT_HOP_PORT_DEFAULT}}"
+FLOW_GROUP="${{LZ_VALIDATION_FLOW_GROUP:-$FLOW_GROUP_DEFAULT}}"
+PRODUCER="${{LZ_VALIDATION_PRODUCER:-$PRODUCER_DEFAULT}}"
+
+set -- "$COMMAND" \
+    --fixture-dir "$FIXTURE_DIR" \
+    --entry-dir "$ENTRY_DIR" \
+    --flow-group "$FLOW_GROUP" \
+    --producer "$PRODUCER" \
+    "$@"
+
+if [ -n "$NEXT_HOP" ]; then
+    set -- "$@" --next-hop "$NEXT_HOP"
+fi
+if [ -n "$NEXT_HOP_PORT" ]; then
+    set -- "$@" --next-hop-port "$NEXT_HOP_PORT"
+fi
+
+exec "$HELPER_SCRIPT" "$@"
+""".format(
+        helper_name=validation_helper_name(),
+        fixture_dir=shlex.quote(spec['fixture_dir']),
+        entry_dir=shlex.quote(spec['entry_dir']),
+        next_hop=shlex.quote(next_hop_default),
+        next_hop_port=shlex.quote(next_hop_port_default),
+        flow_group=shlex.quote(spec['flow_group']),
+        producer=shlex.quote(spec['producer']),
+    )
+
+
+def generate_validation_script_content():
+    """Return the shared hop-local validation helper shell script."""
+    return load_bundled_template(VALIDATION_TEMPLATE_NAME)
+
+
+def validation_script_names(transfers_df=None):
+    """Return generated validation helper and wrapper filenames."""
+    names = {validation_helper_name()}
+    names.update(
+        spec['script_name'] for spec in build_validation_wrapper_specs(transfers_df)
+    )
+    return sorted(names)
+
+
+def write_validation_scripts(validation_scripts_dir, transfers_df=None):
+    """Write shared helper shell scripts into the validation scripts directory."""
+    if not os.path.isdir(validation_scripts_dir):
+        os.makedirs(validation_scripts_dir)
+    validation_script_path = os.path.join(validation_scripts_dir, validation_helper_name())
+    with open(validation_script_path, 'w') as handle:
+        handle.write(add_owner_marker(generate_validation_script_content()))
+    os.chmod(validation_script_path, 0o755)
+
+    for spec in build_validation_wrapper_specs(transfers_df):
+        wrapper_path = os.path.join(validation_scripts_dir, spec['script_name'])
+        with open(wrapper_path, 'w') as handle:
+            handle.write(add_owner_marker(generate_validation_wrapper_content(spec)))
+        os.chmod(wrapper_path, 0o755)
+
+
 def remove_stale_generated_scripts(scripts_dir, expected_script_names):
     """Delete orphaned generated shell scripts from the output directory."""
     if not os.path.isdir(scripts_dir):
@@ -865,10 +2079,55 @@ def remove_stale_generated_scripts(scripts_dir, expected_script_names):
             continue
         if entry in expected:
             continue
-        os.remove(os.path.join(scripts_dir, entry))
+        path = os.path.join(scripts_dir, entry)
+        if not file_has_current_owner_marker(path):
+            continue
+        os.remove(path)
 
 
-def generate_cron_file(system_user, transfers_df, scripts_dir):
+def cron_file_name(runtime_id):
+    """Return the generated cron filename for a runtime_id group."""
+    prefix = configured_artifact_prefix()
+    if prefix:
+        return "{0}.{1}.Landing_Zone.cron".format(prefix, runtime_id)
+    return "{0}.Landing_Zone.cron".format(runtime_id)
+
+
+def remove_stale_cron_files(crontab_dir, expected_cron_names):
+    """Delete stale owned cron files from the output directory."""
+    if not current_artifact_owner_id() or not os.path.isdir(crontab_dir):
+        return
+
+    expected = set(expected_cron_names)
+    for entry in os.listdir(crontab_dir):
+        if not entry.endswith('.cron'):
+            continue
+        if entry in expected:
+            continue
+        path = os.path.join(crontab_dir, entry)
+        if not file_has_current_owner_marker(path):
+            continue
+        os.remove(path)
+
+
+def remove_stale_validation_scripts(validation_scripts_dir, transfers_df=None):
+    """Delete orphaned validation helper/wrapper scripts from the output directory."""
+    if not os.path.isdir(validation_scripts_dir):
+        return
+
+    expected = set(validation_script_names(transfers_df))
+    for entry in os.listdir(validation_scripts_dir):
+        if not entry.endswith('.sh'):
+            continue
+        if entry in expected:
+            continue
+        path = os.path.join(validation_scripts_dir, entry)
+        if not file_has_current_owner_marker(path):
+            continue
+        os.remove(path)
+
+
+def generate_cron_file(runtime_id, transfers_df, scripts_dir):
     """Generate complete cron file content from DataFrame subset"""
     # Get the first row to extract system and user info
     first_transfer = transfers_df.iloc[0]
@@ -893,8 +2152,8 @@ def generate_cron_file(system_user, transfers_df, scripts_dir):
     return content
 
 
-def main():
-    """Main function to generate all cron files"""
+def main(argv=None):
+    """Main function to generate all cron files."""
     parser = argparse.ArgumentParser(
         description='Generate cron files from transfers.tsv configuration'
     )
@@ -923,14 +2182,26 @@ def main():
         default=None,
         help='Output directory for generated shell scripts (default: output/scripts)'
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        '--validation-scripts-dir',
+        default=None,
+        help='Output directory for generated validation wrapper scripts (default: output/validation_scripts)'
+    )
+    parser.add_argument(
+        '--runtime-id',
+        action='append',
+        default=[],
+        help='Exact runtime_id to include. May be passed multiple times.'
+    )
+    args = parser.parse_args(argv)
     
     # Load configuration from file and/or command line arguments
     config.load_config(
         config_file=args.config,
         transfers_file=args.transfers,
         crontab_dir=args.output_dir,
-        log_dir=args.log_dir
+        log_dir=args.log_dir,
+        validation_scripts_dir=args.validation_scripts_dir,
     )
     
     transfers_file = config.transfers_file
@@ -939,6 +2210,7 @@ def main():
     scripts_dir = args.scripts_dir or os.path.join(
         os.path.dirname(output_dir), 'scripts'
     )
+    validation_scripts_dir = config.validation_scripts_dir
     
     if not os.path.exists(transfers_file):
         print("Error: {0} not found".format(transfers_file))
@@ -954,9 +2226,15 @@ def main():
 
     if not os.path.exists(scripts_dir):
         os.makedirs(scripts_dir)
+    if not os.path.exists(validation_scripts_dir):
+        os.makedirs(validation_scripts_dir)
     
     # Parse transfers into DataFrame using pandas
-    transfers_df = parse_transfers_file(transfers_file)
+    try:
+        transfers_df = parse_transfers_file(transfers_file, runtime_ids=args.runtime_id)
+    except ValueError as exc:
+        print("Error: {0}".format(exc))
+        return 1
     
     if transfers_df.empty:
         print("No transfers found in the file")
@@ -987,25 +2265,32 @@ def main():
         scripts_dir,
         transfers_df['script_name'].dropna().tolist(),
     )
+    remove_stale_validation_scripts(validation_scripts_dir, transfers_df)
+    expected_cron_names = [
+        cron_file_name(runtime_id)
+        for runtime_id in transfers_df['runtime_id'].dropna().unique()
+    ]
+    remove_stale_cron_files(output_dir, expected_cron_names)
+    write_validation_scripts(validation_scripts_dir, transfers_df)
 
-    # Group by system_user and generate cron files
-    grouped = transfers_df.groupby('system_user')
+    # Group by runtime_id and generate cron files
+    grouped = transfers_df.groupby('runtime_id')
 
-    for system_user, group_df in grouped:
+    for runtime_id, group_df in grouped:
         for _, transfer in group_df.iterrows():
             script_path = os.path.join(scripts_dir, transfer['script_name'])
             script_content = generate_script_content(transfer)
             with open(script_path, 'w') as file:
-                file.write(script_content)
+                file.write(add_owner_marker(script_content))
             os.chmod(script_path, 0o755)
 
-        filename = "{0}.Landing_Zone.cron".format(system_user)
-        content = generate_cron_file(system_user, group_df, scripts_dir)
+        filename = cron_file_name(runtime_id)
+        content = generate_cron_file(runtime_id, group_df, scripts_dir)
         
         # Write the cron file
         output_path = os.path.join(output_dir, filename)
         with open(output_path, 'w') as file:
-            file.write(content)
+            file.write(add_owner_marker(content))
         
         # Get unique log files for this group
         log_files = group_df['log_file'].dropna().unique()
@@ -1025,11 +2310,13 @@ def main():
     # Print summary statistics
     print("\nSummary:")
     print("Total transfers: {0}".format(len(transfers_df)))
-    unique_combinations = transfers_df['system_user'].nunique()
-    print("Unique system-user combinations: {0}".format(
-        unique_combinations))
-    print("Systems: {0}".format(', '.join(transfers_df['system'].unique())))
-    print("Users: {0}".format(', '.join(transfers_df['users'].unique())))
+    unique_combinations = transfers_df['runtime_id'].nunique()
+    print("Unique runtime IDs: {0}".format(unique_combinations))
+    if 'system' in transfers_df.columns:
+        print("Systems: {0}".format(', '.join(transfers_df['system'].unique())))
+    if 'users' in transfers_df.columns:
+        print("Users: {0}".format(', '.join(transfers_df['users'].unique())))
+    print("Validation scripts: {0}".format(validation_scripts_dir))
     
     # Show log file information
     if 'log_file' in transfers_df.columns:

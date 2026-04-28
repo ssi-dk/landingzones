@@ -8,15 +8,20 @@ Automated data transfer system using rsync with cron job generation.
 # Install
 pip install -e .
 
-# Generate cron files
-lz-generate-cron --help
-lz-generate-cron
+# Generate cron files, transfer scripts, and validation wrappers
+landingzones --help
+landingzones --config config/config.yaml build
+landingzones build
 
 # Check deployment readiness
-lz-check-deployment
+landingzones validate deployment
+
+# Run a hop-local validation
+landingzones validate hop <flow_group> preflight
+landingzones validate hop <flow_group>
 
 # Run toy data through the configured flows
-lz-check-deployment --test-with-data
+landingzones validate integration
 ```
 
 ## Project Structure
@@ -24,16 +29,20 @@ lz-check-deployment --test-with-data
 ```
 landingzones/
 ├── src/landingzones/           # Main package
+│   ├── cli.py                  # Top-level operator CLI
 │   ├── generate_cron_files.py  # Cron generation tool
 │   ├── check_deployment_readiness.py
+│   ├── plot_transfer_status.py
 │   └── config/transfers.tsv    # Default config
 ├── input/                      # Default input directory
 ├── output/                     # Default output directory
-│   └── crontab.d/             # Generated cron files
+│   ├── crontab.d/              # Generated cron files
+│   ├── scripts/                # Generated transfer scripts
+│   └── validation_scripts/     # Generated validation wrappers
 ├── log/                        # Default log directory
 ├── tests/                      # Test suite
-├── setup.py                    # Package config
-└── requirements.txt            # Dependencies
+├── pyproject.toml              # Package config
+└── README.md
 ```
 
 ## Configuration
@@ -43,8 +52,9 @@ The system is configured via a tab-separated `transfers.tsv` file:
 | Column | Description | Example |
 |--------|-------------|---------|
 | `identifiers` | Unique transfer ID used for generated shell script names | `transfer_001`, `gridion_to_calc` |
-| `system` | Source system identifier | `server1`, `localhost` |
-| `users` | System user for transfer | `user1`, `local` |
+| `runtime_id` | Required deploy/artifact identity used for cron grouping and filtering | `calc_prod.f041664` |
+| `system` | Configured system key used for managed paths and flock settings | `server1`, `localhost` |
+| `users` | Optional user/account context for review and generated headers | `user1`, `local` |
 | `source` | Source directory path | `/srv/data/src/` |
 | `source_port` | SSH port for remote sources (optional) | `2222` |
 | `destination` | Destination (local or remote) | `user@host:/dest/` |
@@ -57,21 +67,30 @@ The system is configured via a tab-separated `transfers.tsv` file:
 ### Example
 
 ```tsv
-identifiers	system	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file
-local_copy	localhost	testuser	input/*		output/				transfers.log	landingzones.lock
+identifiers	runtime_id	system	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file
+local_copy	localhost_test.testuser	localhost	testuser	input/*		output/				transfers.log	landingzones.lock
 ```
 
 ## CLI Commands
 
 ```bash
 # Generate cron files with defaults
-lz-generate-cron
+landingzones build
+
+# Generate only selected runtime IDs from a shared transfers.tsv
+landingzones build --runtime-id calc_prod.f041664 --runtime-id calc_prod.F041668
 
 # Check deployment readiness
-lz-check-deployment
+landingzones validate deployment
+
+# Run a hop-local validation wrapper through the CLI
+landingzones validate hop <flow_group>
 
 # Seed toy data and run the real scripts/logs/locks
-lz-check-deployment --test-with-data
+landingzones validate integration
+
+# Generate an HTML health dashboard from a shared transfer TSV log
+landingzones report transfers output/log/Landing_Zone_calc.transfers.tsv
 ```
 
 ### Generated Cron Format
@@ -84,7 +103,7 @@ lz-check-deployment --test-with-data
 
 ```bash
 # Development mode
-pip install -e .
+pip install -e ".[report]"
 
 # With test dependencies
 pip install -e ".[test]"
@@ -92,6 +111,84 @@ pip install -e ".[test]"
 # Production
 pip install .
 ```
+
+### Lab Sequencer Bundle
+
+For lab machines where a managed Python environment is awkward, build a
+relocatable bundle using a `python-build-standalone` runtime. Build it on a
+machine that matches the lab sequencer OS, architecture, and libc family.
+
+Download or provide a python-build-standalone `install_only` archive, then run:
+
+```bash
+cd app
+python scripts/build_python_standalone_bundle.py --python-archive /path/to/cpython-*-install_only.tar.*
+```
+
+If you already extracted the runtime, point at its Python executable instead:
+
+```bash
+python scripts/build_python_standalone_bundle.py --python-bin /path/to/python/install/bin/python3
+```
+
+With Pixi, the app includes a packaging task that downloads a matching
+python-build-standalone runtime using `getpybs`:
+
+```bash
+cd app
+pixi run build-standalone
+```
+
+Build the lab Linux artifact on Linux. A bundle built on macOS contains a macOS
+Python runtime and will fail on the sequencer with `cannot execute binary file`.
+Before copying a tarball to the lab host, verify the bundled runtime:
+
+```bash
+file packaging/dist/landingzones-standalone/python/bin/python3
+packaging/dist/landingzones-standalone/python/bin/python3 -c "import platform; print(platform.system(), platform.machine())"
+```
+
+Expected for the current lab machines is Linux/x86_64.
+
+The standalone bundle installs the core operator CLI without pandas, so it is
+intended for `build`, `validate`, and `deploy` on locked-down lab machines.
+`landingzones report transfers` remains a reporting extra and should run from
+an environment with `landingzones[report]` installed.
+
+The same bundle can be produced by the GitHub Actions workflow
+`Build Standalone Bundle`. Run it manually from Actions, or push a `v*` tag.
+It uploads `landingzones-standalone-linux-x86_64` containing:
+
+```text
+landingzones-standalone-linux-x86_64.tar.gz
+```
+
+For `v*` tags, the workflow also creates or updates the matching GitHub Release
+and uploads `landingzones-standalone-linux-x86_64.tar.gz` as a release asset.
+
+The bundle is written to:
+
+```text
+app/packaging/dist/landingzones-standalone/
+app/packaging/dist/landingzones-standalone.tar.gz
+```
+
+Copy the tarball to the lab machine, extract it, and run it like the normal CLI:
+
+```bash
+./landingzones --config config/config.yaml build
+./landingzones --config config/config.yaml validate deployment
+```
+
+For offline builds, pass `--wheelhouse /path/to/wheels` so dependencies are
+installed from local wheels. The legacy shell wrapper still works:
+
+```bash
+./scripts/build_python_standalone_bundle.sh --python-archive /path/to/cpython-*-install_only.tar.*
+```
+
+The bundle carries Python and Python packages only; the target machine still
+needs system tools such as `rsync`, `ssh`, `flock`, `curl`, and `cron`.
 
 ## Testing
 
@@ -109,15 +206,65 @@ pytest --cov=landingzones --cov-report=html
 pytest tests/test_generate_cron_files.py::TestClassName::test_method
 ```
 
-### Test With Data
+### Validation Modes
 
-`--test-with-data` is the integration-style test mode. It copies toy data into the configured starting locations, generates the real shell scripts, and runs the transfers using the normal log and flock paths. After a successful run the data should be visible in the terminal destinations unless you choose cleanup at the prompt.
+The operator-facing validation surface has three modes:
+
+- `landingzones validate deployment`
+- `landingzones validate hop <flow_group> [preflight|run]`
+- `landingzones validate integration`
+
+`landingzones validate integration` is the heavier integration-style test mode. It copies toy data into the configured starting locations, generates the real shell scripts, and runs the transfers using the normal log and flock paths.
+Use `landingzones validate integration --slow` when you want the harness to print the result of each completed step and wait for Enter before running the next one.
+
+### Generated Validation Wrappers
+
+Each `flow_group` with exactly one `is_entry_point=TRUE` row gets a generated wrapper in the configured validation-scripts directory:
+
+```text
+output/validation_scripts/lz_run_validation_<flow_group>.sh
+```
+
+Use `landingzones validate hop <flow_group>` as the main interface. The generated wrapper remains available directly and bakes in:
+
+- the entry directory for that flow
+- the immediate next hop for preflight checks
+- the default fixture directory under `test_data`
+- the `flow_group` and producer labels used in the `LZTEST_...` folder name
+
+Typical usage:
+
+```bash
+# Regenerate scripts after changing config/transfers
+landingzones --config config/config.yaml build
+
+# Check only the current hop structure and immediate next-hop access
+landingzones validate hop local_labnet_to_calc_seqdata preflight
+
+# Inject a validation run with the baked-in defaults
+landingzones validate hop local_labnet_to_calc_seqdata
+
+# Inject a validation run with an explicit token suffix
+landingzones validate hop local_labnet_to_calc_seqdata --token ABCD
+
+# Direct wrapper execution still works if needed
+./output/validation_scripts/lz_run_validation_local_labnet_to_calc_seqdata.sh
+```
+
+Wrapper/CLI behavior:
+
+- no action defaults to `run`
+- `preflight` checks only the current hop plus its immediate next hop
+- options-only invocation such as `--token ABCD` also defaults to `run`
+
+Use `landingzones validate hop` for lightweight producer-side validation. Use `landingzones validate integration` when you want the heavier integration test that seeds toy data and executes the full generated transfer chain.
 
 Required config in your deployment `config.yaml`:
 
 ```yaml
 transfers_file: input/transfers.tsv
 test_data: tests/toy_data/
+validation_scripts_dir: output/validation_scripts/
 rit_managed_locations:
   test_local: tests/test_local
 flock_paths:
@@ -145,8 +292,11 @@ How to run it:
 # Run from the deployment root that owns config/, input/, and tests/
 cd deploy/local
 
-# Generate and execute the transfer scripts with toy data
-lz-check-deployment --config config/config.yaml --test-with-data
+# Generate deployment artifacts
+landingzones build --config config/config.yaml
+
+# Run the heavier integration test
+landingzones --config config/config.yaml validate integration
 ```
 
 What it does:
@@ -163,7 +313,7 @@ After a successful run it asks whether you want cleanup. Answer `y` to remove th
 ## Deployment
 
 1. Configure `transfers.tsv` with your routes
-2. Generate cron files: `lz-generate-cron`
+2. Generate cron files: `landingzones build`
 3. Deploy:
    ```bash
    cp output/crontab.d/*.cron ~/crontab.d/
@@ -172,7 +322,7 @@ After a successful run it asks whether you want cleanup. Answer `y` to remove th
 
 Or use automated deployment:
 ```bash
-lz-check-deployment
+landingzones validate deployment
 ```
 
 ## Development
@@ -183,11 +333,12 @@ lz-check-deployment
 pytest
 
 # Test CLI
-lz-generate-cron --help
+landingzones --help
 ```
 
 ## Requirements
 
 - Python >= 3.8
-- pandas >= 1.0.0
+- PyYAML >= 5.0.0
+- pandas >= 1.0.0 only for `landingzones report transfers` / `landingzones[report]`
 - System: rsync, ssh, flock

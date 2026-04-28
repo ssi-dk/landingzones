@@ -13,32 +13,42 @@ Checks all prerequisites before deploying cron files:
 import os
 import sys
 import subprocess
-import socket
 import shutil
-import glob
-import errno
 import argparse
-from io import StringIO
-
-import pandas as pd
 
 from landingzones.config import config
 from landingzones.generate_cron_files import (
     parse_transfers_file,
     normalize_source_path,
+    sanitize_identifier,
     split_remote_path,
     shell_path,
 )
-
-
-class Colors:
-    """ANSI color codes for console output"""
-    GREEN = '\033[92m'
-    RED = '\033[91m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    BOLD = '\033[1m'
-    END = '\033[0m'
+from landingzones.readiness_ops import (
+    Colors,
+    build_ssh_target,
+    check_flock_command,
+    check_local_directory,
+    check_log_directory,
+    check_remote_directory,
+    check_required_tools,
+    check_ssh_connection,
+    deploy_cron_files,
+    generate_cron_files,
+    get_current_system,
+    get_current_user,
+    inspect_local_directory,
+    inspect_remote_directory,
+    normalize_directory_path,
+    parse_remote_destination,
+    print_header,
+    print_status,
+    setup_crontab_directory,
+)
+from landingzones.transfer_loading import (
+    filter_transfers_by_system_user,
+    load_runtime_transfers,
+)
 
 
 def get_test_flock_path():
@@ -49,45 +59,14 @@ def get_test_flock_path():
     return '/usr/bin/true'
 
 
-def print_status(message, status, details=None):
-    """Print formatted status message"""
-    if status == "OK":
-        icon = "{0}✓{1}".format(Colors.GREEN, Colors.END)
-        status_text = "{0}OK{1}".format(Colors.GREEN, Colors.END)
-    elif status == "WARN":
-        icon = "{0}⚠{1}".format(Colors.YELLOW, Colors.END)
-        status_text = "{0}WARNING{1}".format(Colors.YELLOW, Colors.END)
-    elif status == "INFO" or status == "...":
-        icon = "{0}ℹ{1}".format(Colors.BLUE, Colors.END)
-        status_text = "{0}INFO{1}".format(Colors.BLUE, Colors.END)
-    else:  # ERROR
-        icon = "{0}✗{1}".format(Colors.RED, Colors.END)
-        status_text = "{0}ERROR{1}".format(Colors.RED, Colors.END)
-    
-    print("{0} {1}: {2}".format(icon, message, status_text))
-    if details:
-        print("   {0}".format(details))
-
-
-def print_header(title):
-    """Print section header"""
-    print("\n{0}{1}=== {2} ==={3}".format(Colors.BOLD, Colors.BLUE, title, Colors.END))
-
-
 def _snapshot_config_state():
     """Capture config state so temporary overrides can be restored."""
-    return {
-        'yaml_config': dict(config._yaml_config),
-        'runtime_config': dict(config._runtime_config),
-        'config_file': config._config_file,
-    }
+    return config.snapshot_state()
 
 
 def _restore_config_state(snapshot):
     """Restore config state after temporary overrides."""
-    config._yaml_config = snapshot['yaml_config']
-    config._runtime_config = snapshot['runtime_config']
-    config._config_file = snapshot['config_file']
+    config.restore_state(snapshot)
 
 
 def get_repo_root():
@@ -160,6 +139,18 @@ def unique_transfer_endpoints(transfers_df, column, port_column):
     return endpoints
 
 
+def parse_test_fixture_names(value):
+    """Parse an optional comma-separated fixture-name list."""
+    text = str(value).strip() if value is not None else ''
+    if not text or text == 'nan':
+        return []
+    return [
+        item.strip()
+        for item in text.split(',')
+        if item.strip()
+    ]
+
+
 def build_run_test_plan(transfers_df):
     """Build source/destination relationships for the real-transfer smoke test."""
     source_keys = {
@@ -169,24 +160,57 @@ def build_run_test_plan(transfers_df):
         endpoint_key(transfer['destination']) for _, transfer in transfers_df.iterrows()
     }
 
-    initial_sources = []
+    initial_source_map = {}
     terminal_destinations = []
+    entry_point_flags = {
+        str(transfer.get('is_entry_point', '') or '').strip().upper()
+        for _, transfer in transfers_df.iterrows()
+    }
+    prefer_explicit_entry_points = 'TRUE' in entry_point_flags
+
     for _, transfer in transfers_df.iterrows():
         source_info = {
             'value': transfer['source'],
             'port': str(transfer.get('source_port', '') or '').strip(),
+            'test_fixture_names': parse_test_fixture_names(
+                transfer.get('test_fixture_names', '')
+            ),
         }
         destination_info = {
             'value': transfer['destination'],
             'port': str(transfer.get('destination_port', '') or '').strip(),
         }
-        if endpoint_key(transfer['source']) not in destination_keys:
-            initial_sources.append(source_info)
+        is_entry_point = (
+            str(transfer.get('is_entry_point', '') or '').strip().upper() == 'TRUE'
+        )
+        is_initial_source = False
+        if prefer_explicit_entry_points:
+            is_initial_source = is_entry_point
+        else:
+            is_initial_source = endpoint_key(transfer['source']) not in destination_keys
+
+        if is_initial_source:
+            source_key = endpoint_key(transfer['source'])
+            existing = initial_source_map.get(source_key)
+            if existing is None:
+                initial_source_map[source_key] = source_info
+            else:
+                merged_fixtures = []
+                seen_fixtures = set()
+                for fixture_name in (
+                    existing.get('test_fixture_names', []) +
+                    source_info.get('test_fixture_names', [])
+                ):
+                    if fixture_name in seen_fixtures:
+                        continue
+                    seen_fixtures.add(fixture_name)
+                    merged_fixtures.append(fixture_name)
+                existing['test_fixture_names'] = merged_fixtures
         if endpoint_key(transfer['destination']) not in source_keys:
             terminal_destinations.append(destination_info)
 
     return {
-        'initial_sources': dedupe_test_endpoints(initial_sources),
+        'initial_sources': list(initial_source_map.values()),
         'all_sources': dedupe_test_endpoints([
             {
                 'value': transfer['source'],
@@ -268,9 +292,25 @@ def resolve_test_data_dir(endpoint, toy_data_root, test_tree_root):
         if os.path.isdir(toy_dir):
             return toy_dir
 
+    fixture_names = endpoint.get('test_fixture_names', [])
+    if fixture_names:
+        available = set(list_visible_directories(toy_data_root))
+        if all(fixture_name in available for fixture_name in fixture_names):
+            return toy_data_root
+
     available = list_visible_directories(toy_data_root)
     if len(available) == 1:
-        return os.path.join(toy_data_root, available[0])
+        # Allow fixture bundles to be wrapped in one or more single-directory
+        # containers such as test_data/data/lab_machine_1/<runs>.
+        current = os.path.join(toy_data_root, available[0])
+        while True:
+            nested = list_visible_directories(current)
+            if len(nested) != 1:
+                return current
+            child = os.path.join(current, nested[0])
+            if not list_visible_directories(child):
+                return current
+            current = child
 
     raise ValueError(
         "No toy data found for source root '{0}'. Checked: {1}".format(
@@ -318,6 +358,168 @@ def remove_endpoint_entries(endpoint, entry_names):
         remove_local_path(os.path.join(root, entry_name))
 
 
+def list_endpoint_entries(endpoint):
+    """List top-level entries under an endpoint root, including hidden names."""
+    root = get_endpoint_root(endpoint)
+    user, host, _ = parse_remote_destination(endpoint['value'])
+    port = endpoint.get('port', '')
+
+    if host:
+        command = (
+            "if [ -d {0} ]; then find {0} -mindepth 1 -maxdepth 1 "
+            "-exec basename {{}} \\; | sort; fi"
+        ).format(shell_path(root))
+        rc, stdout, stderr = run_remote_shell(user, host, command, port)
+        if rc != 0:
+            raise ValueError(
+                "Cannot inspect test entries on {0}: {1}".format(
+                    shell_target(user, host), stderr.strip() or 'unknown error'
+                )
+            )
+        return [
+            line.strip()
+            for line in stdout.splitlines()
+            if line.strip() not in ('.', '..')
+        ]
+
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        name for name in os.listdir(root)
+        if name not in ('.', '..')
+    )
+
+
+def build_test_with_data_existing_state(test_plan, expected_entry_names):
+    """Classify existing endpoint contents before seeding toy data."""
+    source_keys = {
+        endpoint_key(endpoint['value']) for endpoint in test_plan['all_sources']
+    }
+    endpoint_state = []
+
+    for endpoint in dedupe_test_endpoints(
+        test_plan['all_sources'] + test_plan['all_destinations']
+    ):
+        entries = list_endpoint_entries(endpoint)
+        if not entries:
+            continue
+
+        endpoint_is_source = endpoint_key(endpoint['value']) in source_keys
+        blockers = []
+        extras = []
+        for entry_name in entries:
+            is_hidden = entry_name.startswith('.')
+            is_expected = entry_name in expected_entry_names
+            is_blocker = False
+            if entry_name == '.staging':
+                is_blocker = True
+            elif endpoint_is_source and not is_hidden:
+                is_blocker = True
+            elif is_expected:
+                is_blocker = True
+
+            if is_blocker:
+                blockers.append(entry_name)
+            else:
+                extras.append(entry_name)
+
+        endpoint_state.append({
+            'endpoint': endpoint,
+            'display': normalize_endpoint_display(endpoint['value']),
+            'is_source': endpoint_is_source,
+            'entries': entries,
+            'blockers': blockers,
+            'extras': extras,
+        })
+
+    return endpoint_state
+
+
+def summarize_test_with_data_existing_state(existing_state):
+    """Render a concise summary of pre-existing test data state."""
+    lines = []
+    for item in existing_state:
+        lines.append(item['display'])
+        if item['blockers']:
+            lines.append(
+                "blockers: {0}".format(', '.join(item['blockers']))
+            )
+        if item['extras']:
+            lines.append(
+                "extras: {0}".format(', '.join(item['extras']))
+            )
+    return '\n'.join(lines)
+
+
+def ask_test_with_data_existing_state_action(existing_state):
+    """Ask how pre-existing integration entries should be handled."""
+    if not existing_state:
+        return 'blockers'
+
+    print_header("Existing Test Data State")
+    print_status(
+        "Pre-existing entries",
+        "WARN",
+        summarize_test_with_data_existing_state(existing_state),
+    )
+    prompt = (
+        "\n{0}Choose cleanup scope before seeding "
+        "[a]ll/[b]lockers/[l]eave as-is (default: b): {1}"
+    ).format(Colors.YELLOW, Colors.END)
+    print(prompt, end="")
+    try:
+        response = input().strip().lower()
+    except KeyboardInterrupt:
+        print("\n{0}Operation cancelled.{1}".format(Colors.YELLOW, Colors.END))
+        return 'leave'
+
+    if response in ('', 'b', 'blockers'):
+        return 'blockers'
+    if response in ('a', 'all'):
+        return 'all'
+    if response in ('l', 'leave', 'leave as-is', 'leave as is'):
+        return 'leave'
+    print_status(
+        "Pre-existing state choice",
+        "WARN",
+        "Unrecognized response '{0}', defaulting to blocker cleanup".format(
+            response
+        ),
+    )
+    return 'blockers'
+
+
+def build_test_with_data_cleanup_map(existing_state, mode):
+    """Build per-endpoint cleanup entries for the requested preflight mode."""
+    cleanup_map = []
+    for item in existing_state:
+        if mode == 'all':
+            entry_names = item['entries']
+        elif mode == 'blockers':
+            entry_names = item['blockers']
+        else:
+            entry_names = []
+        if not entry_names:
+            continue
+        cleanup_map.append({
+            'endpoint': item['endpoint'],
+            'entry_names': sorted(set(entry_names)),
+        })
+    return cleanup_map
+
+
+def cleanup_test_with_data_endpoint_entries(cleanup_map):
+    """Remove the requested entry names from each endpoint."""
+    cleanup_errors = []
+    for item in cleanup_map:
+        try:
+            remove_endpoint_entries(item['endpoint'], item['entry_names'])
+        except ValueError as exc:
+            cleanup_errors.append(str(exc))
+    if cleanup_errors:
+        raise ValueError('\n'.join(cleanup_errors))
+
+
 def build_test_with_data_seed_plan(test_plan, toy_data_root, test_tree_root):
     """Resolve toy-data sources and expected top-level directories for testing with data."""
     seed_plan = []
@@ -332,7 +534,24 @@ def build_test_with_data_seed_plan(test_plan, toy_data_root, test_tree_root):
         toy_data_dir = resolve_test_data_dir(
             endpoint, toy_data_root, test_tree_root
         )
-        entry_names = list_visible_directories(toy_data_dir)
+        fixture_names = endpoint.get('test_fixture_names', [])
+        if fixture_names:
+            entry_names = []
+            missing_fixtures = []
+            available_dirs = set(list_visible_directories(toy_data_dir))
+            for fixture_name in fixture_names:
+                if fixture_name in available_dirs:
+                    entry_names.append(fixture_name)
+                else:
+                    missing_fixtures.append(fixture_name)
+            if missing_fixtures:
+                raise ValueError(
+                    "Toy data directory missing configured fixture(s) for source root '{0}': {1}".format(
+                        get_endpoint_root(endpoint), ', '.join(missing_fixtures)
+                    )
+                )
+        else:
+            entry_names = list_visible_directories(toy_data_dir)
         if not entry_names:
             raise ValueError(
                 "Toy data directory contains no visible directories: {0}".format(
@@ -349,15 +568,14 @@ def build_test_with_data_seed_plan(test_plan, toy_data_root, test_tree_root):
 
 def cleanup_test_with_data_entries(test_plan, entry_names):
     """Remove seeded test directories from all test-with-data roots."""
-    cleanup_errors = []
     all_entries = sorted(set(entry_names) | {'.staging'})
-    for endpoint in test_plan['all_destinations'] + test_plan['all_sources']:
-        try:
-            remove_endpoint_entries(endpoint, all_entries)
-        except ValueError as exc:
-            cleanup_errors.append(str(exc))
-    if cleanup_errors:
-        raise ValueError('\n'.join(cleanup_errors))
+    cleanup_test_with_data_endpoint_entries([
+        {
+            'endpoint': endpoint,
+            'entry_names': all_entries,
+        }
+        for endpoint in test_plan['all_destinations'] + test_plan['all_sources']
+    ])
 
 
 def cleanup_test_with_data_runtime_artifacts(transfers_df):
@@ -378,6 +596,15 @@ def cleanup_test_with_data_runtime_artifacts(transfers_df):
     for path in artifact_paths:
         if os.path.exists(path) or os.path.islink(path):
             remove_local_path(path)
+
+
+def cleanup_test_with_data_generated_scripts(runtime_dirs):
+    """Remove generated integration script artifacts from a previous run."""
+    if not runtime_dirs:
+        return
+    runtime_root = runtime_dirs.get('root', '')
+    if runtime_root and (os.path.exists(runtime_root) or os.path.islink(runtime_root)):
+        remove_local_path(runtime_root)
 
 
 def seed_test_data_sources(seed_plan):
@@ -422,7 +649,12 @@ def shell_target(user, host):
 
 def run_remote_shell(user, host, command, port=''):
     """Run a shell command over ssh."""
-    cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
+    cmd = [
+        'ssh',
+        '-o', 'BatchMode=yes',
+        '-o', 'ConnectTimeout=10',
+        '-o', 'LogLevel=ERROR',
+    ]
     if port:
         cmd.extend(['-p', str(port)])
     cmd.extend([shell_target(user, host), command])
@@ -435,14 +667,20 @@ def load_test_with_data_transfers(
     transfers_file, current_system, current_user, base_dir
 ):
     """Load the current system/user transfer subset for test-with-data."""
-    df = parse_transfers_file(transfers_file)
-    df = df[(df['system'] == current_system) & (df['users'] == current_user)].copy()
+    df = load_test_with_data_transfer_graph(transfers_file, base_dir)
+    df = filter_transfers_by_system_user(df, current_system, current_user)
     if df.empty:
         raise ValueError(
             "No transfers found for user '{0}' on system '{1}'".format(
                 current_user, current_system
             )
         )
+    return df
+
+
+def load_test_with_data_transfer_graph(transfers_file, base_dir):
+    """Load all test-with-data transfers with local endpoints absolutized."""
+    df = parse_transfers_file(transfers_file)
     for column in ('source', 'destination'):
         df[column] = df[column].apply(
             lambda value: absolutize_local_endpoint(value, base_dir)
@@ -450,15 +688,39 @@ def load_test_with_data_transfers(
     return df
 
 
-def generate_test_scripts(transfers_df, scripts_dir, crontab_dir):
+def get_test_with_data_runtime_dirs(current_system, current_user):
+    """Return writable directories used to generate integration-only artifacts."""
+    base_root = config.get_rit_managed_location(current_system)
+    runtime_name = "{0}.{1}".format(
+        sanitize_identifier(current_system) or 'system',
+        sanitize_identifier(current_user) or 'user',
+    )
+    runtime_root = os.path.join(base_root, 'test_with_data_runtime', runtime_name)
+    return {
+        'root': runtime_root,
+        'scripts_dir': os.path.join(runtime_root, 'scripts'),
+        'crontab_dir': os.path.join(runtime_root, 'crontab.d'),
+        'validation_scripts_dir': os.path.join(runtime_root, 'validation_scripts'),
+    }
+
+
+def generate_test_scripts(transfers_df, scripts_dir, crontab_dir, validation_scripts_dir):
     """Generate shell scripts and cron files for the current transfer subset."""
     from landingzones import generate_cron_files as gcf
 
     os.makedirs(crontab_dir, exist_ok=True)
     os.makedirs(scripts_dir, exist_ok=True)
+    os.makedirs(validation_scripts_dir, exist_ok=True)
     gcf.remove_stale_generated_scripts(
         scripts_dir, transfers_df['script_name'].dropna().tolist()
     )
+    gcf.remove_stale_validation_scripts(validation_scripts_dir, transfers_df)
+    expected_cron_names = [
+        gcf.cron_file_name(system_user)
+        for system_user in transfers_df['system_user'].dropna().unique()
+    ]
+    gcf.remove_stale_cron_files(crontab_dir, expected_cron_names)
+    gcf.write_validation_scripts(validation_scripts_dir, transfers_df)
 
     grouped = transfers_df.groupby('system_user')
     for system_user, group_df in grouped:
@@ -466,19 +728,84 @@ def generate_test_scripts(transfers_df, scripts_dir, crontab_dir):
             script_path = os.path.join(scripts_dir, transfer['script_name'])
             script_content = gcf.generate_script_content(transfer)
             with open(script_path, 'w') as handle:
-                handle.write(script_content)
+                handle.write(gcf.add_owner_marker(script_content))
             os.chmod(script_path, 0o755)
 
-        cron_path = os.path.join(
-            crontab_dir, "{0}.Landing_Zone.cron".format(system_user)
-        )
+        cron_path = os.path.join(crontab_dir, gcf.cron_file_name(system_user))
         with open(cron_path, 'w') as handle:
-            handle.write(gcf.generate_cron_file(system_user, group_df, scripts_dir))
+            handle.write(
+                gcf.add_owner_marker(
+                    gcf.generate_cron_file(system_user, group_df, scripts_dir)
+                )
+            )
 
     return transfers_df
 
 
-def run_generated_scripts(transfers_df, scripts_dir, runtime_root=None):
+def read_log_excerpt(log_file, max_lines=10):
+    """Return a short trailing excerpt from a log file when it exists."""
+    if not log_file or log_file == 'nan' or not os.path.exists(log_file):
+        return ''
+
+    with open(log_file, 'r') as handle:
+        lines = handle.read().splitlines()
+
+    if not lines:
+        return ''
+    return '\n'.join(lines[-max_lines:])
+
+
+def format_script_result_summary(result):
+    """Format a compact execution summary for a generated test script."""
+    details = [
+        "Script: {0}".format(result['script_path']),
+        "Exit code: {0}".format(result['returncode']),
+    ]
+
+    stdout = result['stdout'].strip()
+    stderr = result['stderr'].strip()
+    log_excerpt = read_log_excerpt(result.get('log_file', ''))
+
+    if stdout:
+        details.append("stdout:\n{0}".format(stdout))
+    if stderr:
+        details.append("stderr:\n{0}".format(stderr))
+    if log_excerpt:
+        details.append("log tail:\n{0}".format(log_excerpt))
+
+    return '\n'.join(details)
+
+
+def prompt_to_continue(prompt_text):
+    """Pause until the operator confirms the next slow-mode step should run."""
+    prompt = "\n{0}{1}{2}".format(Colors.YELLOW, prompt_text, Colors.END)
+    print(prompt, end="")
+    try:
+        input()
+    except EOFError:
+        return
+    except KeyboardInterrupt:
+        print("\n{0}Slow integration run cancelled.{1}".format(
+            Colors.YELLOW, Colors.END
+        ))
+        raise SystemExit(130)
+
+
+def print_slow_step_summary(result, step_number, total_steps):
+    """Print a human-readable summary of the most recent integration step."""
+    print_header(
+        "Integration Step {0}/{1}: {2}".format(
+            step_number, total_steps, result['identifier']
+        )
+    )
+    print_status(
+        "Last step",
+        "OK" if result['returncode'] == 0 else "ERROR",
+        format_script_result_summary(result),
+    )
+
+
+def run_generated_scripts(transfers_df, scripts_dir, runtime_root=None, slow=False):
     """Execute generated scripts in transfer order."""
     env = os.environ.copy()
     env['LZ_DEBUG_CLI'] = '1'
@@ -489,7 +816,8 @@ def run_generated_scripts(transfers_df, scripts_dir, runtime_root=None):
         env.pop('LZ_TEST_ROOT', None)
     results = []
 
-    for _, transfer in transfers_df.iterrows():
+    total_steps = len(transfers_df)
+    for step_number, (_, transfer) in enumerate(transfers_df.iterrows(), start=1):
         script_path = os.path.join(scripts_dir, transfer['script_name'])
         proc = subprocess.Popen(
             ['/bin/sh', script_path],
@@ -499,15 +827,116 @@ def run_generated_scripts(transfers_df, scripts_dir, runtime_root=None):
             cwd=runtime_root or os.getcwd(),
         )
         stdout, stderr = proc.communicate()
-        results.append({
+        result = {
             'identifier': transfer['identifiers'],
             'script_path': script_path,
             'log_file': transfer.get('log_file', ''),
             'returncode': proc.returncode,
             'stdout': stdout.decode('utf-8'),
             'stderr': stderr.decode('utf-8'),
-        })
+        }
+        results.append(result)
+
+        if slow:
+            print_slow_step_summary(result, step_number, total_steps)
+            if step_number < total_steps:
+                next_identifier = transfers_df.iloc[step_number]['identifiers']
+                prompt_to_continue(
+                    "Press Enter to continue to the next step ({0})... ".format(
+                        next_identifier
+                    )
+                )
     return results
+
+
+def build_test_with_data_handoffs(
+    all_transfers_df,
+    current_transfers_df,
+    slow=False,
+):
+    """Identify downstream system/user handoffs after the current subset finishes."""
+    if all_transfers_df is None or all_transfers_df.empty:
+        return []
+    if current_transfers_df is None or current_transfers_df.empty:
+        return []
+
+    current_pairs = {
+        (str(row['system']).strip(), str(row['users']).strip())
+        for _, row in current_transfers_df.iterrows()
+    }
+    destination_keys = {
+        endpoint_key(row['destination'])
+        for _, row in current_transfers_df.iterrows()
+    }
+
+    grouped = []
+    grouped_index = {}
+    for _, transfer in all_transfers_df.iterrows():
+        system = str(transfer['system']).strip()
+        user = str(transfer['users']).strip()
+        if (system, user) in current_pairs:
+            continue
+        if endpoint_key(transfer['source']) not in destination_keys:
+            continue
+
+        group_key = (system, user)
+        if group_key not in grouped_index:
+            grouped_index[group_key] = len(grouped)
+            grouped.append({
+                'system': system,
+                'user': user,
+                'command': 'landingzones validate integration{0}'.format(
+                    ' --slow' if slow else ''
+                ),
+                'transfers': [],
+            })
+
+        grouped[grouped_index[group_key]]['transfers'].append({
+            'identifier': str(transfer['identifiers']).strip(),
+            'flow_group': str(transfer.get('flow_group', '') or '').strip(),
+            'source': transfer['source'],
+            'destination': transfer['destination'],
+        })
+
+    return grouped
+
+
+def format_test_with_data_handoff(handoff):
+    """Render a downstream handoff for the operator."""
+    lines = [
+        "Switch to {0}@{1}".format(handoff['user'], handoff['system']),
+        "Run from that deployment root: `{0}`".format(handoff['command']),
+    ]
+    for transfer in handoff['transfers']:
+        flow_group = transfer['flow_group']
+        if flow_group and flow_group != 'nan':
+            lines.append(
+                "Next transfer: {0} (flow: {1})".format(
+                    transfer['identifier'], flow_group
+                )
+            )
+        else:
+            lines.append("Next transfer: {0}".format(transfer['identifier']))
+        lines.append(
+            "Source to verify there: {0}".format(
+                normalize_endpoint_display(transfer['source'])
+            )
+        )
+    return '\n'.join(lines)
+
+
+def print_test_with_data_handoffs(handoffs):
+    """Print downstream handoff guidance for multi-system integration runs."""
+    if not handoffs:
+        return
+
+    print_header("Next System Handoff")
+    for handoff in handoffs:
+        print_status(
+            "Continue flow",
+            "INFO",
+            format_test_with_data_handoff(handoff),
+        )
 
 
 def endpoint_directory_exists(endpoint, directory_name):
@@ -523,10 +952,48 @@ def endpoint_directory_exists(endpoint, directory_name):
         )
         rc, stdout, stderr = run_remote_shell(user, host, command, port)
         if rc != 0:
-            return False, "Remote check failed: {0}".format(stderr.strip())
-        return 'EXISTS' in stdout, directory_path
+            remote_path = "{0}:{1}".format(
+                build_ssh_target(user, host),
+                directory_path,
+            )
+            return False, "Remote check failed for {0}: {1}".format(
+                remote_path,
+                stderr.strip() or 'unknown error',
+            )
+        remote_path = "{0}:{1}".format(
+            build_ssh_target(user, host),
+            directory_path,
+        )
+        return 'EXISTS' in stdout, remote_path
 
     return os.path.isdir(directory_path), directory_path
+
+
+def endpoint_root_ready(endpoint):
+    """Check whether a terminal endpoint root is reachable and exists."""
+    root = get_endpoint_root(endpoint)
+    user, host, _ = parse_remote_destination(endpoint['value'])
+    port = endpoint.get('port', '')
+
+    if host:
+        command = '[ -d {0} ] && echo EXISTS || echo MISSING'.format(
+            shell_path(root)
+        )
+        rc, stdout, stderr = run_remote_shell(user, host, command, port)
+        remote_path = "{0}:{1}".format(
+            build_ssh_target(user, host),
+            root,
+        )
+        if rc != 0:
+            return False, "Remote check failed for {0}: {1}".format(
+                remote_path,
+                stderr.strip() or 'unknown error',
+            )
+        if 'EXISTS' in stdout:
+            return True, remote_path
+        return False, remote_path
+
+    return os.path.isdir(root), root
 
 
 def validate_script_test_results(test_plan, expected_contents):
@@ -536,18 +1003,33 @@ def validate_script_test_results(test_plan, expected_contents):
         expected_entries = sorted(
             expected_contents.get(endpoint_key(endpoint['value']), set())
         )
+        root_ready, root_status = endpoint_root_ready(endpoint)
+        if not root_ready:
+            errors.append(
+                "Terminal destination root unavailable: {0}".format(
+                    root_status
+                )
+            )
+            continue
         for entry_name in expected_entries:
             exists, path = endpoint_directory_exists(endpoint, entry_name)
             if not exists:
-                errors.append(
-                    "Expected test directory missing at terminal destination: {0}".format(
-                        path
+                if str(path).startswith("Remote check failed for "):
+                    errors.append(
+                        "Terminal destination entry check failed: {0}".format(
+                            path
+                        )
                     )
-                )
+                else:
+                    errors.append(
+                        "Expected test directory missing under terminal destination root: {0}".format(
+                            path
+                        )
+                    )
     return errors
 
 
-def cleanup_test_with_data_outputs(test_plan, transfers_df, seed_plan):
+def cleanup_test_with_data_outputs(test_plan, transfers_df, seed_plan, runtime_dirs=None):
     """Remove seeded test directories and runtime artifacts after a test-with-data run."""
     entry_names = sorted({
         entry_name
@@ -556,6 +1038,7 @@ def cleanup_test_with_data_outputs(test_plan, transfers_df, seed_plan):
     })
     cleanup_test_with_data_entries(test_plan, entry_names)
     cleanup_test_with_data_runtime_artifacts(transfers_df)
+    cleanup_test_with_data_generated_scripts(runtime_dirs)
 
 
 def ask_yes_no(prompt_text):
@@ -567,20 +1050,152 @@ def ask_yes_no(prompt_text):
     try:
         response = input().strip().lower()
         return response in ['y', 'yes']
+    except EOFError:
+        print()
+        return False
     except KeyboardInterrupt:
         print("\n{0}Operation cancelled.{1}".format(Colors.YELLOW, Colors.END))
         return False
 
 
-def run_test_with_data(config_file=None, transfers_file=None):
+def run_cron_deployment_prompt():
+    """Offer an interactive cron deployment for the current system/user."""
+    current_system = get_current_system()
+    current_user = get_current_user()
+
+    print_header("Cron Deployment")
+    print_status(
+        "Deployment target",
+        "INFO",
+        "{0}@{1}".format(current_user, current_system),
+    )
+
+    if not ask_yes_no("Do you want to deploy the cron files now?"):
+        print_status(
+            "Cron deployment",
+            "INFO",
+            "Skipped. Re-run `landingzones deploy cron` when ready.",
+        )
+        return False
+
+    deploy_ok = deploy_cron_files(current_system, current_user)
+    if deploy_ok:
+        print_status(
+            "Cron deployment",
+            "OK",
+            "Cron files deployed and activated. Use `crontab -l` to review active jobs.",
+        )
+    else:
+        print_status(
+            "Cron deployment",
+            "ERROR",
+            "Deployment failed. Review the errors above and retry when ready.",
+        )
+    return deploy_ok
+
+
+def normalize_endpoint_display(value):
+    """Render a local or remote endpoint with redundant slashes collapsed."""
+    user, host, path = parse_remote_destination(value)
+    normalized_path = normalize_directory_path(path)
+    if host:
+        return "{0}:{1}".format(build_ssh_target(user, host), normalized_path)
+    return normalized_path
+
+
+def missing_directory_key(entry):
+    """Return a stable dedupe key for a missing directory record."""
+    if entry['scope'] == 'remote':
+        return (
+            entry['scope'],
+            entry['user'] or '',
+            entry['host'],
+            str(entry['port'] or ''),
+            entry['path'],
+        )
+    return (entry['scope'], entry['path'])
+
+
+def add_missing_directory(missing_directories, entry):
+    """Append a missing directory record if it is not already present."""
+    key = missing_directory_key(entry)
+    if key in {missing_directory_key(item) for item in missing_directories}:
+        return
+    missing_directories.append(entry)
+
+
+def format_missing_directory(entry):
+    """Return a user-facing display string for a missing directory."""
+    if entry['scope'] == 'remote':
+        return "{0}:{1}".format(
+            build_ssh_target(entry['user'], entry['host']),
+            entry['path'],
+        )
+    return entry['path']
+
+
+def create_missing_directories(missing_directories):
+    """Attempt to create the collected missing directories."""
+    if not missing_directories:
+        return True
+
+    print_header("Create Missing Directories")
+    all_ok = True
+
+    for entry in missing_directories:
+        display_path = format_missing_directory(entry)
+        if entry['scope'] == 'local':
+            try:
+                os.makedirs(entry['path'], exist_ok=True)
+                print_status(
+                    "Create local directory",
+                    "OK",
+                    display_path,
+                )
+            except OSError as exc:
+                print_status(
+                    "Create local directory",
+                    "ERROR",
+                    "{0}: {1}".format(display_path, exc),
+                )
+                all_ok = False
+            continue
+
+        command = 'mkdir -p {0}'.format(shell_path(entry['path']))
+        rc, _, stderr = run_remote_shell(
+            entry['user'],
+            entry['host'],
+            command,
+            entry['port'],
+        )
+        if rc == 0:
+            print_status(
+                "Create remote directory",
+                "OK",
+                display_path,
+            )
+        else:
+            print_status(
+                "Create remote directory",
+                "ERROR",
+                "{0}: {1}".format(display_path, stderr.strip() or 'unknown error'),
+            )
+            all_ok = False
+
+    return all_ok
+
+
+def run_test_with_data(config_file=None, transfers_file=None, slow=False):
     """Run generated scripts against seeded toy-data in the real test tree."""
     print_header("Transfer Test With Data")
     snapshot = _snapshot_config_state()
     current_system = None
     current_user = None
+    all_transfers_df = None
     transfers_df = None
     test_plan = None
     seed_plan = None
+    runtime_dirs = None
 
     try:
         work_root = os.getcwd()
@@ -602,8 +1217,14 @@ def run_test_with_data(config_file=None, transfers_file=None):
         toy_data_root = config.test_data
         if not os.path.isabs(toy_data_root):
             toy_data_root = os.path.abspath(os.path.join(work_root, toy_data_root))
+        all_transfers_df = load_test_with_data_transfer_graph(
+            transfers_path, work_root
+        )
         transfers_df = load_test_with_data_transfers(
             transfers_path, current_system, current_user, work_root
+        )
+        runtime_dirs = get_test_with_data_runtime_dirs(
+            current_system, current_user
         )
         test_plan = build_run_test_plan(transfers_df)
         seed_plan = build_test_with_data_seed_plan(
@@ -614,8 +1235,37 @@ def run_test_with_data(config_file=None, transfers_file=None):
             for seed in seed_plan
             for entry_name in seed['entry_names']
         })
-        cleanup_test_with_data_entries(test_plan, expected_entry_names)
+        existing_state = build_test_with_data_existing_state(
+            test_plan, expected_entry_names
+        )
+        cleanup_mode = ask_test_with_data_existing_state_action(existing_state)
+        if cleanup_mode != 'leave':
+            cleanup_test_with_data_endpoint_entries(
+                build_test_with_data_cleanup_map(existing_state, cleanup_mode)
+            )
+            print_status(
+                "Pre-existing test data cleanup",
+                "OK",
+                "Removed {0} entries before seeding".format(cleanup_mode),
+            )
+        else:
+            remaining_blockers = [
+                item for item in existing_state
+                if item['blockers']
+            ]
+            if remaining_blockers:
+                print_status(
+                    "Pre-existing test data cleanup",
+                    "ERROR",
+                    "Blocking entries left in place:\n{0}".format(
+                        summarize_test_with_data_existing_state(
+                            remaining_blockers
+                        )
+                    ),
+                )
+                return False
         cleanup_test_with_data_runtime_artifacts(transfers_df)
+        cleanup_test_with_data_generated_scripts(runtime_dirs)
         seeded_count = seed_test_data_sources(seed_plan)
         print_status(
             "Seeded toy data",
@@ -630,9 +1280,12 @@ def run_test_with_data(config_file=None, transfers_file=None):
                 "WARN",
                 "No flock binary found on PATH; test-with-data is running without lock enforcement",
             )
-        scripts_dir = config.get_rit_managed_path(current_system, 'sh_output')
-        crontab_dir = config.get_rit_managed_path(current_system, 'crontabs')
-        generate_test_scripts(transfers_df, scripts_dir, crontab_dir)
+        scripts_dir = runtime_dirs['scripts_dir']
+        crontab_dir = runtime_dirs['crontab_dir']
+        validation_scripts_dir = runtime_dirs['validation_scripts_dir']
+        generate_test_scripts(
+            transfers_df, scripts_dir, crontab_dir, validation_scripts_dir
+        )
 
         print_status(
             "Generated test scripts",
@@ -643,7 +1296,9 @@ def run_test_with_data(config_file=None, transfers_file=None):
         expected_contents = build_test_with_data_expectations(
             transfers_df, seed_plan
         )
-        run_results = run_generated_scripts(transfers_df, scripts_dir)
+        run_results = run_generated_scripts(
+            transfers_df, scripts_dir, slow=slow
+        )
         failed_runs = [result for result in run_results if result['returncode'] != 0]
         if failed_runs:
             first_failure = failed_runs[0]
@@ -687,10 +1342,26 @@ def run_test_with_data(config_file=None, transfers_file=None):
             "OK",
             "Seeded toy-data directories reached all terminal destinations",
         )
+        downstream_handoffs = build_test_with_data_handoffs(
+            all_transfers_df,
+            transfers_df,
+            slow=slow,
+        )
+        if downstream_handoffs:
+            print_test_with_data_handoffs(downstream_handoffs)
+            print_status(
+                "Test-with-data handoff",
+                "INFO",
+                "Left propagated data and runtime artifacts in place so the downstream system can continue the flow",
+            )
+            return True
+
         if ask_yes_no(
             "Do you want to clean up the propagated output locations so test-with-data can be rerun from the initial state?"
         ):
-            cleanup_test_with_data_outputs(test_plan, transfers_df, seed_plan)
+            cleanup_test_with_data_outputs(
+                test_plan, transfers_df, seed_plan, runtime_dirs
+            )
             print_status(
                 "Test-with-data cleanup",
                 "OK",
@@ -706,499 +1377,8 @@ def run_test_with_data(config_file=None, transfers_file=None):
     finally:
         _restore_config_state(snapshot)
 
-
-def check_required_tools():
-    """Check if required system tools are available"""
-    print_header("Checking Required Tools")
-    
-    tools = ['rsync', 'ssh', 'find']
-    
-    all_good = True
-    
-    for tool in tools:
-        try:
-            proc = subprocess.Popen(['which', tool], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = proc.communicate()
-            result_returncode = proc.returncode
-            result_stdout = stdout.decode('utf-8')
-            if result_returncode == 0:
-                location = result_stdout.strip()
-                print_status("{0} available".format(tool), "OK", "Location: {0}".format(location))
-            else:
-                print_status("{0} missing".format(tool), "ERROR", 
-                           "Please install {0}".format(tool))
-                all_good = False
-        except Exception as e:
-            print_status("{0} check failed".format(tool), "ERROR", str(e))
-            all_good = False
-    
-    return all_good
-
-
-def check_flock_command(system):
-    """Check whether the configured flock binary exists and is executable."""
-    flock_path = config.get_flock_path(system)
-    expanded_path = os.path.expandvars(os.path.expanduser(flock_path))
-
-    if not os.path.exists(expanded_path):
-        print_status("Flock binary", "ERROR",
-                     "Configured path does not exist: {0}".format(flock_path))
-        return False
-
-    if not os.access(expanded_path, os.X_OK):
-        print_status("Flock binary", "ERROR",
-                     "Configured path is not executable: {0}".format(flock_path))
-        return False
-
-    print_status("Flock binary", "OK",
-                 "Using: {0}".format(flock_path))
-    return True
-
-
-def check_local_directory(path, description, check_writable=True):
-    """Check if a local directory exists and is writable
-    
-    If the path ends with a wildcard (e.g., /path/to/dir/*), 
-    it will check the parent directory instead.
-    """
-    # Expand both environment variables ($HOME, $USER, etc.) and user home (~)
-    expanded_path = os.path.expandvars(os.path.expanduser(path))
-    
-    # Handle wildcards at the end of the path
-    # If path ends with /* or /*, check the parent directory instead
-    check_path = expanded_path
-    is_wildcard = False
-    if expanded_path.endswith('/*') or expanded_path.endswith('*'):
-        # Strip the wildcard and trailing slash
-        check_path = expanded_path.rstrip('*').rstrip('/')
-        is_wildcard = True
-        if description == "Source directory":
-            description = "Source directory (wildcard pattern)"
-    
-    if not os.path.exists(check_path):
-        print_status("{0}".format(description), "ERROR", "Directory does not exist: {0}".format(path))
-        return False
-    
-    if not os.path.isdir(check_path):
-        print_status("{0}".format(description), "ERROR", "Path exists but is not a directory: {0}".format(path))
-        return False
-    
-    if check_writable and not os.access(check_path, os.W_OK):
-        print_status("{0}".format(description), "ERROR", "Directory is not writable: {0}".format(path))
-        return False
-    
-    if is_wildcard:
-        print_status("{0}".format(description), "OK", "Parent path: {0}".format(check_path))
-    else:
-        print_status("{0}".format(description), "OK", "Path: {0}".format(check_path))
-    return True
-
-
-def parse_remote_destination(destination):
-    """Parse a transfer endpoint into remote target components."""
-    value = str(destination).strip() if destination is not None else ''
-    if ':' not in value:
-        return None, None, value
-
-    remote, path = value.split(':', 1)
-    if not remote or not path or '/' in remote:
-        return None, None, value
-
-    if '@' in remote:
-        user, host = remote.split('@', 1)
-        if user and host:
-            return user, host, path
-        return None, None, value
-
-    return None, remote, path
-
-
-def build_ssh_target(user, host):
-    """Build an ssh target string from parsed endpoint parts."""
-    if user:
-        return '{0}@{1}'.format(user, host)
-    return host
-
-
-def check_ssh_connection(user, host, port=None):
-    """Check SSH connection to remote host"""
-    try:
-        cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
-        if port:
-            cmd.extend(['-p', str(port)])
-        cmd.extend([build_ssh_target(user, host), 'echo', 'SSH_TEST_OK'])
-        
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = proc.communicate()
-        result_returncode = proc.returncode
-        result_stdout = stdout.decode('utf-8')
-        result_stderr = stderr.decode('utf-8')
-        
-        if result_returncode == 0 and 'SSH_TEST_OK' in result_stdout:
-            return True, "Connection successful"
-        else:
-            return False, "SSH failed: {0}".format(result_stderr.strip() if result_stderr else 'Unknown error')
-    
-    except Exception as e:
-        return False, "SSH test error: {0}".format(str(e))
-
-
-def check_remote_directory(
-    user, host, path, port=None, description="Remote directory", check_writable=True
-):
-    """Check if a remote directory exists and is optionally writable."""
-    try:
-        cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
-        if port:
-            cmd.extend(['-p', str(port)])
-        
-        if check_writable:
-            test_cmd = (
-                '[ -d "{0}" ] && [ -w "{0}" ] && echo "DIR_OK" || echo "DIR_FAIL"'
-            ).format(path)
-        else:
-            test_cmd = '[ -d "{0}" ] && echo "DIR_OK" || echo "DIR_FAIL"'.format(path)
-        cmd.extend([build_ssh_target(user, host), test_cmd])
-        
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = proc.communicate()
-        result_returncode = proc.returncode
-        result_stdout = stdout.decode('utf-8')
-        result_stderr = stderr.decode('utf-8')
-        
-        if result_returncode == 0:
-            if 'DIR_OK' in result_stdout:
-                if check_writable:
-                    return True, "Directory exists and is writable"
-                return True, "Directory exists"
-            if check_writable:
-                return False, "Directory does not exist or is not writable"
-            return False, "Directory does not exist"
-        else:
-            return False, "Remote check failed: {0}".format(result_stderr.strip())
-    
-    except Exception as e:
-        return False, "Remote directory check error: {0}".format(str(e))
-
-
-def check_log_directory(log_file_path):
-    """Check if log directory exists and create if necessary"""
-    if not log_file_path or log_file_path == 'nan':
-        return True, "No log file specified"
-    
-    # Expand both environment variables ($HOME, $USER, etc.) and user home (~)
-    expanded_path = os.path.expandvars(os.path.expanduser(log_file_path))
-    log_dir = os.path.dirname(expanded_path)
-    
-    if not log_dir:  # Relative path in current directory
-        return True, "Log file in current directory"
-    
-    if not os.path.exists(log_dir):
-        try:
-            os.makedirs(log_dir)
-            return True, "Created log directory: {0}".format(log_dir)
-        except OSError as e:
-            # Handle race condition where directory was created by another process
-            if e.errno == errno.EEXIST and os.path.isdir(log_dir):
-                pass
-            else:
-                return False, "Cannot create log directory {0}: {1}".format(log_dir, str(e))
-    
-    if not os.access(log_dir, os.W_OK):
-        return False, "Log directory not writable: {0}".format(log_dir)
-    
-    return True, "Log directory OK: {0}".format(log_dir)
-
-
-def check_lock_file_directory(lock_file=None):
-    """Check if lock file directory exists and is writable
-    
-    Args:
-        lock_file: Path to lock file. If None, uses config.default_lock_file
-    """
-    if lock_file is None:
-        lock_file = config.default_lock_file
-    
-    lock_dir = os.path.dirname(lock_file)
-    
-    # Handle case where lock file is in current directory
-    if not lock_dir:
-        lock_dir = '.'
-    
-    if not os.path.exists(lock_dir):
-        print_status("Lock file directory", "ERROR", "Directory does not exist: {0}".format(lock_dir))
-        return False
-    
-    if not os.access(lock_dir, os.W_OK):
-        print_status("Lock file directory", "ERROR", "Directory not writable: {0}".format(lock_dir))
-        return False
-    
-    print_status("Lock file directory", "OK", "Path: {0} (lock: {1})".format(lock_dir, lock_file))
-    return True
-
-
-def get_current_user():
-    """Get current user and allow selection if multiple users exist in transfers"""
-    current_user = os.environ.get('USER', os.environ.get('USERNAME', ''))
-    transfers_file = config.transfers_file
-    
-    try:
-        df = parse_transfers_file(transfers_file)
-        users = df['users'].unique()
-        
-        # If current user is in the list, use it
-        if current_user in users:
-            return current_user
-        
-        # If only one user, use that
-        if len(users) == 1:
-            return users[0]
-            
-    except Exception:
-        pass
-    
-    # Ask user if we can't determine
-    print("\n{0}Current user: {1}{2}".format(Colors.YELLOW, current_user, Colors.END))
-    print("Available users in {0}:".format(transfers_file))
-    
-    try:
-        df = parse_transfers_file(transfers_file)
-        users = df['users'].unique()
-        for i, user in enumerate(users, 1):
-            marker = " (current)" if user == current_user else ""
-            print("  {0}. {1}{2}".format(i, user, marker))
-        
-        while True:
-            try:
-                choice = input("\nSelect user (1-{0}) or enter username: ".format(len(users))).strip()
-                if choice.isdigit():
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(users):
-                        return users[idx]
-                elif choice in users:
-                    return choice
-                elif not choice and current_user in users:
-                    return current_user
-                print("Invalid choice. Please try again.")
-            except KeyboardInterrupt:
-                print("\nOperation cancelled.")
-                sys.exit(1)
-    
-    except Exception as e:
-        print("Could not read {0}: {1}".format(transfers_file, e))
-        return current_user if current_user else input("Please enter your username: ").strip()
-
-
-def get_current_system():
-    """Determine current system based on hostname or user input"""
-    hostname = socket.gethostname().lower()
-    transfers_file = config.transfers_file
-    
-    # Try to match hostname against systems defined in transfers.tsv
-    try:
-        df = parse_transfers_file(transfers_file)
-        systems = df['system'].unique()
-        
-        # Check if hostname contains any known system name
-        for system in systems:
-            if system.lower() in hostname:
-                return system
-    except Exception:
-        pass
-    
-    # Ask user if we can't determine
-    print("\n{0}Current hostname: {1}{2}".format(Colors.YELLOW, hostname, Colors.END))
-    print("Available systems in {0}:".format(transfers_file))
-    
-    try:
-        df = parse_transfers_file(transfers_file)
-        systems = df['system'].unique()
-        for i, system in enumerate(systems, 1):
-            print("  {0}. {1}".format(i, system))
-        
-        while True:
-            try:
-                choice = input("\nSelect your system (1-{0}) or enter system name: ".format(len(systems))).strip()
-                if choice.isdigit():
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(systems):
-                        return systems[idx]
-                elif choice in systems:
-                    return choice
-                print("Invalid choice. Please try again.")
-            except KeyboardInterrupt:
-                print("\nOperation cancelled.")
-                sys.exit(1)
-    
-    except Exception as e:
-        print("Could not read {0}: {1}".format(transfers_file, e))
-        return input("Please enter your system name: ").strip()
-
-
-def generate_cron_files():
-    """Generate cron files using the installed module.
-
-    Prefer calling landingzones.generate_cron_files.main() directly.
-    Falls back to `python -m landingzones.generate_cron_files` if import fails.
-    """
-    # First, try to import and call the module directly
-    try:
-        from landingzones import generate_cron_files as gcf
-        # Capture stdout so we can show a concise message to the user
-        output_capture = None
-        old_stdout = None
-        if StringIO is not None:
-            output_capture = StringIO()
-            old_stdout = sys.stdout
-            sys.stdout = output_capture
-        try:
-            gcf.main()
-        finally:
-            if old_stdout is not None:
-                sys.stdout = old_stdout
-        details = output_capture.getvalue() if output_capture is not None else "Generated cron files"
-        return True, details
-    except Exception as import_err:
-        # Fallback to module execution via python -m
-        try:
-            proc = subprocess.Popen([sys.executable, '-m', 'landingzones.generate_cron_files'],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = proc.communicate()
-            rc = proc.returncode
-            out = stdout.decode('utf-8') if stdout else ''
-            err = stderr.decode('utf-8') if stderr else ''
-            if rc == 0:
-                return True, out or 'Generated cron files'
-            return False, "Generation failed: {0}".format(err or out)
-        except Exception as e:
-            return False, "Error running generator: {0}".format(str(e))
-
-
-def setup_crontab_directory():
-    """Ensure ~/crontab.d directory exists"""
-    crontab_dir = os.path.expandvars(os.path.expanduser("~/crontab.d"))
-    try:
-        os.makedirs(crontab_dir)
-        return True, "Directory ready: {0}".format(crontab_dir)
-    except OSError as e:
-        # Handle race condition where directory already exists
-        if e.errno == errno.EEXIST and os.path.isdir(crontab_dir):
-            return True, "Directory ready: {0}".format(crontab_dir)
-        else:
-            return False, "Cannot create directory {0}: {1}".format(crontab_dir, str(e))
-
-
-def deploy_cron_files(current_system, current_user=None):
-    """Deploy cron files for the current system and user
-    
-    Args:
-        current_system: The system name to deploy for
-        current_user: The user to deploy for (defaults to current OS user)
-    """
-    if current_user is None:
-        current_user = os.environ.get('USER', os.environ.get('USERNAME', ''))
-    
-    print_header("Automatic Cron Deployment")
-    print_status("Deploying for", "INFO", "{0}@{1}".format(current_user, current_system))
-
-    # Step 1: Ensure local crontab.d exists before generation
-    dir_ok, dir_msg = setup_crontab_directory()
-    print_status("Crontab directory setup", "OK" if dir_ok else "ERROR", dir_msg)
-    if not dir_ok:
-        return False
-
-    # Step 2: Generate cron files via installed module
-    print_status("Generating cron files", "INFO", "Using landingzones.generate_cron_files")
-    gen_ok, gen_msg = generate_cron_files()
-    if not gen_ok:
-        print_status("Cron file generation", "WARN", gen_msg)
-        print_status("Continuing deployment", "INFO", "Will use existing files in crontab.d/")
-    else:
-        print_status("Cron file generation", "OK", gen_msg)
-    
-    # Step 3: Find and copy relevant cron files
-    cron_files = []
-    try:
-        # Look for cron files that match the current system and user in crontab.d/
-        # File format: system.user.Landing_Zone.cron
-        pattern = "crontab.d/{0}.{1}.Landing_Zone.cron".format(current_system, current_user)
-        matches = glob.glob(pattern)
-        
-        if not matches:
-            msg = (
-                "No new files for '{0}@{1}'. Using existing crontab.d/"
-            ).format(current_user, current_system)
-            print_status("Cron file discovery", "WARN", msg)
-            return True  # Not an error, just no files to deploy
-
-        cron_files = matches
-        found_msg = "Found {0} files".format(len(cron_files))
-        print_status("Cron file discovery", "OK", found_msg)
-    except Exception as e:
-        print_status("Cron file discovery", "ERROR", "Search failed: {0}".format(str(e)))
-        return False
-    
-    # Step 4: Copy files to ~/crontab.d/
-    crontab_dir = os.path.expandvars(os.path.expanduser("~/crontab.d"))
-    copied_files = []
-    
-    for cron_file in cron_files:
-        try:
-            # Extract just the filename from the path (remove crontab.d/ prefix)
-            filename = os.path.basename(cron_file)
-            dest_path = os.path.join(crontab_dir, filename)
-            shutil.copy2(cron_file, dest_path)
-            copied_files.append(filename)
-            print_status("Copy {0}".format(filename), "OK", "Copied to {0}".format(dest_path))
-        except Exception as e:
-            print_status("Copy {0}".format(cron_file), "ERROR", "Failed: {0}".format(str(e)))
-            return False
-    
-    if not copied_files:
-        return True  # Nothing to deploy
-    
-    # Step 5: Activate cron jobs
-    try:
-        # Run: cat ~/crontab.d/*.cron | crontab -
-        crontab_pattern = os.path.join(crontab_dir, "*.cron")
-        cmd = "cat {0} | crontab -".format(crontab_pattern)
-        
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = proc.communicate()
-        result_returncode = proc.returncode
-        result_stderr = stderr.decode('utf-8')
-
-        if result_returncode == 0:
-            print_status("Crontab activation", "OK",
-                         "Activated {0} cron files".format(len(copied_files)))
-
-            # Show current crontab for verification
-            verify_proc = subprocess.Popen(['crontab', '-l'],
-                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            verify_stdout, verify_stderr = verify_proc.communicate()
-            verify_returncode = verify_proc.returncode
-            verify_result_stdout = verify_stdout.decode('utf-8')
-            if verify_returncode == 0:
-                lines = verify_result_stdout.split('\n')
-                active_jobs = len([line for line in lines
-                                   if (line.strip() and
-                                       not line.startswith('#'))])
-                print_status("Crontab verification", "OK",
-                             "Total active cron jobs: {0}".format(active_jobs))
-
-            return True
-        else:
-            print_status("Crontab activation", "ERROR",
-                         "Failed: {0}".format(result_stderr.strip()))
-            return False
-    
-    except Exception as e:
-        print_status("Crontab activation", "ERROR", "Error: {0}".format(str(e)))
-        return False
-
-
-def main():
-    """Main verification function"""
+def main(argv=None):
+    """Main verification function."""
     # Parse command line arguments
     parser = argparse.ArgumentParser(
         description='Check deployment readiness for Landing Zone cron jobs'
@@ -1218,19 +1398,39 @@ def main():
         action='store_true',
         help='Seed toy data from config.test_data into the real test tree and execute the generated transfer scripts'
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        '--slow',
+        action='store_true',
+        help='With --test-with-data, print each completed step and wait for Enter before continuing'
+    )
+    parser.add_argument(
+        '--validation-scripts-dir',
+        default=None,
+        help='Directory containing generated validation wrappers (overrides config)'
+    )
+    parser.add_argument(
+        '--deploy-cron',
+        action='store_true',
+        help='Prompt to deploy the generated cron files for the current system/user'
+    )
+    args = parser.parse_args(argv)
     
     # Load configuration from file and/or command line arguments
     config.load_config(
         config_file=args.config,
-        transfers_file=args.transfers
+        transfers_file=args.transfers,
+        validation_scripts_dir=args.validation_scripts_dir,
     )
 
     if args.test_with_data:
         return run_test_with_data(
             config_file=args.config,
             transfers_file=args.transfers,
+            slow=args.slow,
         )
+
+    if args.deploy_cron:
+        return run_cron_deployment_prompt()
     
     print("{0}{1}".format(Colors.BOLD, Colors.BLUE))
     print("╔══════════════════════════════════════════════════════════════╗")
@@ -1250,7 +1450,7 @@ def main():
     
     # Load and filter transfers
     try:
-        df = parse_transfers_file(transfers_file)
+        df = load_runtime_transfers(transfers_file=transfers_file)
         
         print_status("Configuration file", "OK", "Loaded {0} active transfers".format(len(df)))
     except Exception as e:
@@ -1264,7 +1464,7 @@ def main():
         Colors.BOLD, current_system, current_user, Colors.END))
     
     # Filter transfers for current system and user
-    system_transfers = df[(df['system'] == current_system) & (df['users'] == current_user)]
+    system_transfers = filter_transfers_by_system_user(df, current_system, current_user)
     if len(system_transfers) == 0:
         # Check if there are transfers for the system but different user
         system_only = df[df['system'] == current_system]
@@ -1288,9 +1488,15 @@ def main():
     
     # Check each transfer
     all_transfers_ok = True
+    missing_directories = []
     
     for _, transfer in system_transfers.iterrows():
-        print_header("Transfer: {0} → {1}".format(transfer['source'], transfer['destination']))
+        print_header(
+            "Transfer: {0} → {1}".format(
+                normalize_endpoint_display(transfer['source']),
+                normalize_endpoint_display(transfer['destination']),
+            )
+        )
         
         transfer_ok = True
         
@@ -1313,22 +1519,53 @@ def main():
                 ssh_msg,
             )
             if ssh_ok:
-                dir_ok, dir_msg = check_remote_directory(
+                remote_source_info = inspect_remote_directory(
                     source_user,
                     source_host,
                     source_path,
-                    source_port,
-                    "Source directory",
+                    port=source_port,
                     check_writable=False,
                 )
-                print_status("Source directory", "OK" if dir_ok else "ERROR", dir_msg)
-                if not dir_ok:
+                print_status(
+                    "Source directory",
+                    "OK" if remote_source_info['ok'] else "ERROR",
+                    remote_source_info['message'],
+                )
+                if not remote_source_info['ok']:
                     transfer_ok = False
+                    if remote_source_info['missing']:
+                        add_missing_directory(
+                            missing_directories,
+                            {
+                                'scope': 'remote',
+                                'user': source_user,
+                                'host': source_host,
+                                'port': source_port,
+                                'path': remote_source_info['path'],
+                            },
+                        )
             else:
                 transfer_ok = False
         else:
-            if not check_local_directory(transfer['source'], "Source directory"):
+            local_source_info = inspect_local_directory(
+                transfer['source'],
+                check_writable=False,
+            )
+            print_status(
+                "Source directory",
+                "OK" if local_source_info['ok'] else "ERROR",
+                local_source_info['message'],
+            )
+            if not local_source_info['ok']:
                 transfer_ok = False
+                if local_source_info['missing']:
+                    add_missing_directory(
+                        missing_directories,
+                        {
+                            'scope': 'local',
+                            'path': local_source_info['path'],
+                        },
+                    )
         
         # Check destination
         user, host, dest_path = parse_remote_destination(transfer['destination'])
@@ -1341,7 +1578,12 @@ def main():
         if host:
             # Remote destination
             remote_label = build_ssh_target(user, host)
-            print("\n  Remote destination: {0}:{1}".format(remote_label, dest_path))
+            print(
+                "\n  Remote destination: {0}:{1}".format(
+                    remote_label,
+                    normalize_directory_path(dest_path),
+                )
+            )
             if port:
                 print("  Using port: {0}".format(port))
             
@@ -1350,17 +1592,54 @@ def main():
             print_status("SSH connection to {0}".format(host), "OK" if ssh_ok else "ERROR", ssh_msg)
             
             if ssh_ok:
-                # Check remote directory
-                dir_ok, dir_msg = check_remote_directory(user, host, dest_path, port, "Remote destination")
-                print_status("Remote destination directory", "OK" if dir_ok else "ERROR", dir_msg)
-                if not dir_ok:
+                remote_dest_info = inspect_remote_directory(
+                    user,
+                    host,
+                    dest_path,
+                    port=port,
+                    check_writable=True,
+                )
+                print_status(
+                    "Remote destination directory",
+                    "OK" if remote_dest_info['ok'] else "ERROR",
+                    remote_dest_info['message'],
+                )
+                if not remote_dest_info['ok']:
                     transfer_ok = False
+                    if remote_dest_info['missing']:
+                        add_missing_directory(
+                            missing_directories,
+                            {
+                                'scope': 'remote',
+                                'user': user,
+                                'host': host,
+                                'port': port,
+                                'path': remote_dest_info['path'],
+                            },
+                        )
             else:
                 transfer_ok = False
         else:
             # Local destination
-            if not check_local_directory(dest_path, "Destination directory"):
+            local_dest_info = inspect_local_directory(
+                dest_path,
+                check_writable=True,
+            )
+            print_status(
+                "Destination directory",
+                "OK" if local_dest_info['ok'] else "ERROR",
+                local_dest_info['message'],
+            )
+            if not local_dest_info['ok']:
                 transfer_ok = False
+                if local_dest_info['missing']:
+                    add_missing_directory(
+                        missing_directories,
+                        {
+                            'scope': 'local',
+                            'path': local_dest_info['path'],
+                        },
+                    )
         
         # Check log file directory
         log_file = transfer.get('log_file', '')
@@ -1383,6 +1662,30 @@ def main():
             all_transfers_ok = False
         
         print()  # Blank line between transfers
+
+    if missing_directories:
+        print_header("Missing Directories")
+        print_status(
+            "Missing directory count",
+            "INFO",
+            "Found {0} missing directories.".format(len(missing_directories)),
+        )
+        for entry in missing_directories:
+            print("  - {0}".format(format_missing_directory(entry)))
+        if ask_yes_no("Do you want to attempt to create these missing directories now?"):
+            create_ok = create_missing_directories(missing_directories)
+            if create_ok:
+                print_status(
+                    "Directory creation",
+                    "OK",
+                    "Created all listed directories. Re-run validate deployment to confirm readiness.",
+                )
+            else:
+                print_status(
+                    "Directory creation",
+                    "ERROR",
+                    "Some directories could not be created. Review the errors above.",
+                )
     
     # Final summary
     print_header("Deployment Readiness Summary")
@@ -1393,27 +1696,9 @@ def main():
         print_status("System ready for cron deployment", "OK", 
                     "All checks passed! You can safely deploy the cron files.")
         print("\n{0}{1}✓ READY TO DEPLOY{2}".format(Colors.GREEN, Colors.BOLD, Colors.END))
-        
-        # Ask user if they want automatic deployment
-        if ask_yes_no("Do you want to automatically deploy the cron files now?"):
-            print_header("Automatic Deployment")
-            deploy_ok = deploy_cron_files(current_system, current_user)
-            
-            if deploy_ok:
-                success_msg = ("\n{0}🚀 Deployment completed "
-                               "successfully!{1}").format(Colors.GREEN, Colors.END)
-                print(success_msg)
-                print("Your cron jobs are now active and will run "
-                      "according to schedule.")
-                print("Use 'crontab -l' to view active jobs.")
-            else:
-                print("\n{0}❌ Deployment failed.{1}".format(Colors.RED, Colors.END))
-                print("Please check the errors above and deploy manually.")
-        else:
-            print("\nManual deployment steps:")
-            print("1. Run: python generate_cron_files.py")
-            print("2. Copy relevant .cron files to ~/crontab.d/")
-            print("3. Activate: cat ~/crontab.d/*.cron | crontab -")
+        print("\nNext steps after all validations pass:")
+        print("1. Run: landingzones validate integration")
+        print("2. Deploy crons when ready: landingzones deploy cron")
     else:
         print_status("System deployment readiness", "ERROR",
                      "Please fix the issues above before deploying "

@@ -163,15 +163,18 @@ class TestConfigClass:
         assert cfg.log_dir == 'log'
         assert cfg.output_dir == 'output'
         assert cfg.input_dir == 'input'
+        assert cfg.validation_scripts_dir == os.path.join('output', 'validation_scripts')
     
     def test_config_from_yaml(self, tmp_path, monkeypatch):
         """Test that Config loads values from config.yaml"""
         config_file = tmp_path / "config.yaml"
         config_file.write_text(
+            "report_transfer_log_file: shared/transfers.tsv\n"
             "log_dir: custom_log\n"
             "output_dir: custom_output\n"
+            "validation_scripts_dir: custom_validation\n"
             "rit_managed_locations:\n"
-            "  calc: /srv/rit_managed\n"
+            "  server1: /srv/rit_managed\n"
             "rit_managed_folder_structure:\n"
             "  sh_output: scripts/out\n"
         )
@@ -181,10 +184,23 @@ class TestConfigClass:
         
         assert cfg.log_dir == 'custom_log'
         assert cfg.output_dir == 'custom_output'
-        assert cfg.get_rit_managed_location('calc') == '/srv/rit_managed'
+        assert cfg.report_transfer_log_file == 'shared/transfers.tsv'
+        assert cfg.validation_scripts_dir == 'custom_validation'
+        assert cfg.get_rit_managed_location('server1') == '/srv/rit_managed'
         assert cfg.get_rit_managed_location('unknown') == 'custom_output'
-        assert cfg.get_rit_managed_path('calc', 'sh_output') == '/srv/rit_managed/scripts/out'
-        assert cfg.get_flock_path('calc') == '/usr/bin/flock'
+        assert cfg.get_rit_managed_path('server1', 'sh_output') == '/srv/rit_managed/scripts/out'
+        assert cfg.get_flock_path('server1') == '/usr/bin/flock'
+
+    def test_report_transfer_log_file_accepts_legacy_yaml_key(self, tmp_path, monkeypatch):
+        """Older configs using transfer_log_file should keep working."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("transfer_log_file: legacy/transfers.tsv\n")
+
+        monkeypatch.chdir(tmp_path)
+        cfg = config.Config()
+
+        assert cfg.report_transfer_log_file == 'legacy/transfers.tsv'
+        assert cfg.transfer_log_file == 'legacy/transfers.tsv'
     
     def test_config_from_config_subdir(self, tmp_path, monkeypatch):
         """Test that Config loads values from config/config.yaml"""
@@ -210,12 +226,45 @@ class TestConfigClass:
         
         assert cfg.log_dir == 'from_env'
 
+    def test_report_transfer_log_file_accepts_legacy_env_var(self, tmp_path, monkeypatch):
+        """Older automation environments should still resolve LZ_TRANSFER_LOG_FILE."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LZ_TRANSFER_LOG_FILE", "/tmp/legacy.tsv")
+
+        cfg = config.Config()
+
+        assert cfg.report_transfer_log_file == '/tmp/legacy.tsv'
+
+    def test_path_variables_merge_env_yaml_and_runtime(self, tmp_path, monkeypatch):
+        """Config path variables should merge env, YAML, and runtime values."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "path_variables:\n"
+            "  YAML_ONLY: /yaml/root\n"
+            "  SHARED_ROOT: /yaml/shared\n"
+        )
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ENV_ONLY", "/env/root")
+        monkeypatch.setenv("SHARED_ROOT", "/env/shared")
+
+        cfg = config.Config()
+        cfg.load_config(path_variables={
+            'RUNTIME_ONLY': '/runtime/root',
+            'SHARED_ROOT': '/runtime/shared',
+        })
+
+        assert cfg.path_variables['ENV_ONLY'] == '/env/root'
+        assert cfg.path_variables['YAML_ONLY'] == '/yaml/root'
+        assert cfg.path_variables['RUNTIME_ONLY'] == '/runtime/root'
+        assert cfg.path_variables['SHARED_ROOT'] == '/runtime/shared'
+
     def test_rit_managed_paths_preserve_configured_paths(self, tmp_path, monkeypatch):
         """Test that rit_managed config values are preserved verbatim."""
         config_file = tmp_path / "config.yaml"
         config_file.write_text(
             "rit_managed_locations:\n"
-            "  calc: ~/calc/output\n"
+            "  server1: ~/server1/output\n"
             "  Promethion_1: $TEST_ROOT/prom/output\n"
             "rit_managed_folder_structure:\n"
             "  sh_output: scripts/out/\n"
@@ -226,16 +275,16 @@ class TestConfigClass:
 
         cfg = config.Config()
 
-        assert cfg.get_rit_managed_location('calc') == "~/calc/output"
+        assert cfg.get_rit_managed_location('server1') == "~/server1/output"
         assert cfg.get_rit_managed_location('Promethion_1') == "$TEST_ROOT/prom/output"
-        assert cfg.get_rit_managed_path('calc', 'sh_output') == "~/calc/output/scripts/out/"
+        assert cfg.get_rit_managed_path('server1', 'sh_output') == "~/server1/output/scripts/out/"
 
     def test_resolve_managed_file_path_from_filename(self, tmp_path, monkeypatch):
         """Test resolving a filename against a system-specific managed directory."""
         config_file = tmp_path / "config.yaml"
         config_file.write_text(
             "rit_managed_locations:\n"
-            "  calc: /srv/rit\n"
+            "  server1: /srv/rit\n"
             "rit_managed_folder_structure:\n"
             "  log: log/\n"
         )
@@ -243,28 +292,55 @@ class TestConfigClass:
         monkeypatch.chdir(tmp_path)
         cfg = config.Config()
 
-        assert cfg.resolve_managed_file_path('calc', 'test.log', 'log') == '/srv/rit/log/test.log'
+        assert cfg.resolve_managed_file_path('server1', 'test.log', 'log') == '/srv/rit/log/test.log'
 
     def test_resolve_managed_file_path_preserves_explicit_path(self, tmp_path, monkeypatch):
         """Test resolving leaves explicit paths unchanged."""
         monkeypatch.chdir(tmp_path)
         cfg = config.Config()
 
-        assert cfg.resolve_managed_file_path('calc', '$HOME/test.log', 'log') == '$HOME/test.log'
+        assert cfg.resolve_managed_file_path('server1', '$HOME/test.log', 'log') == '$HOME/test.log'
 
     def test_get_flock_path_default_and_override(self, tmp_path, monkeypatch):
         """Test per-system flock path override with default fallback."""
         config_file = tmp_path / "config.yaml"
         config_file.write_text(
             "flock_paths:\n"
-            "  calc: /opt/bin/flock\n"
+            "  server1: /opt/bin/flock\n"
         )
 
         monkeypatch.chdir(tmp_path)
         cfg = config.Config()
 
-        assert cfg.get_flock_path('calc') == '/opt/bin/flock'
+        assert cfg.get_flock_path('server1') == '/opt/bin/flock'
         assert cfg.get_flock_path('other') == '/usr/bin/flock'
+
+    def test_notifications_from_yaml_runtime_and_env(self, tmp_path, monkeypatch):
+        """Notification settings should merge YAML, runtime, and env overrides."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "notifications:\n"
+            "  endpoint: https://yaml.example/events\n"
+            "  token_env: YAML_TOKEN\n"
+            "  title: YAML title\n"
+            "  body: YAML body\n"
+            "  timeout_seconds: 9\n"
+        )
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LZ_NOTIFICATION_ENDPOINT", "https://env.example/events")
+        cfg = config.Config()
+        cfg.load_config(notifications={
+            'body': 'Runtime body',
+            'status_file': 'notifications.tsv',
+        })
+
+        assert cfg.notifications['endpoint'] == 'https://env.example/events'
+        assert cfg.notifications['token_env'] == 'YAML_TOKEN'
+        assert cfg.notifications['title'] == 'YAML title'
+        assert cfg.notifications['body'] == 'Runtime body'
+        assert cfg.notifications['timeout_seconds'] == '9'
+        assert cfg.notifications['status_file'] == 'notifications.tsv'
 
 
 class TestLoadConfig:
@@ -290,3 +366,24 @@ class TestLoadConfig:
         cfg.load_config(log_dir='override_log')
         
         assert cfg.log_dir == 'override_log'
+
+    def test_snapshot_and_restore_state(self, tmp_path, monkeypatch):
+        """Snapshots should restore YAML-backed and runtime config state."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "log_dir: from_yaml\n"
+            "output_dir: from_yaml_output\n"
+        )
+
+        monkeypatch.chdir(tmp_path)
+
+        cfg = config.Config()
+        snapshot = cfg.snapshot_state()
+
+        cfg.load_config(log_dir='override_log', output_dir='override_output')
+        assert cfg.log_dir == 'override_log'
+        assert cfg.output_dir == 'override_output'
+
+        cfg.restore_state(snapshot)
+        assert cfg.log_dir == 'from_yaml'
+        assert cfg.output_dir == 'from_yaml_output'
