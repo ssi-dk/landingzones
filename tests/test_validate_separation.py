@@ -16,7 +16,7 @@ def make_transfers_df():
                 "system": "lab-a",
                 "users": "local",
                 "source": "/landing/heartbeat/",
-                "destination": "/calc/heartbeat/",
+                "destination": "/server1/heartbeat/",
                 "tags": "heartbeat,lab",
             },
             {
@@ -24,15 +24,15 @@ def make_transfers_df():
                 "system": "lab-a",
                 "users": "local",
                 "source": "/landing/heartbeat/subdir/",
-                "destination": "/calc/archive/",
+                "destination": "/server1/archive/",
                 "tags": "",
             },
             {
-                "identifiers": "calc_consumer",
-                "system": "calc",
+                "identifiers": "server1_consumer",
+                "system": "server1",
                 "users": "svc",
-                "source": "/calc/heartbeat/",
-                "destination": "/calc/final/",
+                "source": "/server1/heartbeat/",
+                "destination": "/server1/final/",
                 "tags": "",
             },
             {
@@ -40,7 +40,7 @@ def make_transfers_df():
                 "system": "lab-a",
                 "users": "local",
                 "source": "/landing/manual/",
-                "destination": "/calc/manual/",
+                "destination": "/server1/manual/",
                 "tags": "manual",
             },
         ]
@@ -58,7 +58,7 @@ def test_detect_separation_collisions_reports_source_overlap_and_handoff():
     assert set(tagged_df["identifiers"]) == {"heartbeat_stage"}
     assert set(other_df["identifiers"]) == {
         "heartbeat_nested_overlap",
-        "calc_consumer",
+        "server1_consumer",
         "isolated_manual",
     }
     assert {finding["type"] for finding in findings} == {
@@ -71,7 +71,7 @@ def test_detect_separation_collisions_reports_source_overlap_and_handoff():
         if finding["type"] == "source_overlap"
     )
     assert any(
-        finding["other_identifier"] == "calc_consumer"
+        finding["other_identifier"] == "server1_consumer"
         for finding in findings
         if finding["type"] == "destination_handoff"
     )
@@ -152,9 +152,9 @@ def test_main_returns_nonzero_and_prints_warnings(tmp_path, capsys):
         "\n".join(
             [
                 "identifiers\tenabled\tsystem\tusers\tsource\tdestination\ttags",
-                "heartbeat_stage\tTRUE\tlab-a\tlocal\t/landing/heartbeat/\t/calc/heartbeat/\theartbeat,lab",
-                "heartbeat_nested_overlap\tTRUE\tlab-a\tlocal\t/landing/heartbeat/subdir/\t/calc/archive/\t",
-                "calc_consumer\tTRUE\tcalc\tsvc\t/calc/heartbeat/\t/calc/final/\t",
+                "heartbeat_stage\tTRUE\tlab-a\tlocal\t/landing/heartbeat/\t/server1/heartbeat/\theartbeat,lab",
+                "heartbeat_nested_overlap\tTRUE\tlab-a\tlocal\t/landing/heartbeat/subdir/\t/server1/archive/\t",
+                "server1_consumer\tTRUE\tserver1\tsvc\t/server1/heartbeat/\t/server1/final/\t",
             ]
         )
     )

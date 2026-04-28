@@ -1531,20 +1531,21 @@ notify_transfer_event() {{
     idempotency_key="$(sanitize_tsv_field "${{current_run_id}}|${{transfer_identifier}}|${{event_status}}|${{event_directory}}|${{event_source}}|${{event_destination}}")"
     notification_already_sent "$idempotency_key" && return 0
     notification_time_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    if ! command -v curl >/dev/null 2>&1; then
+    curl_bin="${{LANDINGZONES_CURL:-curl}}"
+    if ! command -v "$curl_bin" >/dev/null 2>&1; then
         append_notification_status "$transfer_event_time_utc" "$notification_time_utc" "$idempotency_key" "$event_directory" "$event_source" "$event_destination" "$event_status" "failed" "curl_missing" "1" "curl command not found"
         return 0
     fi
     payload="$(build_notification_payload "$event_status" "$event_directory" "$event_source" "$event_destination" "$event_message" "$idempotency_key")"
     token_value="$(notification_token_value)"
     if [ -n "$token_value" ]; then
-        if http_status="$(curl -sS -o /dev/null -w '%{{http_code}}' --max-time "$notification_timeout_seconds" -H 'Content-Type: application/json' -H "Authorization: Bearer $token_value" -H "Idempotency-Key: $idempotency_key" --data "$payload" "$notification_api_endpoint" 2>/dev/null)"; then
+        if http_status="$("$curl_bin" -sS -o /dev/null -w '%{{http_code}}' --max-time "$notification_timeout_seconds" -H 'Content-Type: application/json' -H "Authorization: Bearer $token_value" -H "Idempotency-Key: $idempotency_key" --data "$payload" "$notification_api_endpoint" 2>/dev/null)"; then
             :
         else
             http_status="curl_error"
         fi
     else
-        if http_status="$(curl -sS -o /dev/null -w '%{{http_code}}' --max-time "$notification_timeout_seconds" -H 'Content-Type: application/json' -H "Idempotency-Key: $idempotency_key" --data "$payload" "$notification_api_endpoint" 2>/dev/null)"; then
+        if http_status="$("$curl_bin" -sS -o /dev/null -w '%{{http_code}}' --max-time "$notification_timeout_seconds" -H 'Content-Type: application/json' -H "Idempotency-Key: $idempotency_key" --data "$payload" "$notification_api_endpoint" 2>/dev/null)"; then
             :
         else
             http_status="curl_error"

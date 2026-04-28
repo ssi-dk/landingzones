@@ -13,7 +13,7 @@ def make_transfers_tsv(tmp_path):
     path.write_text(
         """identifiers\tenabled\tsystem\tusers\tsource\tdestination
 stage_lab\tTRUE\ttest_local\tlocal\t/source/inbox/*\t/flow/stage/
-promote_calc\tTRUE\ttest_local\tlocal\t/flow/stage/\t/flow/final/
+promote_server1\tTRUE\ttest_local\tlocal\t/flow/stage/\t/flow/final/
 pullback\tTRUE\ttest_local\tlocal\t/flow/final/\t/flow/archive/
 other_system\tTRUE\tother\tlocal\t/elsewhere/*\t/unused/
 """
@@ -26,17 +26,17 @@ def make_log_df():
     rows = [
         ("2026-04-09 09:00:00+0200", "stage_lab", "alpha", "/source/inbox/alpha", "/flow/stage/alpha", "initiated", "Heartbeat, Lab"),
         ("2026-04-09 09:10:00+0200", "stage_lab", "alpha", "/source/inbox/alpha", "/flow/stage/alpha", "completed", "heartbeat"),
-        ("2026-04-09 09:20:00+0200", "promote_calc", "alpha", "/flow/stage/alpha", "/flow/final/alpha", "initiated", ""),
-        ("2026-04-09 09:25:00+0200", "promote_calc", "alpha", "/flow/stage/alpha", "/flow/final/alpha", "completed", ""),
+        ("2026-04-09 09:20:00+0200", "promote_server1", "alpha", "/flow/stage/alpha", "/flow/final/alpha", "initiated", ""),
+        ("2026-04-09 09:25:00+0200", "promote_server1", "alpha", "/flow/stage/alpha", "/flow/final/alpha", "completed", ""),
         ("2026-04-09 09:30:00+0200", "pullback", "alpha", "/flow/final/alpha", "/flow/archive/alpha", "initiated", ""),
         ("2026-04-09 09:35:00+0200", "pullback", "alpha", "/flow/final/alpha", "/flow/archive/alpha", "completed", ""),
         ("2026-04-10 07:00:00+0200", "stage_lab", "beta", "/source/inbox/beta", "/flow/stage/beta", "initiated", "lab"),
-        ("2026-04-10 07:20:00+0200", "promote_calc", "beta", "/flow/stage/beta", "/flow/final/beta", "error", "side-flow"),
+        ("2026-04-10 07:20:00+0200", "promote_server1", "beta", "/flow/stage/beta", "/flow/final/beta", "error", "side-flow"),
         ("2026-04-10 08:00:00+0200", "stage_lab", "gamma", "/source/inbox/gamma", "/flow/stage/gamma", "initiated", ""),
-        ("2026-04-10 09:15:00+0200", "promote_calc", "gamma", "/flow/stage/gamma", "/flow/final/gamma", "completed", "lab"),
+        ("2026-04-10 09:15:00+0200", "promote_server1", "gamma", "/flow/stage/gamma", "/flow/final/gamma", "completed", "lab"),
         ("2026-04-10 07:30:00+0200", "stage_lab", "delta", "/source/inbox/delta", "/flow/stage/delta", "initiated", ""),
         ("2026-04-10 09:30:00+0200", "stage_lab", "epsilon", "/source/inbox/epsilon", "/flow/stage/epsilon", "initiated", "manual"),
-        ("2026-04-10 09:35:00+0200", "promote_calc", "epsilon", "/flow/stage/epsilon", "/flow/final/epsilon", "error", "manual"),
+        ("2026-04-10 09:35:00+0200", "promote_server1", "epsilon", "/flow/stage/epsilon", "/flow/final/epsilon", "error", "manual"),
         ("2026-04-10 09:45:00+0200", "pullback", "epsilon", "/flow/final/epsilon", "/flow/archive/epsilon", "completed", "manual"),
     ]
     columns = ["datetime", "identifier", "directory", "source", "destination", "status", "tags"]
@@ -50,7 +50,7 @@ def make_log_df():
 def test_normalize_directory_suffix_handles_paths_and_remote_prefixes():
     assert pts.normalize_directory_suffix("Illumina_TransferTest") == "Illumina_TransferTest"
     assert pts.normalize_directory_suffix("/tmp/a/b/Nanopore_TransferTest/") == "Nanopore_TransferTest"
-    assert pts.normalize_directory_suffix("calck:/home/kimn/Landing_Zone/Illumina_TransferTest") == "Illumina_TransferTest"
+    assert pts.normalize_directory_suffix("server1host:/home/kimn/Landing_Zone/Illumina_TransferTest") == "Illumina_TransferTest"
 
 
 def test_main_skips_report_without_pandas(monkeypatch, capsys):
@@ -86,7 +86,7 @@ def test_resolve_report_input_falls_back_to_system_status_log(monkeypatch):
         lambda system: "/tmp/Landing_Zone_{0}.transfers.tsv".format(system),
     )
 
-    assert pts.resolve_report_input_path(system="calc") == "/tmp/Landing_Zone_calc.transfers.tsv"
+    assert pts.resolve_report_input_path(system="server1") == "/tmp/Landing_Zone_server1.transfers.tsv"
 
 
 def test_load_transfer_log_supports_rich_event_schema(tmp_path):
@@ -193,9 +193,9 @@ def test_build_flow_graph_identifies_terminal_identifier(tmp_path):
 
     system_df, edges, terminal_identifiers = pts.build_flow_graph(transfers_df, "test_local")
 
-    assert set(system_df["identifiers"]) == {"stage_lab", "promote_calc", "pullback"}
-    assert edges["stage_lab"] == {"promote_calc"}
-    assert edges["promote_calc"] == {"pullback"}
+    assert set(system_df["identifiers"]) == {"stage_lab", "promote_server1", "pullback"}
+    assert edges["stage_lab"] == {"promote_server1"}
+    assert edges["promote_server1"] == {"pullback"}
     assert terminal_identifiers == ["pullback"]
 
 

@@ -187,13 +187,13 @@ sample\tserver1\tuser1\t/src/\t/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt
         test_file.write_text(tsv_content)
 
         snapshot = gcf.config.snapshot_state()
-        gcf.config.load_config(artifact_prefix="prod calc")
+        gcf.config.load_config(artifact_prefix="prod server1")
         try:
             df = gcf.parse_transfers_file(str(test_file))
         finally:
             gcf.config.restore_state(snapshot)
 
-        assert df.iloc[0]["script_name"] == "prod_calc__sample.sh"
+        assert df.iloc[0]["script_name"] == "prod_server1__sample.sh"
 
     def test_parse_resolves_log_and_flock_filenames(self, tmp_path):
         """Test that filename-only log and flock values resolve via config."""
@@ -389,7 +389,7 @@ second\tserver1\tuser1\t/src2/\t/dest2/\t\t\t\t/tmp/shared.log\t/tmp/shared.lock
         """Reporting/analysis mode should not require runtime log fields."""
         tsv_content = """identifiers\tenabled\tsystem\tusers\tsource\tdestination
 stage_lab\tTRUE\ttest_local\tlocal\t/source/inbox/*\t/flow/stage/
-promote_calc\tTRUE\ttest_local\tlocal\t/flow/stage/\t/flow/final/
+promote_server1\tTRUE\ttest_local\tlocal\t/flow/stage/\t/flow/final/
 """
         test_file = tmp_path / "minimal_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -400,7 +400,7 @@ promote_calc\tTRUE\ttest_local\tlocal\t/flow/stage/\t/flow/final/
         )
 
         assert len(df) == 2
-        assert list(df["identifiers"]) == ["stage_lab", "promote_calc"]
+        assert list(df["identifiers"]) == ["stage_lab", "promote_server1"]
         assert (df["log_file"] == "").all()
         assert (df["flock_file"] == "").all()
 
@@ -634,7 +634,7 @@ class TestGenerateRsyncCommand:
         fixture_dir = test_data_root / "lab_machine_1" / "FixtureRun"
         fixture_dir.mkdir(parents=True)
         (fixture_dir / "payload.txt").write_text("payload")
-        entry_dir = tmp_path / "tests" / "test_local" / "lab_machine_1" / "Landing_Zone" / "to_calc"
+        entry_dir = tmp_path / "tests" / "test_local" / "lab_machine_1" / "Landing_Zone" / "to_server1"
         entry_dir.mkdir(parents=True)
         next_hop = tmp_path / "next_hop"
         next_hop.mkdir()
@@ -648,7 +648,7 @@ class TestGenerateRsyncCommand:
 
         snapshot = gcf.config.snapshot_state()
         gcf.config.load_config(
-            artifact_prefix="prod-calc",
+            artifact_prefix="prod-server1",
             test_data=str(test_data_root),
         )
         try:
@@ -657,8 +657,8 @@ class TestGenerateRsyncCommand:
         finally:
             gcf.config.restore_state(snapshot)
 
-        assert "lz_run_validation_prod-calc.sh" in names
-        assert "lz_run_validation_prod-calc__flow_a.sh" in names
+        assert "lz_run_validation_prod-server1.sh" in names
+        assert "lz_run_validation_prod-server1__flow_a.sh" in names
 
     def test_remove_stale_validation_scripts_preserves_validation_outputs(self, tmp_path):
         """Validation helper scripts should be preserved in the validation output dir."""
@@ -666,7 +666,7 @@ class TestGenerateRsyncCommand:
         fixture_dir = test_data_root / "lab_machine_1" / "FixtureRun"
         fixture_dir.mkdir(parents=True)
         (fixture_dir / "payload.txt").write_text("payload")
-        entry_dir = tmp_path / "tests" / "test_local" / "lab_machine_1" / "Landing_Zone" / "to_calc"
+        entry_dir = tmp_path / "tests" / "test_local" / "lab_machine_1" / "Landing_Zone" / "to_server1"
         entry_dir.mkdir(parents=True)
         next_hop = tmp_path / "next_hop"
         next_hop.mkdir()
@@ -1121,7 +1121,7 @@ class TestGenerateRsyncCommand:
         fixture_dir = test_data_root / "lab_machine_1" / "FixtureRun"
         fixture_dir.mkdir(parents=True)
         (fixture_dir / "payload.txt").write_text("payload")
-        entry_dir = tmp_path / "tests" / "test_local" / "lab_machine_1" / "Landing_Zone" / "to_calc"
+        entry_dir = tmp_path / "tests" / "test_local" / "lab_machine_1" / "Landing_Zone" / "to_server1"
         entry_dir.mkdir(parents=True)
         next_hop = tmp_path / "next_hop"
         next_hop.mkdir()
@@ -1247,7 +1247,7 @@ class TestGenerateRsyncCommand:
         fixture_dir = test_data_root / "lab_machine_1" / "FixtureRun"
         fixture_dir.mkdir(parents=True)
         (fixture_dir / "payload.txt").write_text("payload")
-        entry_dir = tmp_path / "tests" / "test_local" / "lab_machine_1" / "Landing_Zone" / "to_calc"
+        entry_dir = tmp_path / "tests" / "test_local" / "lab_machine_1" / "Landing_Zone" / "to_server1"
         entry_dir.mkdir(parents=True)
         next_hop = tmp_path / "next_hop"
         next_hop.mkdir()
@@ -1292,7 +1292,7 @@ class TestGenerateRsyncCommand:
         fixture_dir = test_data_root / "lab_machine_1" / "FixtureRun"
         fixture_dir.mkdir(parents=True)
         (fixture_dir / "payload.txt").write_text("payload")
-        entry_dir = tmp_path / "tests" / "test_local" / "lab_machine_1" / "Landing_Zone" / "to_calc"
+        entry_dir = tmp_path / "tests" / "test_local" / "lab_machine_1" / "Landing_Zone" / "to_server1"
         entry_dir.mkdir(parents=True)
         next_hop = tmp_path / "next_hop"
         next_hop.mkdir()
@@ -1584,6 +1584,7 @@ class TestGenerateRsyncCommand:
         fake_curl = fake_bin / "curl"
         fake_curl.write_text("#!/bin/sh\nprintf '200'\n")
         fake_curl.chmod(0o755)
+        monkeypatch.setenv("LANDINGZONES_CURL", str(fake_curl))
         monkeypatch.setenv(
             "PATH",
             "{0}{1}{2}".format(fake_bin, os.pathsep, os.environ.get("PATH", "")),

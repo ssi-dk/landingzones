@@ -285,7 +285,7 @@ class TestCheckFlockCommand:
         """Test that an existing flock binary path passes."""
         monkeypatch.setattr(cdr.config, 'get_flock_path', lambda system: '/bin/sh')
 
-        result = cdr.check_flock_command('calc')
+        result = cdr.check_flock_command('server1')
 
         assert result is True
 
@@ -293,7 +293,7 @@ class TestCheckFlockCommand:
         """Test that a missing flock binary path fails."""
         monkeypatch.setattr(cdr.config, 'get_flock_path', lambda system: '/no/such/flock')
 
-        result = cdr.check_flock_command('calc')
+        result = cdr.check_flock_command('server1')
 
         assert result is False
 
@@ -759,18 +759,18 @@ class TestTestWithData:
         df = pd.DataFrame([
             {
                 'identifiers': 'entry_local',
-                'source': str(tmp_path / 'calc' / 'Landing_Zone' / 'to_ugerm') + '/',
+                'source': str(tmp_path / 'server1' / 'Landing_Zone' / 'to_server2') + '/',
                 'source_port': '',
-                'destination': 'sshdat@ugerm:/users/data/Landing_Zone/from_calc/',
+                'destination': 'sshdat@server2:/users/data/Landing_Zone/from_server1/',
                 'destination_port': '',
                 'test_fixture_names': 'fixture_one',
                 'is_entry_point': 'TRUE',
             },
             {
                 'identifiers': 'return_remote',
-                'source': 'sshdat@ugerm:/users/data/Landing_Zone/to_calc/',
+                'source': 'sshdat@server2:/users/data/Landing_Zone/to_server1/',
                 'source_port': '',
-                'destination': str(tmp_path / 'calc' / 'Landing_Zone' / 'from_ugerm') + '/',
+                'destination': str(tmp_path / 'server1' / 'Landing_Zone' / 'from_server2') + '/',
                 'destination_port': '',
                 'test_fixture_names': '',
                 'is_entry_point': 'FALSE',
@@ -781,23 +781,43 @@ class TestTestWithData:
 
         assert len(plan['initial_sources']) == 1
         assert plan['initial_sources'][0]['value'] == str(
-            tmp_path / 'calc' / 'Landing_Zone' / 'to_ugerm'
+            tmp_path / 'server1' / 'Landing_Zone' / 'to_server2'
         ) + '/'
 
-    def test_dev_calc_seed_plan_scopes_fixtures_per_entry_flow(self):
-        """The dev calc subset should not seed every fixture into every entry flow."""
-        repo_root = Path(cdr.get_repo_root())
-        config_file = repo_root / 'deploy' / 'dev' / 'config' / 'config.yaml'
-        transfers_file = repo_root / 'deploy' / 'dev' / 'input' / 'transfers.tsv'
-        base_dir = repo_root / 'deploy' / 'dev'
+    def test_dev_server1_seed_plan_scopes_fixtures_per_entry_flow(self, tmp_path):
+        """The dev server1 subset should not seed every fixture into every entry flow."""
+        config_file = tmp_path / 'config.yaml'
+        transfers_file = tmp_path / 'transfers.tsv'
+        base_dir = tmp_path
         snapshot = cdr.config.snapshot_state()
+
+        config_file.write_text(
+            "\n".join([
+                "transfers_file: {0}".format(transfers_file),
+                "test_data: tests/data/",
+                "path_variables:",
+                "  LZ_DEV_SERVER1_LAB_ROOT: /srv/tests/dev/server1/labnet/",
+                "  LZ_DEV_SERVER1_LANDING_ZONE_ROOT: /srv/tests/dev/server1/Landing_Zone/",
+                "  LZ_DEV_SERVER3_REGION_ROOT: /srv/tests/dev/server3/region/",
+                "",
+            ])
+        )
+        transfers_file.write_text(
+            "\n".join([
+                "identifiers\tenabled\tsystem\tnotes\tusers\tsource\tsource_port\tdestination\tdestination_port\ttest_fixture_names\trsync_options\tio_nice\tlog_file\tflock_file\tfrequency\tflow_group\tis_entry_point",
+                "dev_lab_to_server1\tTRUE\tserver1\t\tuser1\t${LZ_DEV_SERVER1_LAB_ROOT}/corefacility/\t\t${LZ_DEV_SERVER1_LANDING_ZONE_ROOT}/from_labnet/\t\tIllumina_TransferTest\t\t\tdev_lab_to_server1.log\tdev_lab_to_server1.lock\t* * * * *\tdev_lab_to_server1\tTRUE",
+                "dev_server1_to_server2\tTRUE\tserver1\t\tuser1\t${LZ_DEV_SERVER1_LANDING_ZONE_ROOT}/to_server2/Projects/dev_shadow/proj/Landing_Zone/\t\tserver2:${LZ_DEV_SERVER1_LANDING_ZONE_ROOT}/from_server1/Projects/dev_shadow/proj/Landing_Zone/\t\tIllumina_TransferTest\t\t\tdev_server1_to_server2.log\tdev_server1_to_server2.lock\t* * * * *\tdev_server1_to_server2\tTRUE",
+                "dev_server1_to_server3\tTRUE\tserver1\t\tuser1\t${LZ_DEV_SERVER1_LANDING_ZONE_ROOT}/regionh/to_server3/\t\tserver3:${LZ_DEV_SERVER3_REGION_ROOT}/to_server3/\t\tIllumina_TransferTest\t\t\tdev_server1_to_server3.log\tdev_server1_to_server3.lock\t* * * * *\tdev_server1_to_server3\tTRUE",
+                "",
+            ])
+        )
 
         try:
             cdr.config.load_config(config_file=str(config_file))
             transfers_df = cdr.load_test_with_data_transfers(
                 str(transfers_file),
-                'calc',
-                'f041664',
+                'server1',
+                'user1',
                 str(base_dir),
             )
             plan = cdr.build_run_test_plan(transfers_df)
@@ -810,13 +830,13 @@ class TestTestWithData:
         }
 
         assert fixture_by_root == {
-            '/srv/data/NGS_Kaare/rit_managed/tests/dev/landingzones/labnet//corefacility': [
+            '/srv/tests/dev/server1/labnet//corefacility': [
                 'Illumina_TransferTest'
             ],
-            '/srv/data/NGS_Kaare/rit_managed/tests/dev/landingzones/calc/Landing_Zone//to_ugerm/Projects/dev_shadow/proj/Landing_Zone': [
+            '/srv/tests/dev/server1/Landing_Zone//to_server2/Projects/dev_shadow/proj/Landing_Zone': [
                 'Illumina_TransferTest'
             ],
-            '/srv/data/NGS_Kaare/rit_managed/tests/dev/landingzones/calc/Landing_Zone//regionh/to_ssicompute': [
+            '/srv/tests/dev/server1/Landing_Zone//regionh/to_server3': [
                 'Illumina_TransferTest'
             ],
         }
@@ -888,7 +908,7 @@ class TestTestWithData:
         all_transfers_df = pd.DataFrame([
             {
                 'identifiers': 'step1',
-                'system': 'calc',
+                'system': 'server1',
                 'users': 'runner',
                 'source': str(tmp_path / 'source') + '/',
                 'destination': str(tmp_path / 'handoff') + '/',
@@ -896,7 +916,7 @@ class TestTestWithData:
             },
             {
                 'identifiers': 'step2',
-                'system': 'ugerm',
+                'system': 'server2',
                 'users': 'corfac',
                 'source': str(tmp_path / 'handoff') + '/',
                 'destination': str(tmp_path / 'final') + '/',
@@ -913,7 +933,7 @@ class TestTestWithData:
         )
 
         assert len(handoffs) == 1
-        assert handoffs[0]['system'] == 'ugerm'
+        assert handoffs[0]['system'] == 'server2'
         assert handoffs[0]['user'] == 'corfac'
         assert handoffs[0]['command'] == 'landingzones validate integration --slow'
         assert handoffs[0]['transfers'][0]['identifier'] == 'step2'
@@ -947,9 +967,9 @@ class TestTestWithData:
                 "transfers_file: {0}".format(transfers_file),
                 "test_data: {0}".format(tmp_path / 'tests' / 'toy_data'),
                 "rit_managed_locations:",
-                "  calc: {0}".format(rit_managed),
+                "  server1: {0}".format(rit_managed),
                 "flock_paths:",
-                "  calc: /usr/bin/true",
+                "  server1: /usr/bin/true",
                 "rit_managed_folder_structure:",
                 "  log: log/",
                 "  flock: flock/",
@@ -961,17 +981,17 @@ class TestTestWithData:
         transfers_file.write_text(
             "\n".join([
                 "identifiers\tenabled\tsystem\tnotes\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tfrequency",
-                "step1\tTRUE\tcalc\t''\trunner\t{0}/\t\t{1}/\t\t--out-format='%t %o %i %n%L'\t\tstep1.log\tstep1.lock\t* * * * *".format(
+                "step1\tTRUE\tserver1\t''\trunner\t{0}/\t\t{1}/\t\t--out-format='%t %o %i %n%L'\t\tstep1.log\tstep1.lock\t* * * * *".format(
                     tmp_path / 'producer_a', handoff_root
                 ),
-                "step2\tTRUE\tugerm\t''\tcorfac\t{0}/\t\t{1}/\t\t--out-format='%t %o %i %n%L'\t\tstep2.log\tstep2.lock\t* * * * *".format(
+                "step2\tTRUE\tserver2\t''\tcorfac\t{0}/\t\t{1}/\t\t--out-format='%t %o %i %n%L'\t\tstep2.log\tstep2.lock\t* * * * *".format(
                     handoff_root, final_root
                 ),
                 "",
             ])
         )
 
-        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'calc')
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'server1')
         monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
 
         cleanup_prompts = []
@@ -987,7 +1007,7 @@ class TestTestWithData:
             slow=True,
         )
         captured = capsys.readouterr()
-        runtime_root = rit_managed / 'test_with_data_runtime' / 'calc.runner'
+        runtime_root = rit_managed / 'test_with_data_runtime' / 'server1.runner'
 
         assert result is True
         assert cleanup_prompts == []
@@ -995,7 +1015,7 @@ class TestTestWithData:
         assert cdr.list_visible_entries(str(final_root)) == []
         assert (runtime_root / 'scripts').exists()
         assert "Next System Handoff" in captured.out
-        assert "Switch to corfac@ugerm" in captured.out
+        assert "Switch to corfac@server2" in captured.out
         assert "landingzones validate integration --slow" in captured.out
         assert "step2" in captured.out
 
@@ -1292,20 +1312,20 @@ class TestTestWithData:
         """Missing local directories should be summarized and created on confirmation."""
         transfers_file = tmp_path / 'transfers.tsv'
         transfers_file.write_text("placeholder\n")
-        source_dir = tmp_path / 'calc' / 'Landing_Zone' / 'from_labnet'
-        destination_dir = tmp_path / 'calc' / 'Landing_Zone' / 'to_ugerm'
+        source_dir = tmp_path / 'server1' / 'Landing_Zone' / 'from_labnet'
+        destination_dir = tmp_path / 'server1' / 'Landing_Zone' / 'to_server2'
         log_file = tmp_path / 'log' / 'transfer.log'
         flock_file = tmp_path / 'flock' / 'transfer.lock'
 
         df = pd.DataFrame([
             {
-                'source': str(tmp_path) + '//calc//Landing_Zone//from_labnet/',
+                'source': str(tmp_path) + '//server1//Landing_Zone//from_labnet/',
                 'source_port': '',
-                'destination': str(tmp_path) + '//calc//Landing_Zone//to_ugerm/',
+                'destination': str(tmp_path) + '//server1//Landing_Zone//to_server2/',
                 'destination_port': '',
                 'log_file': str(log_file),
                 'flock_file': str(flock_file),
-                'system': 'calc',
+                'system': 'server1',
                 'users': 'runner',
             }
         ])
@@ -1318,7 +1338,7 @@ class TestTestWithData:
             'filter_transfers_by_system_user',
             lambda loaded_df, system, user: loaded_df,
         )
-        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'calc')
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'server1')
         monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
         monkeypatch.setattr(cdr, 'ask_yes_no', lambda prompt_text: True)
 

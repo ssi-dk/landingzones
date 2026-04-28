@@ -36,7 +36,7 @@ class TestOperatorCli:
             '--config', 'config.yaml',
             '--scripts-dir', 'scripts',
             '--validation-scripts-dir', 'validation_scripts',
-            '--runtime-id', 'calc_prod.user1',
+            '--runtime-id', 'server1_prod.user1',
         ])
 
         assert rc == 0
@@ -44,7 +44,7 @@ class TestOperatorCli:
             '--config', 'config.yaml',
             '--scripts-dir', 'scripts',
             '--validation-scripts-dir', 'validation_scripts',
-            '--runtime-id', 'calc_prod.user1',
+            '--runtime-id', 'server1_prod.user1',
         ]
 
     def test_global_config_routes_to_build(self, monkeypatch):
@@ -202,7 +202,7 @@ class TestOperatorCli:
             '--slow',
             '--tag', 'heartbeat',
             '--report-output', 'dashboard.html',
-            '--system', 'calc',
+            '--system', 'server1',
         ])
 
         assert rc == 0
@@ -229,7 +229,7 @@ class TestOperatorCli:
             '--output', 'dashboard.html',
             '--config', 'config.yaml',
             '--transfers-file', 'transfers.tsv',
-            '--system', 'calc',
+            '--system', 'server1',
             '--tag', 'heartbeat',
         ]]
 
@@ -371,14 +371,14 @@ class TestOperatorCli:
             'transfers',
             'input.tsv',
             '--output', 'dashboard.html',
-            '--system', 'calc',
+            '--system', 'server1',
         ])
 
         assert rc == 0
         assert captured['argv'] == [
             'input.tsv',
             '--output', 'dashboard.html',
-            '--system', 'calc',
+            '--system', 'server1',
         ]
 
     def test_report_transfers_routes_to_dashboard_from_config(self, monkeypatch):
@@ -395,13 +395,13 @@ class TestOperatorCli:
             'report',
             'transfers',
             '--config', 'config.yaml',
-            '--system', 'calc',
+            '--system', 'server1',
         ])
 
         assert rc == 0
         assert captured['argv'] == [
             '--config', 'config.yaml',
-            '--system', 'calc',
+            '--system', 'server1',
         ]
 
     def test_report_transfers_routes_tag_filters(self, monkeypatch):
