@@ -155,9 +155,10 @@ def test_main_uses_configured_report_transfer_log_file_when_input_omitted(tmp_pa
             ]
         )
 
-    def fake_load_transfers_for_reporting(config_file=None, transfers_file=None):
+    def fake_load_transfers_for_reporting(config_file=None, transfers_file=None, system=None):
         captured["config_file"] = config_file
         captured["transfers_file"] = transfers_file
+        captured["definition_system"] = system
         return pd.DataFrame(
             [
                 {
@@ -184,6 +185,7 @@ def test_main_uses_configured_report_transfer_log_file_when_input_omitted(tmp_pa
     assert captured["log_path"] == str(log_path)
     assert captured["config_file"] == str(config_file)
     assert captured["transfers_file"] is None
+    assert captured["definition_system"] == "test_local"
     assert captured["system"] == "test_local"
     assert captured["output_path"] == str(tmp_path / "Landing_Zone_test_local.transfers.health_dashboard.html")
 

@@ -51,8 +51,8 @@ The system is configured via a tab-separated `transfers.tsv` file:
 
 | Column | Description | Example |
 |--------|-------------|---------|
-| `identifiers` | Unique transfer ID used for generated shell script names | `transfer_001`, `gridion_to_calc` |
-| `runtime_id` | Required deploy/artifact identity used for cron grouping and filtering | `calc_prod.f041664` |
+| `identifiers` | Unique transfer ID used for generated shell script names | `transfer_001`, `server1_to_server2` |
+| `runtime_id` | Required deploy/artifact identity used for cron grouping and filtering | `server1_prod.user1` |
 | `system` | Configured system key used for managed paths and flock settings | `server1`, `localhost` |
 | `users` | Optional user/account context for review and generated headers | `user1`, `local` |
 | `source` | Source directory path | `/srv/data/src/` |
@@ -78,7 +78,7 @@ local_copy	localhost_test.testuser	localhost	testuser	input/*		output/				transf
 landingzones build
 
 # Generate only selected runtime IDs from a shared transfers.tsv
-landingzones build --runtime-id calc_prod.f041664 --runtime-id calc_prod.F041668
+landingzones build --runtime-id server1_prod.user1 --runtime-id server2_prod.user2
 
 # Check deployment readiness
 landingzones validate deployment
@@ -90,7 +90,7 @@ landingzones validate hop <flow_group>
 landingzones validate integration
 
 # Generate an HTML health dashboard from a shared transfer TSV log
-landingzones report transfers output/log/Landing_Zone_calc.transfers.tsv
+landingzones report transfers output/log/Landing_Zone_server1_prod.user1.transfers.tsv
 ```
 
 ### Generated Cron Format
@@ -239,16 +239,16 @@ Typical usage:
 landingzones --config config/config.yaml build
 
 # Check only the current hop structure and immediate next-hop access
-landingzones validate hop local_labnet_to_calc_seqdata preflight
+landingzones validate hop local_labnet_to_server1_data preflight
 
 # Inject a validation run with the baked-in defaults
-landingzones validate hop local_labnet_to_calc_seqdata
+landingzones validate hop local_labnet_to_server1_data
 
 # Inject a validation run with an explicit token suffix
-landingzones validate hop local_labnet_to_calc_seqdata --token ABCD
+landingzones validate hop local_labnet_to_server1_data --token ABCD
 
 # Direct wrapper execution still works if needed
-./output/validation_scripts/lz_run_validation_local_labnet_to_calc_seqdata.sh
+./output/validation_scripts/lz_run_validation_local_labnet_to_server1_data.sh
 ```
 
 Wrapper/CLI behavior:

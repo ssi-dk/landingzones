@@ -22,8 +22,8 @@ Example config.yaml:
     flock_paths:
       localhost: /usr/bin/flock
     rit_managed_folder_structure:
-      sh_output: scripts/landingzones/deploy/calc_prod.f041664/output/scripts/
-      crontabs: scripts/landingzones/deploy/calc_prod.f041664/output/crontab.d/
+      sh_output: scripts/landingzones/runtimes/server1_prod.user1/landingzone/output/scripts/
+      crontabs: scripts/landingzones/runtimes/server1_prod.user1/landingzone/output/crontab.d/
       log: log/
       flock: flock/
     input_dir: input

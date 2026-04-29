@@ -108,7 +108,7 @@ def validate_runtime_ids(rows):
         )
 
 
-def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None):
+def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None, systems=None):
     """Parse the transfers.tsv file and return normalized transfer records.
 
     Args:
@@ -118,6 +118,8 @@ def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None)
             transfer metadata needed for reporting/analysis.
         runtime_ids: Optional exact runtime_id values to include before runtime
             path validation and artifact generation.
+        systems: Optional exact system values to include before endpoint
+            expansion.
     """
     with open(filename, 'r', newline='') as handle:
         reader = csv.DictReader(handle, delimiter='\t')
@@ -166,6 +168,23 @@ def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None)
         ]
         if not rows:
             raise ValueError("runtime_id filter produced no transfer rows")
+
+    requested_systems = normalize_system_filters(systems)
+    if requested_systems:
+        available = set(row.get('system', '') for row in rows)
+        missing = sorted(set(requested_systems) - available)
+        if missing:
+            raise ValueError(
+                "system filter matched no transfer rows for: {0}".format(
+                    ', '.join(missing)
+                )
+            )
+        rows = [
+            row for row in rows
+            if row.get('system', '') in requested_systems
+        ]
+        if not rows:
+            raise ValueError("system filter produced no transfer rows")
 
     text_columns = (
         'runtime_id',
@@ -256,6 +275,20 @@ def normalize_runtime_id_filters(runtime_ids):
     for runtime_id in runtime_ids:
         value = clean_tsv_value(runtime_id)
         if value:
+            normalized.append(value)
+    return normalized
+
+
+def normalize_system_filters(systems):
+    """Normalize CLI-provided system filters."""
+    if not systems:
+        return []
+    if isinstance(systems, str):
+        systems = [systems]
+    normalized = []
+    for system in systems:
+        value = clean_tsv_value(system)
+        if value and value not in normalized:
             normalized.append(value)
     return normalized
 

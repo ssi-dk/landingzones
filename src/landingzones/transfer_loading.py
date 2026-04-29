@@ -10,12 +10,18 @@ from landingzones.transfer_definitions import (
 )
 
 
-def load_transfers(config_file=None, transfers_file=None, require_runtime_files=True):
+def load_transfers(
+    config_file=None,
+    transfers_file=None,
+    require_runtime_files=True,
+    system=None,
+):
     """Load normalized transfer definitions after resolving config defaults."""
     config.load_config(config_file=config_file, transfers_file=transfers_file)
     return gcf.parse_transfers_file(
         config.transfers_file,
         require_runtime_files=require_runtime_files,
+        systems=[system] if system else None,
     )
 
 
@@ -28,12 +34,13 @@ def load_runtime_transfers(config_file=None, transfers_file=None):
     )
 
 
-def load_reporting_transfers(config_file=None, transfers_file=None):
+def load_reporting_transfers(config_file=None, transfers_file=None, system=None):
     """Load transfers with analysis/reporting validation enabled."""
     return load_transfers(
         config_file=config_file,
         transfers_file=transfers_file,
         require_runtime_files=False,
+        system=system,
     )
 
 

@@ -77,6 +77,32 @@ two\tserver2_prod.user2\tserver2\tuser2\t/src2/\t/dest2/\t\t\t\t/tmp/log2.txt\t/
         assert filtered['identifiers'].tolist() == ['one']
         with pytest.raises(ValueError):
             gcf.filter_transfers_by_runtime_ids(df, ['missing_prod.user'])
+
+    def test_parse_filters_system_before_endpoint_expansion(self, tmp_path):
+        """System filters should ignore unrelated rows with unavailable variables."""
+        snapshot = gcf.config.snapshot_state()
+        gcf.config.load_config(path_variables={"LOCAL_ROOT": "/tmp/local"})
+        tsv_content = """identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+local_stage\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\t${LOCAL_ROOT}/in/\t${LOCAL_ROOT}/out/\t\t\t\t/tmp/local.log\t/tmp/local.lock
+remote_stage\tserver2_dev.user\tTRUE\tserver2\tuser\t${MISSING_REMOTE_ROOT}/in/\t/dest/\t\t\t\t/tmp/remote.log\t/tmp/remote.lock
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        try:
+            df = gcf.parse_transfers_file(str(test_file), systems=["local_dev"])
+        finally:
+            gcf.config.restore_state(snapshot)
+
+        assert df["identifiers"].tolist() == ["local_stage"]
+        assert df.iloc[0]["source"] == "/tmp/local/in/"
+
+        try:
+            gcf.config.load_config(path_variables={"LOCAL_ROOT": "/tmp/local"})
+            with pytest.raises(ValueError, match="system filter matched no transfer rows"):
+                gcf.parse_transfers_file(str(test_file), systems=["missing"])
+        finally:
+            gcf.config.restore_state(snapshot)
     
     def test_parse_filters_comments(self, tmp_path):
         """Test that lines starting with # are filtered out"""

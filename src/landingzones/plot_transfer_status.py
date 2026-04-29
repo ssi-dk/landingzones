@@ -839,11 +839,12 @@ def build_default_output_path(input_path):
     return stem + ".health_dashboard.html"
 
 
-def load_transfers_for_reporting(config_file=None, transfers_file=None):
+def load_transfers_for_reporting(config_file=None, transfers_file=None, system=None):
     """Load enabled transfers after resolving config defaults."""
     return load_reporting_transfers(
         config_file=config_file,
         transfers_file=transfers_file,
+        system=system,
     )
 
 
@@ -964,6 +965,7 @@ def main(argv=None):
     transfers_df = load_transfers_for_reporting(
         config_file=args.config,
         transfers_file=args.transfers_file,
+        system=system,
     )
     create_transfer_dashboard(
         log_df,
