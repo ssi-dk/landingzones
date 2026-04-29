@@ -30,6 +30,8 @@ Example config.yaml:
     default_lock_file: /tmp/landingzones.lock
     default_cron_frequency: "*/15 * * * *"
     validation_scripts_dir: output/validation_scripts
+    runtime_ids:
+      - server1_prod.user1
     notifications:
       endpoint: https://example.org/landingzones/events
       token_env: LANDINGZONES_NOTIFY_TOKEN
@@ -75,6 +77,25 @@ def _expand_path(path):
     if path:
         return os.path.expandvars(os.path.expanduser(path))
     return path
+
+
+def _normalize_runtime_ids(value):
+    """Normalize runtime_id config values to a de-duplicated list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values = value.split(',')
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = value
+    else:
+        raw_values = [value]
+
+    normalized = []
+    for raw_value in raw_values:
+        text = str(raw_value).strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
 
 
 def _load_yaml_config(config_file=None):
@@ -133,6 +154,8 @@ class Config:
         - LZ_INPUT_DIR: Default input directory
         - LZ_CRONTAB_DIR: Default crontab output directory
         - LZ_VALIDATION_SCRIPTS_DIR: Default validation wrapper output directory
+        - LZ_RUNTIME_IDS: Comma-separated runtime_id filter values
+        - LZ_RUNTIME_ID: Single runtime_id filter value
         - LZ_CRON_FREQUENCY: Default cron schedule expression
         - LZ_NOTIFICATION_ENDPOINT: Optional notification API endpoint
         - LZ_NOTIFICATION_TOKEN_ENV: Optional env var name containing bearer token
@@ -182,6 +205,7 @@ class Config:
         """
         if config_file:
             self._load_yaml(config_file)
+            self._runtime_config = {}
         
         # Store runtime overrides
         for key, value in kwargs.items():
@@ -312,6 +336,26 @@ class Config:
     def artifact_prefix(self):
         """Optional filename prefix for generated scripts, crons, and wrappers."""
         return self._get_value('artifact_prefix', 'LZ_ARTIFACT_PREFIX', '')
+
+    @property
+    def runtime_ids(self):
+        """Runtime IDs used to scope transfer loading and generated artifacts."""
+        for key in ('runtime_ids', 'runtime_id'):
+            if key in self._runtime_config:
+                return _normalize_runtime_ids(self._runtime_config[key])
+
+        env_value = os.environ.get('LZ_RUNTIME_IDS')
+        if env_value:
+            return _normalize_runtime_ids(env_value)
+        env_value = os.environ.get('LZ_RUNTIME_ID')
+        if env_value:
+            return _normalize_runtime_ids(env_value)
+
+        for key in ('runtime_ids', 'runtime_id'):
+            if key in self._yaml_config:
+                return _normalize_runtime_ids(self._yaml_config[key])
+
+        return []
 
     @property
     def rit_managed_locations(self):
@@ -455,6 +499,7 @@ class Config:
             'validation_scripts_dir': self.validation_scripts_dir,
             'artifact_owner_id': self.artifact_owner_id,
             'artifact_prefix': self.artifact_prefix,
+            'runtime_ids': self.runtime_ids,
             'rit_managed_locations': self.rit_managed_locations,
             'flock_paths': self.flock_paths,
             'notifications': self.notifications,

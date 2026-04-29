@@ -155,10 +155,16 @@ def test_main_uses_configured_report_transfer_log_file_when_input_omitted(tmp_pa
             ]
         )
 
-    def fake_load_transfers_for_reporting(config_file=None, transfers_file=None, system=None):
+    def fake_load_transfers_for_reporting(
+        config_file=None,
+        transfers_file=None,
+        system=None,
+        runtime_ids=None,
+    ):
         captured["config_file"] = config_file
         captured["transfers_file"] = transfers_file
         captured["definition_system"] = system
+        captured["runtime_ids"] = runtime_ids
         return pd.DataFrame(
             [
                 {
@@ -179,15 +185,88 @@ def test_main_uses_configured_report_transfer_log_file_when_input_omitted(tmp_pa
     monkeypatch.setattr(pts, "load_transfers_for_reporting", fake_load_transfers_for_reporting)
     monkeypatch.setattr(pts, "create_transfer_dashboard", fake_create_transfer_dashboard)
 
-    rc = pts.main(["--config", str(config_file), "--system", "test_local"])
+    rc = pts.main([
+        "--config", str(config_file),
+        "--system", "test_local",
+        "--runtime-id", "local_dev.local",
+    ])
 
     assert rc == 0
     assert captured["log_path"] == str(log_path)
     assert captured["config_file"] == str(config_file)
     assert captured["transfers_file"] is None
     assert captured["definition_system"] == "test_local"
+    assert captured["runtime_ids"] == ["local_dev.local"]
     assert captured["system"] == "test_local"
     assert captured["output_path"] == str(tmp_path / "Landing_Zone_test_local.transfers.health_dashboard.html")
+
+
+def test_main_uses_yaml_runtime_ids_when_cli_filter_is_omitted(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.yaml"
+    log_path = tmp_path / "Landing_Zone_test_local.transfers.tsv"
+    log_path.write_text("placeholder\n")
+    config_file.write_text(
+        "transfers_file: /tmp/transfers.tsv\n"
+        "report_transfer_log_file: {0}\n"
+        "runtime_ids:\n"
+        "  - local_dev.local\n".format(log_path)
+    )
+
+    captured = {}
+
+    monkeypatch.setattr(
+        pts,
+        "load_transfer_log",
+        lambda path: pd.DataFrame(
+            [
+                {
+                    "datetime": pd.Timestamp("2026-04-10T07:00:00Z"),
+                    "identifier": "stage_lab",
+                    "directory": "alpha",
+                    "source": "/source/inbox/alpha",
+                    "destination": "/flow/stage/alpha",
+                    "status": "initiated",
+                    "run_id": "run-123",
+                    "run_name": "alpha",
+                    "directory_suffix": "alpha",
+                    "run_group": "run-123",
+                }
+            ]
+        ),
+    )
+
+    def fake_load_transfers_for_reporting(
+        config_file=None,
+        transfers_file=None,
+        system=None,
+        runtime_ids=None,
+    ):
+        captured["runtime_ids"] = runtime_ids
+        return pd.DataFrame(
+            [
+                {
+                    "identifiers": "stage_lab",
+                    "system": "test_local",
+                    "source": "/source/inbox/*",
+                    "destination": "/flow/stage/",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(pts, "load_transfers_for_reporting", fake_load_transfers_for_reporting)
+    monkeypatch.setattr(
+        pts,
+        "create_transfer_dashboard",
+        lambda log_df, transfers_df, system, output_path, **kwargs: output_path,
+    )
+
+    rc = pts.main([
+        "--config", str(config_file),
+        "--system", "test_local",
+    ])
+
+    assert rc == 0
+    assert captured["runtime_ids"] == ["local_dev.local"]
 
 
 def test_build_flow_graph_identifies_terminal_identifier(tmp_path):

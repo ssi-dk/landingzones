@@ -168,3 +168,56 @@ def test_main_returns_nonzero_and_prints_warnings(tmp_path, capsys):
     assert rc == 1
     assert "Separation check for tags: heartbeat" in captured.out
     assert "Found 2 collision(s)." in captured.out
+
+
+def test_main_applies_runtime_id_filter(tmp_path, capsys):
+    transfers_file = tmp_path / "transfers.tsv"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\ttags",
+                "heartbeat_stage\tlocal_dev.local\tTRUE\tlab-a\tlocal\t/landing/heartbeat/\t/server1/heartbeat/\theartbeat",
+                "heartbeat_nested_overlap\tother.local\tTRUE\tlab-a\tlocal\t/landing/heartbeat/subdir/\t/server1/archive/\t",
+                "server1_consumer\tother.local\tTRUE\tserver1\tsvc\t/server1/heartbeat/\t/server1/final/\t",
+            ]
+        )
+    )
+
+    rc = vsep.main([
+        "--transfers", str(transfers_file),
+        "--runtime-id", "local_dev.local",
+        "--tag", "heartbeat",
+    ])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "1 tagged transfer(s) vs 0 other enabled transfer(s)" in captured.out
+
+
+def test_main_applies_yaml_runtime_id_filter(tmp_path, capsys):
+    transfers_file = tmp_path / "transfers.tsv"
+    config_file = tmp_path / "config.yaml"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\ttags",
+                "heartbeat_stage\tlocal_dev.local\tTRUE\tlab-a\tlocal\t/landing/heartbeat/\t/server1/heartbeat/\theartbeat",
+                "heartbeat_nested_overlap\tother.local\tTRUE\tlab-a\tlocal\t/landing/heartbeat/subdir/\t/server1/archive/\t",
+                "server1_consumer\tother.local\tTRUE\tserver1\tsvc\t/server1/heartbeat/\t/server1/final/\t",
+            ]
+        )
+    )
+    config_file.write_text(
+        "transfers_file: {0}\n"
+        "runtime_ids:\n"
+        "  - local_dev.local\n".format(transfers_file)
+    )
+
+    rc = vsep.main([
+        "--config", str(config_file),
+        "--tag", "heartbeat",
+    ])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "1 tagged transfer(s) vs 0 other enabled transfer(s)" in captured.out

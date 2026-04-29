@@ -48,6 +48,8 @@ from landingzones.readiness_ops import (
 from landingzones.transfer_loading import (
     filter_transfers_by_system_user,
     load_runtime_transfers,
+    normalize_runtime_id_args,
+    resolve_runtime_ids,
 )
 
 
@@ -664,10 +666,14 @@ def run_remote_shell(user, host, command, port=''):
 
 
 def load_test_with_data_transfers(
-    transfers_file, current_system, current_user, base_dir
+    transfers_file, current_system, current_user, base_dir, runtime_ids=None
 ):
     """Load the current system/user transfer subset for test-with-data."""
-    df = load_test_with_data_transfer_graph(transfers_file, base_dir)
+    df = load_test_with_data_transfer_graph(
+        transfers_file,
+        base_dir,
+        runtime_ids=runtime_ids,
+    )
     df = filter_transfers_by_system_user(df, current_system, current_user)
     if df.empty:
         raise ValueError(
@@ -678,9 +684,9 @@ def load_test_with_data_transfers(
     return df
 
 
-def load_test_with_data_transfer_graph(transfers_file, base_dir):
+def load_test_with_data_transfer_graph(transfers_file, base_dir, runtime_ids=None):
     """Load all test-with-data transfers with local endpoints absolutized."""
-    df = parse_transfers_file(transfers_file)
+    df = parse_transfers_file(transfers_file, runtime_ids=runtime_ids)
     for column in ('source', 'destination'):
         df[column] = df[column].apply(
             lambda value: absolutize_local_endpoint(value, base_dir)
@@ -1058,10 +1064,47 @@ def ask_yes_no(prompt_text):
         return False
 
 
-def run_cron_deployment_prompt():
+def print_runtime_filter_status(runtime_ids, runtime_filter_source):
+    """Print the active runtime filter when one is resolved."""
+    if not runtime_ids:
+        return
+    print_status(
+        "Runtime filter",
+        "OK",
+        "Using runtime_id {0} from {1}".format(
+            ', '.join(runtime_ids),
+            runtime_filter_source,
+        ),
+    )
+
+
+def run_cron_deployment_prompt(runtime_ids=None, runtime_filter_source=None):
     """Offer an interactive cron deployment for the current system/user."""
-    current_system = get_current_system()
-    current_user = get_current_user()
+    print_runtime_filter_status(runtime_ids, runtime_filter_source)
+
+    transfers_df = None
+    if runtime_ids:
+        try:
+            transfers_df = load_runtime_transfers(
+                transfers_file=config.transfers_file,
+                runtime_ids=runtime_ids,
+            )
+        except Exception as exc:
+            print_status(
+                "Runtime filter",
+                "ERROR",
+                "Cannot read filtered transfers: {0}".format(exc),
+            )
+            return False
+
+    current_system = get_current_system(
+        transfers_df=transfers_df,
+        runtime_ids=runtime_ids,
+    )
+    current_user = get_current_user(
+        transfers_df=transfers_df,
+        runtime_ids=runtime_ids,
+    )
 
     print_header("Cron Deployment")
     print_status(
@@ -1078,7 +1121,11 @@ def run_cron_deployment_prompt():
         )
         return False
 
-    deploy_ok = deploy_cron_files(current_system, current_user)
+    deploy_ok = deploy_cron_files(
+        current_system,
+        current_user,
+        runtime_ids=runtime_ids,
+    )
     if deploy_ok:
         print_status(
             "Cron deployment",
@@ -1185,7 +1232,13 @@ def create_missing_directories(missing_directories):
     return all_ok
 
 
-def run_test_with_data(config_file=None, transfers_file=None, slow=False):
+def run_test_with_data(
+    config_file=None,
+    transfers_file=None,
+    slow=False,
+    runtime_ids=None,
+    runtime_filter_source=None,
+):
     """Run generated scripts against seeded toy-data in the real test tree."""
     print_header("Transfer Test With Data")
     snapshot = _snapshot_config_state()
@@ -1202,10 +1255,16 @@ def run_test_with_data(config_file=None, transfers_file=None, slow=False):
         config.load_config(
             config_file=config_file,
             transfers_file=transfers_file,
+            runtime_ids=runtime_ids,
         )
+        if runtime_ids is None:
+            runtime_ids = config.runtime_ids
+            if runtime_ids and runtime_filter_source is None:
+                runtime_filter_source = 'config'
+        else:
+            runtime_ids = normalize_runtime_id_args(runtime_ids)
+        print_runtime_filter_status(runtime_ids, runtime_filter_source)
         transfers_path = transfers_file or config.transfers_file
-        current_system = get_current_system()
-        current_user = get_current_user()
         test_tree_root = os.path.dirname(
             os.path.abspath(
                 transfers_path if os.path.isabs(transfers_path)
@@ -1218,11 +1277,34 @@ def run_test_with_data(config_file=None, transfers_file=None, slow=False):
         if not os.path.isabs(toy_data_root):
             toy_data_root = os.path.abspath(os.path.join(work_root, toy_data_root))
         all_transfers_df = load_test_with_data_transfer_graph(
-            transfers_path, work_root
+            transfers_path,
+            work_root,
+            runtime_ids=runtime_ids,
         )
-        transfers_df = load_test_with_data_transfers(
-            transfers_path, current_system, current_user, work_root
+        if runtime_ids:
+            current_system = get_current_system(
+                transfers_df=all_transfers_df,
+                runtime_ids=runtime_ids,
+            )
+            current_user = get_current_user(
+                transfers_df=all_transfers_df,
+                runtime_ids=runtime_ids,
+            )
+        else:
+            current_system = get_current_system()
+            current_user = get_current_user()
+        transfers_df = filter_transfers_by_system_user(
+            all_transfers_df,
+            current_system,
+            current_user,
         )
+        if transfers_df.empty:
+            raise ValueError(
+                "No transfers found for user '{0}' on system '{1}'".format(
+                    current_user,
+                    current_system,
+                )
+            )
         runtime_dirs = get_test_with_data_runtime_dirs(
             current_system, current_user
         )
@@ -1409,6 +1491,12 @@ def main(argv=None):
         help='Directory containing generated validation wrappers (overrides config)'
     )
     parser.add_argument(
+        '--runtime-id',
+        action='append',
+        default=None,
+        help='Exact runtime_id to validate. Defaults to the runtime IDs generated by the most recent build when available.'
+    )
+    parser.add_argument(
         '--deploy-cron',
         action='store_true',
         help='Prompt to deploy the generated cron files for the current system/user'
@@ -1420,17 +1508,25 @@ def main(argv=None):
         config_file=args.config,
         transfers_file=args.transfers,
         validation_scripts_dir=args.validation_scripts_dir,
+        runtime_ids=args.runtime_id,
     )
+
+    runtime_ids, runtime_filter_source = resolve_runtime_ids(args.runtime_id)
 
     if args.test_with_data:
         return run_test_with_data(
             config_file=args.config,
             transfers_file=args.transfers,
             slow=args.slow,
+            runtime_ids=runtime_ids,
+            runtime_filter_source=runtime_filter_source,
         )
 
     if args.deploy_cron:
-        return run_cron_deployment_prompt()
+        return run_cron_deployment_prompt(
+            runtime_ids=runtime_ids,
+            runtime_filter_source=runtime_filter_source,
+        )
     
     print("{0}{1}".format(Colors.BOLD, Colors.BLUE))
     print("╔══════════════════════════════════════════════════════════════╗")
@@ -1444,13 +1540,18 @@ def main(argv=None):
         print_status("Configuration file", "ERROR", 
                     "{0} not found".format(transfers_file))
         return False
+
+    print_runtime_filter_status(runtime_ids, runtime_filter_source)
     
     # Check required tools
     tools_ok = check_required_tools()
     
     # Load and filter transfers
     try:
-        df = load_runtime_transfers(transfers_file=transfers_file)
+        df = load_runtime_transfers(
+            transfers_file=transfers_file,
+            runtime_ids=runtime_ids,
+        )
         
         print_status("Configuration file", "OK", "Loaded {0} active transfers".format(len(df)))
     except Exception as e:
@@ -1458,8 +1559,8 @@ def main(argv=None):
         return False
     
     # Determine current system and user
-    current_system = get_current_system()
-    current_user = get_current_user()
+    current_system = get_current_system(transfers_df=df, runtime_ids=runtime_ids)
+    current_user = get_current_user(transfers_df=df, runtime_ids=runtime_ids)
     print("\n{0}Checking transfers for system: {1}, user: {2}{3}".format(
         Colors.BOLD, current_system, current_user, Colors.END))
     

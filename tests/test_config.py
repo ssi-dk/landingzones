@@ -226,6 +226,25 @@ class TestConfigClass:
         
         assert cfg.log_dir == 'from_env'
 
+    def test_runtime_ids_from_yaml_env_and_runtime(self, tmp_path, monkeypatch):
+        """Runtime IDs should resolve with the normal config priority."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "runtime_ids:\n"
+            "  - yaml_runtime.local\n"
+            "  - yaml_runtime.local\n"
+        )
+
+        monkeypatch.chdir(tmp_path)
+        cfg = config.Config()
+        assert cfg.runtime_ids == ['yaml_runtime.local']
+
+        monkeypatch.setenv("LZ_RUNTIME_IDS", "env_one.local, env_two.local")
+        assert cfg.runtime_ids == ['env_one.local', 'env_two.local']
+
+        cfg.load_config(runtime_ids=['runtime.local', 'runtime.local'])
+        assert cfg.runtime_ids == ['runtime.local']
+
     def test_report_transfer_log_file_accepts_legacy_env_var(self, tmp_path, monkeypatch):
         """Older automation environments should still resolve LZ_TRANSFER_LOG_FILE."""
         monkeypatch.chdir(tmp_path)
@@ -366,6 +385,28 @@ class TestLoadConfig:
         cfg.load_config(log_dir='override_log')
         
         assert cfg.log_dir == 'override_log'
+
+    def test_load_config_file_resets_previous_runtime_overrides(self, tmp_path, monkeypatch):
+        """Loading a new config file should not keep stale runtime overrides."""
+        config_file = tmp_path / "config.yaml"
+        transfers_file = tmp_path / "from_yaml.tsv"
+        config_file.write_text(
+            "transfers_file: {0}\n"
+            "runtime_ids:\n"
+            "  - yaml_runtime.local\n".format(transfers_file)
+        )
+
+        monkeypatch.chdir(tmp_path)
+
+        cfg = config.Config()
+        cfg.load_config(
+            transfers_file="from_previous_call.tsv",
+            runtime_ids=["old_runtime.local"],
+        )
+        cfg.load_config(config_file=str(config_file))
+
+        assert cfg.transfers_file == str(transfers_file)
+        assert cfg.runtime_ids == ["yaml_runtime.local"]
 
     def test_snapshot_and_restore_state(self, tmp_path, monkeypatch):
         """Snapshots should restore YAML-backed and runtime config state."""

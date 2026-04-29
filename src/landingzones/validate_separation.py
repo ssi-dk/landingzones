@@ -172,6 +172,12 @@ def build_parser():
     parser.add_argument("--config", "-c", default=None)
     parser.add_argument("--transfers", "-t", default=None)
     parser.add_argument(
+        "--runtime-id",
+        action="append",
+        default=None,
+        help="Exact runtime_id to include in the separation check; repeatable.",
+    )
+    parser.add_argument(
         "--tag",
         action="append",
         default=[],
@@ -190,6 +196,7 @@ def main(argv=None):
     transfers_df = load_reporting_transfers(
         config_file=args.config,
         transfers_file=args.transfers,
+        runtime_ids=args.runtime_id,
     )
     tagged_df, other_df, findings = detect_separation_collisions(
         transfers_df,

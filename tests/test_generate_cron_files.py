@@ -103,6 +103,69 @@ remote_stage\tserver2_dev.user\tTRUE\tserver2\tuser\t${MISSING_REMOTE_ROOT}/in/\
                 gcf.parse_transfers_file(str(test_file), systems=["missing"])
         finally:
             gcf.config.restore_state(snapshot)
+
+    def test_write_runtime_filter_metadata_records_unique_runtime_ids(self, tmp_path):
+        """Build metadata should capture the runtime IDs represented by artifacts."""
+        crontab_dir = tmp_path / "output" / "crontab.d"
+
+        gcf.write_runtime_filter_metadata(
+            str(crontab_dir),
+            ["local_dev.local", "local_dev.local", "local_test.local"],
+        )
+
+        metadata_path = tmp_path / "output" / "runtime_ids.txt"
+        lines = [
+            line.strip()
+            for line in metadata_path.read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        assert lines == ["local_dev.local", "local_test.local"]
+
+    def test_main_uses_yaml_runtime_ids_when_cli_filter_is_omitted(self, tmp_path):
+        """Build should scope artifacts from config runtime_ids without CLI flags."""
+        transfers_file = tmp_path / "transfers.tsv"
+        crontab_dir = tmp_path / "output" / "crontab.d"
+        validation_dir = tmp_path / "output" / "validation_scripts"
+        config_file = tmp_path / "config.yaml"
+        transfers_file.write_text(
+            "\n".join(
+                [
+                    "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file",
+                    "local_stage\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\t/src/local/\t/dst/local/\t\t\t\t{0}\t{1}".format(
+                        tmp_path / "local.log",
+                        tmp_path / "local.lock",
+                    ),
+                    "other_stage\tother.local\tTRUE\tother\tlocal\t/src/other/\t/dst/other/\t\t\t\t{0}\t{1}".format(
+                        tmp_path / "other.log",
+                        tmp_path / "other.lock",
+                    ),
+                ]
+            )
+        )
+        config_file.write_text(
+            "transfers_file: {0}\n"
+            "crontab_dir: {1}\n"
+            "validation_scripts_dir: {2}\n"
+            "runtime_ids:\n"
+            "  - local_dev.local\n".format(
+                transfers_file,
+                crontab_dir,
+                validation_dir,
+            )
+        )
+
+        snapshot = gcf.config.snapshot_state()
+        try:
+            rc = gcf.main(["--config", str(config_file)])
+        finally:
+            gcf.config.restore_state(snapshot)
+
+        assert rc == 0
+        assert (crontab_dir / "local_dev.local.Landing_Zone.cron").exists()
+        assert not (crontab_dir / "other.local.Landing_Zone.cron").exists()
+        metadata_path = tmp_path / "output" / "runtime_ids.txt"
+        assert "local_dev.local" in metadata_path.read_text()
+        assert "other.local" not in metadata_path.read_text()
     
     def test_parse_filters_comments(self, tmp_path):
         """Test that lines starting with # are filtered out"""

@@ -98,10 +98,14 @@ class TestOperatorCli:
             'validate',
             'deployment',
             '--config', 'config.yaml',
+            '--runtime-id', 'local_dev.local',
         ])
 
         assert rc == 0
-        assert captured['argv'] == ['--config', 'config.yaml']
+        assert captured['argv'] == [
+            '--config', 'config.yaml',
+            '--runtime-id', 'local_dev.local',
+        ]
 
     def test_validate_integration_routes_to_test_with_data(self, monkeypatch):
         """`landingzones validate integration` should add the integration flag."""
@@ -203,12 +207,14 @@ class TestOperatorCli:
             '--tag', 'heartbeat',
             '--report-output', 'dashboard.html',
             '--system', 'server1',
+            '--runtime-id', 'local_dev.local',
         ])
 
         assert rc == 0
         assert captured['separation'] == [[
             '--config', 'config.yaml',
             '--transfers', 'transfers.tsv',
+            '--runtime-id', 'local_dev.local',
             '--tag', 'heartbeat',
         ]]
         assert captured['readiness'] == [
@@ -216,11 +222,13 @@ class TestOperatorCli:
                 '--config', 'config.yaml',
                 '--transfers', 'transfers.tsv',
                 '--validation-scripts-dir', 'validation_scripts',
+                '--runtime-id', 'local_dev.local',
             ],
             [
                 '--config', 'config.yaml',
                 '--transfers', 'transfers.tsv',
                 '--validation-scripts-dir', 'validation_scripts',
+                '--runtime-id', 'local_dev.local',
                 '--slow',
                 '--test-with-data',
             ],
@@ -230,8 +238,33 @@ class TestOperatorCli:
             '--config', 'config.yaml',
             '--transfers-file', 'transfers.tsv',
             '--system', 'server1',
+            '--runtime-id', 'local_dev.local',
             '--tag', 'heartbeat',
         ]]
+
+    def test_root_runtime_id_applies_to_validate_integration(self, monkeypatch):
+        """Top-level --runtime-id should scope validation subcommands."""
+        captured = {}
+
+        def fake_main(argv=None):
+            captured['argv'] = argv
+            return True
+
+        monkeypatch.setattr(cli.cdr, 'main', fake_main)
+
+        rc = cli.main([
+            '--runtime-id', 'local_dev.local',
+            'validate',
+            'integration',
+            '--config', 'config.yaml',
+        ])
+
+        assert rc == 0
+        assert captured['argv'] == [
+            '--config', 'config.yaml',
+            '--runtime-id', 'local_dev.local',
+            '--test-with-data',
+        ]
 
     def test_validate_chain_defaults_to_any_tag_for_separation(self, monkeypatch):
         """Omitting --tag should run separation across any tagged transfer."""
@@ -351,10 +384,15 @@ class TestOperatorCli:
             'deploy',
             'cron',
             '--config', 'config.yaml',
+            '--runtime-id', 'local_dev.local',
         ])
 
         assert rc == 0
-        assert captured['argv'] == ['--config', 'config.yaml', '--deploy-cron']
+        assert captured['argv'] == [
+            '--config', 'config.yaml',
+            '--runtime-id', 'local_dev.local',
+            '--deploy-cron',
+        ]
 
     def test_report_transfers_routes_to_dashboard(self, monkeypatch):
         """`landingzones report transfers` should forward its dashboard arguments."""
@@ -372,6 +410,7 @@ class TestOperatorCli:
             'input.tsv',
             '--output', 'dashboard.html',
             '--system', 'server1',
+            '--runtime-id', 'local_dev.local',
         ])
 
         assert rc == 0
@@ -379,6 +418,7 @@ class TestOperatorCli:
             'input.tsv',
             '--output', 'dashboard.html',
             '--system', 'server1',
+            '--runtime-id', 'local_dev.local',
         ]
 
     def test_report_transfers_routes_to_dashboard_from_config(self, monkeypatch):

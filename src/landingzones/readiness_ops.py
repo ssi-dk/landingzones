@@ -14,7 +14,7 @@ import subprocess
 import sys
 
 from landingzones.config import config
-from landingzones.generate_cron_files import shell_path
+from landingzones.generate_cron_files import cron_file_name, shell_path
 from landingzones.transfer_loading import load_runtime_transfers
 
 
@@ -27,6 +27,16 @@ class Colors:
     BLUE = '\033[94m'
     BOLD = '\033[1m'
     END = '\033[0m'
+
+
+def _load_identity_transfers(transfers_file, runtime_ids=None):
+    """Load transfer rows for current-system/user detection."""
+    if runtime_ids:
+        return load_runtime_transfers(
+            transfers_file=transfers_file,
+            runtime_ids=runtime_ids,
+        )
+    return load_runtime_transfers(transfers_file=transfers_file)
 
 
 def normalize_directory_path(path):
@@ -383,13 +393,16 @@ def _select_from_transfer_values(prompt_label, values, current_value=''):
             sys.exit(1)
 
 
-def get_current_user():
+def get_current_user(transfers_df=None, runtime_ids=None):
     """Get current user and allow selection if multiple users exist in transfers."""
     current_user = os.environ.get('USER', os.environ.get('USERNAME', ''))
     transfers_file = config.transfers_file
 
     try:
-        df = load_runtime_transfers(transfers_file=transfers_file)
+        df = (
+            transfers_df if transfers_df is not None
+            else _load_identity_transfers(transfers_file, runtime_ids)
+        )
         users = df['users'].unique()
         if current_user in users:
             return current_user
@@ -399,7 +412,10 @@ def get_current_user():
         pass
 
     try:
-        df = load_runtime_transfers(transfers_file=transfers_file)
+        df = (
+            transfers_df if transfers_df is not None
+            else _load_identity_transfers(transfers_file, runtime_ids)
+        )
         users = df['users'].unique()
         return _select_from_transfer_values("Current user", users, current_user)
     except Exception as exc:
@@ -407,13 +423,16 @@ def get_current_user():
         return current_user if current_user else input("Please enter your username: ").strip()
 
 
-def get_current_system():
+def get_current_system(transfers_df=None, runtime_ids=None):
     """Determine current system based on hostname or user input."""
     hostname = socket.gethostname().lower()
     transfers_file = config.transfers_file
 
     try:
-        df = load_runtime_transfers(transfers_file=transfers_file)
+        df = (
+            transfers_df if transfers_df is not None
+            else _load_identity_transfers(transfers_file, runtime_ids)
+        )
         systems = df['system'].unique()
         for system in systems:
             if system.lower() in hostname:
@@ -424,7 +443,10 @@ def get_current_system():
         pass
 
     try:
-        df = load_runtime_transfers(transfers_file=transfers_file)
+        df = (
+            transfers_df if transfers_df is not None
+            else _load_identity_transfers(transfers_file, runtime_ids)
+        )
         systems = df['system'].unique()
         return _select_from_transfer_values("Current hostname", systems, hostname)
     except Exception as exc:
@@ -432,8 +454,13 @@ def get_current_system():
         return input("Please enter your system name: ").strip()
 
 
-def generate_cron_files():
+def generate_cron_files(runtime_ids=None):
     """Generate cron files using the installed module."""
+    if runtime_ids is None:
+        runtime_ids = config.runtime_ids
+    argv = []
+    for runtime_id in runtime_ids or []:
+        argv.extend(['--runtime-id', runtime_id])
     try:
         from landingzones import generate_cron_files as gcf
         output_capture = None
@@ -443,7 +470,7 @@ def generate_cron_files():
             old_stdout = sys.stdout
             sys.stdout = output_capture
         try:
-            gcf.main()
+            gcf.main(argv)
         finally:
             if old_stdout is not None:
                 sys.stdout = old_stdout
@@ -452,7 +479,7 @@ def generate_cron_files():
     except Exception:
         try:
             proc = subprocess.Popen(
-                [sys.executable, '-m', 'landingzones.generate_cron_files'],
+                [sys.executable, '-m', 'landingzones.generate_cron_files'] + argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -478,8 +505,10 @@ def setup_crontab_directory():
         return False, "Cannot create directory {0}: {1}".format(crontab_dir, str(exc))
 
 
-def deploy_cron_files(current_system, current_user=None):
+def deploy_cron_files(current_system, current_user=None, runtime_ids=None):
     """Deploy cron files for the current system and user."""
+    if runtime_ids is None:
+        runtime_ids = config.runtime_ids
     if current_user is None:
         current_user = os.environ.get('USER', os.environ.get('USERNAME', ''))
 
@@ -492,7 +521,7 @@ def deploy_cron_files(current_system, current_user=None):
         return False
 
     print_status("Generating cron files", "INFO", "Using landingzones.generate_cron_files")
-    gen_ok, gen_msg = generate_cron_files()
+    gen_ok, gen_msg = generate_cron_files(runtime_ids=runtime_ids)
     if not gen_ok:
         print_status("Cron file generation", "WARN", gen_msg)
         print_status("Continuing deployment", "INFO", "Will use existing files in crontab.d/")
@@ -500,10 +529,22 @@ def deploy_cron_files(current_system, current_user=None):
         print_status("Cron file generation", "OK", gen_msg)
 
     try:
-        pattern = "crontab.d/{0}.{1}.Landing_Zone.cron".format(current_system, current_user)
-        cron_files = glob.glob(pattern)
+        if runtime_ids:
+            cron_files = [
+                os.path.join(config.crontab_dir, cron_file_name(runtime_id))
+                for runtime_id in runtime_ids
+            ]
+            cron_files = [path for path in cron_files if os.path.exists(path)]
+            expected = ', '.join(runtime_ids)
+        else:
+            pattern = os.path.join(
+                config.crontab_dir,
+                "{0}.{1}.Landing_Zone.cron".format(current_system, current_user),
+            )
+            cron_files = glob.glob(pattern)
+            expected = "{0}@{1}".format(current_user, current_system)
         if not cron_files:
-            msg = "No new files for '{0}@{1}'. Using existing crontab.d/".format(current_user, current_system)
+            msg = "No new cron files for '{0}'. Using existing crontab.d/".format(expected)
             print_status("Cron file discovery", "WARN", msg)
             return True
         print_status("Cron file discovery", "OK", "Found {0} files".format(len(cron_files)))
