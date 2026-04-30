@@ -33,8 +33,8 @@ flock_paths:
 # Cron entries will reference:
 #   <rit_managed_locations[system]>/<rit_managed_folder_structure.sh_output>/<identifier>.sh
 rit_managed_folder_structure:
-  sh_output: scripts/landingzones/runtimes/server1_prod.user1/landingzone/output/scripts/
-  crontabs: scripts/landingzones/runtimes/server1_prod.user1/landingzone/output/crontab.d/
+  sh_output: runtimes/server1_prod.user1/landingzone/output/scripts/
+  crontabs: runtimes/server1_prod.user1/landingzone/output/crontab.d/
   log: log/
   flock: flock/
 
