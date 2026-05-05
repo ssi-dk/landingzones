@@ -1616,6 +1616,28 @@ debug() {{
     fi
 }}
 
+random_start_delay() {{
+    max_seconds="${{1:-60}}"
+    case "$max_seconds" in
+        ''|*[!0-9]*) max_seconds=60 ;;
+    esac
+    [ "$max_seconds" -gt 0 ] || return 0
+    delay_seconds=""
+    if command -v od >/dev/null 2>&1 && [ -r /dev/urandom ]; then
+        delay_seconds="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | awk -v max="$max_seconds" 'NF {{ print $1 % max; exit }}')"
+    fi
+    if [ -z "$delay_seconds" ] && command -v awk >/dev/null 2>&1; then
+        delay_seconds="$(awk -v max="$max_seconds" 'BEGIN {{ srand(); print int(rand() * max) }}')"
+    fi
+    case "$delay_seconds" in
+        ''|*[!0-9]*) delay_seconds=0 ;;
+    esac
+    if [ "$delay_seconds" -gt 0 ]; then
+        debug "startup delay ${{delay_seconds}}s"
+        sleep "$delay_seconds"
+    fi
+}}
+
 dump_debug_log() {{
     label="$1"
     path="$2"
@@ -1671,12 +1693,15 @@ trap on_exit EXIT HUP INT TERM
 
 mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")" "$(dirname "$common_status_log_file")" "$(dirname "$common_status_lock_file")" "$(dirname "$notification_status_log_file")" "$(dirname "$notification_status_lock_file")"
 debug "using lock file $flock_file"
-{remote_destination_setup}
 exec 9>"$flock_file"
 if ! {flock_command} -n 9; then
     debug "lock busy, exiting"
     exit 0
 fi
+if [ -n "$source_remote_target" ] || [ -n "$destination_remote_target" ]; then
+    random_start_delay 60
+fi
+{remote_destination_setup}
 
 if ! {source_exists_cmd}; then
     log_status "{missing_source_message}"

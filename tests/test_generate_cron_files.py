@@ -1052,9 +1052,15 @@ class TestGenerateRsyncCommand:
         assert 'debug "script failed with exit code $status"' in script
         assert 'debug "$dir_name initiated"' in script
         assert 'debug "$dir_name completed"' in script
+        assert 'random_start_delay() {' in script
+        assert 'od -An -N4 -tu4 /dev/urandom' in script
+        assert 'print $1 % max' in script
+        assert 'random_start_delay 60' in script
+        assert script.index('/opt/bin/flock -n 9') < script.index('random_start_delay 60')
         assert 'log_status "$dir_name initiated"' in script
         assert 'log_status "$dir_name completed"' in script
         assert 'if ! [ -d "/source" ]; then' in script
+        assert script.index('random_start_delay 60') < script.index('if ! [ -d "/source" ]; then')
         assert 'source directory missing: /source' in script
         assert 'append_common_status "error" "" "/source" "/dest"' in script
         assert 'latest_log_file="/tmp/test.log.latest"' in script

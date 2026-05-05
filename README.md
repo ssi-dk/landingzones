@@ -64,6 +64,12 @@ The system is configured via a tab-separated `transfers.tsv` file:
 | `log_file` | Log file name resolved under the system log folder | `transfers.log` |
 | `flock_file` | Lock file name resolved under the system flock folder | `transfer.lock` |
 
+Future todo: add an optional second, per-remote-host lock for cross-server
+transfers. The existing `flock_file` prevents one transfer from overlapping
+with itself; a host-level lock would limit concurrent SSH/rsync handshakes
+against the same remote server when many transfer rows run on the same cron
+schedule.
+
 ### Example
 
 ```tsv
