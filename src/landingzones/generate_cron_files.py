@@ -343,8 +343,7 @@ def normalize_io_nice(io_nice):
 
 def transfer_uses_portable_metadata(transfer):
     """Return True when a transfer participates in portable run tracking."""
-    flow_group = str(transfer.get('flow_group', '') or '').strip()
-    return bool(flow_group and flow_group != 'nan')
+    return True
 
 
 def sanitize_identifier(identifier):
@@ -530,29 +529,16 @@ def validate_flow_metadata(df):
     for _, row in df.iterrows():
         identifier = row.get('identifiers', '')
         uses_portable_metadata = transfer_uses_portable_metadata(row)
-        is_entry_point = row.get('is_entry_point', 'FALSE') == 'TRUE'
         rsync_options = str(row.get('rsync_options', '') or '')
 
-        if not uses_portable_metadata:
-            if any(
-                row.get(column, 'FALSE') == 'TRUE'
-                for column in (
-                    'is_entry_point',
-                    'is_end_point',
-                )
-            ):
-                errors.append(
-                    "Transfer '{0}' sets flow boundary booleans but has no flow_group".format(
-                        identifier
-                    )
-                )
-            continue
-
-        if "--exclude='/.*'" in rsync_options or '--exclude="/.*"' in rsync_options:
+        if (
+            uses_portable_metadata
+            and ("--exclude='/.*'" in rsync_options or '--exclude="/.*"' in rsync_options)
+        ):
             errors.append(
-                "Transfer '{0}' uses flow_group='{1}' but rsync_options excludes hidden "
+                "Transfer '{0}' uses portable .landing_zones metadata but rsync_options excludes hidden "
                 "root-level entries via --exclude='/.*'; portable .landing_zones metadata "
-                "would not transfer".format(identifier, row.get('flow_group', ''))
+                "would not transfer".format(identifier)
             )
 
     if errors:
@@ -1165,6 +1151,7 @@ preflight_stderr_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.pre
 current_run=""
 current_run_id=""
 current_run_name=""
+current_flow_group=""
 current_origin_system=""
 current_entry_transfer_identifier=""
 current_created_at_utc=""
@@ -1280,7 +1267,7 @@ write_run_metadata_local() {{
         printf 'schema_version\\t1\\n'
         printf 'run_id\\t%s\\n' "$(sanitize_tsv_field "$current_run_id")"
         printf 'run_name\\t%s\\n' "$(sanitize_tsv_field "$current_run")"
-        printf 'flow_group\\t%s\\n' "$(sanitize_tsv_field "$flow_group")"
+        printf 'flow_group\\t%s\\n' "$(sanitize_tsv_field "$current_flow_group")"
         printf 'origin_system\\t%s\\n' "$(sanitize_tsv_field "$transfer_system")"
         printf 'entry_transfer_identifier\\t%s\\n' "$(sanitize_tsv_field "$transfer_identifier")"
         printf 'created_at_utc\\t%s\\n' "$(sanitize_tsv_field "$created_at_utc")"
@@ -1302,7 +1289,7 @@ write_run_metadata_remote() {{
         'schema_version	1' \
         "run_id	$(sanitize_tsv_field "$current_run_id")" \
         "run_name	$(sanitize_tsv_field "$current_run")" \
-        "flow_group	$(sanitize_tsv_field "$flow_group")" \
+        "flow_group	$(sanitize_tsv_field "$current_flow_group")" \
         "origin_system	$(sanitize_tsv_field "$transfer_system")" \
         "entry_transfer_identifier	$(sanitize_tsv_field "$transfer_identifier")" \
         "created_at_utc	$(sanitize_tsv_field "$created_at_utc")"
@@ -1320,7 +1307,7 @@ append_portable_event_local() {{
     printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
         "$(sanitize_tsv_field "$event_time_utc")" \
         "$(sanitize_tsv_field "$current_run_id")" \
-        "$(sanitize_tsv_field "$flow_group")" \
+        "$(sanitize_tsv_field "$current_flow_group")" \
         "$(sanitize_tsv_field "$transfer_identifier")" \
         "$(sanitize_tsv_field "$transfer_system")" \
         "$(sanitize_tsv_field "$event_status")" \
@@ -1342,7 +1329,7 @@ append_portable_event_remote() {{
     remote_ssh "$remote_target" "$remote_port" sh -c '
         printf "%s\\n" "$2" >> "$1"
     ' sh "$events_file" \
-        "$(sanitize_tsv_field "$event_time_utc")	$(sanitize_tsv_field "$current_run_id")	$(sanitize_tsv_field "$flow_group")	$(sanitize_tsv_field "$transfer_identifier")	$(sanitize_tsv_field "$transfer_system")	$(sanitize_tsv_field "$event_status")	$(sanitize_tsv_field "$current_run_source")	$(sanitize_tsv_field "$current_run_destination")	$(sanitize_tsv_field "$event_message")"
+        "$(sanitize_tsv_field "$event_time_utc")	$(sanitize_tsv_field "$current_run_id")	$(sanitize_tsv_field "$current_flow_group")	$(sanitize_tsv_field "$transfer_identifier")	$(sanitize_tsv_field "$transfer_system")	$(sanitize_tsv_field "$event_status")	$(sanitize_tsv_field "$current_run_source")	$(sanitize_tsv_field "$current_run_destination")	$(sanitize_tsv_field "$event_message")"
 }}
 
 source_metadata_exists() {{
@@ -1357,6 +1344,7 @@ ensure_source_run_bundle() {{
     if [ "$portable_metadata_enabled" != "1" ]; then
         current_run_id=""
         current_run_name="$current_run"
+        current_flow_group=""
         current_origin_system=""
         current_entry_transfer_identifier=""
         current_created_at_utc=""
@@ -1367,12 +1355,14 @@ ensure_source_run_bundle() {{
         if [ -n "$source_remote_target" ]; then
             current_run_id="$(read_run_id_remote "$source_remote_target" "$source_remote_port" "$(portable_metadata_file_for_run "$source_dir")")"
             current_run_name="$(read_metadata_field_remote "$source_remote_target" "$source_remote_port" "$(portable_metadata_file_for_run "$source_dir")" "run_name")"
+            current_flow_group="$(read_metadata_field_remote "$source_remote_target" "$source_remote_port" "$(portable_metadata_file_for_run "$source_dir")" "flow_group")"
             current_origin_system="$(read_metadata_field_remote "$source_remote_target" "$source_remote_port" "$(portable_metadata_file_for_run "$source_dir")" "origin_system")"
             current_entry_transfer_identifier="$(read_metadata_field_remote "$source_remote_target" "$source_remote_port" "$(portable_metadata_file_for_run "$source_dir")" "entry_transfer_identifier")"
             current_created_at_utc="$(read_metadata_field_remote "$source_remote_target" "$source_remote_port" "$(portable_metadata_file_for_run "$source_dir")" "created_at_utc")"
         else
             current_run_id="$(read_run_id_local "$(portable_metadata_file_for_run "$source_dir")")"
             current_run_name="$(read_metadata_field_local "$(portable_metadata_file_for_run "$source_dir")" "run_name")"
+            current_flow_group="$(read_metadata_field_local "$(portable_metadata_file_for_run "$source_dir")" "flow_group")"
             current_origin_system="$(read_metadata_field_local "$(portable_metadata_file_for_run "$source_dir")" "origin_system")"
             current_entry_transfer_identifier="$(read_metadata_field_local "$(portable_metadata_file_for_run "$source_dir")" "entry_transfer_identifier")"
             current_created_at_utc="$(read_metadata_field_local "$(portable_metadata_file_for_run "$source_dir")" "created_at_utc")"
@@ -1387,13 +1377,6 @@ ensure_source_run_bundle() {{
         return 0
     fi
 
-    if [ "$is_entry_point" != "TRUE" ]; then
-        log_status "$dir_name missing portable metadata"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination"
-        debug "$dir_name missing portable metadata"
-        return 1
-    fi
-
     if ! command -v uuidgen >/dev/null 2>&1; then
         log_status "$dir_name missing uuidgen"
         append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination"
@@ -1403,6 +1386,7 @@ ensure_source_run_bundle() {{
 
     current_run_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
     current_run_name="$current_run"
+    current_flow_group="$flow_group"
     current_origin_system="$transfer_system"
     current_entry_transfer_identifier="$transfer_identifier"
     current_created_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -1496,7 +1480,7 @@ build_notification_payload() {{
         "$(json_escape "$transfer_system")" \\
         "$(json_escape "$current_run_id")" \\
         "$(json_escape "$current_run_name")" \\
-        "$(json_escape "$flow_group")" \\
+        "$(json_escape "$current_flow_group")" \\
         "$(json_escape "$transfer_tags")" \\
         "$(json_escape "$event_directory")" \\
         "$(json_escape "$event_source")" \\
@@ -1537,7 +1521,7 @@ append_notification_status() {{
             "$(sanitize_tsv_field "$transfer_system")" \\
             "$(sanitize_tsv_field "$current_run_id")" \\
             "$(sanitize_tsv_field "$current_run_name")" \\
-            "$(sanitize_tsv_field "$flow_group")" \\
+            "$(sanitize_tsv_field "$current_flow_group")" \\
             "$(sanitize_tsv_field "$transfer_tags")" \\
             "$(sanitize_tsv_field "$event_directory")" \\
             "$(sanitize_tsv_field "$event_source")" \\
@@ -1612,7 +1596,7 @@ append_common_status() {{
             "$(sanitize_tsv_field "$transfer_system")" \\
             "$(sanitize_tsv_field "$current_run_id")" \\
             "$(sanitize_tsv_field "$current_run_name")" \\
-            "$(sanitize_tsv_field "$flow_group")" \\
+            "$(sanitize_tsv_field "$current_flow_group")" \\
             "$(sanitize_tsv_field "$transfer_tags")" \\
             "$(sanitize_tsv_field "$current_origin_system")" \\
             "$(sanitize_tsv_field "$current_entry_transfer_identifier")" \\
@@ -1645,6 +1629,7 @@ reset_current_run_context() {{
     current_run=""
     current_run_id=""
     current_run_name=""
+    current_flow_group=""
     current_origin_system=""
     current_entry_transfer_identifier=""
     current_created_at_utc=""
@@ -1711,6 +1696,7 @@ fi
     current_run_destination={run_destination_expr}
     current_run_id=""
     current_run_name="$dir_name"
+    current_flow_group=""
     current_origin_system=""
     current_entry_transfer_identifier=""
     current_created_at_utc=""

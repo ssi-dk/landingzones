@@ -675,6 +675,28 @@ class TestTestWithData:
         assert cdr.list_visible_directories(str(final_root)) == ['flow_one', 'flow_two']
         assert (final_root / 'flow_one' / 'payload.txt').read_text() == 'flow_one'
         assert (final_root / 'flow_two' / 'payload.txt').read_text() == 'flow_two'
+        metadata = (
+            final_root
+            / 'flow_one'
+            / '.landing_zones'
+            / 'landingzone-run-metadata.tsv'
+        )
+        events = (
+            final_root
+            / 'flow_one'
+            / '.landing_zones'
+            / 'landingzone-transfer-events.tsv'
+        )
+        metadata_fields = dict(
+            line.split('\t', 1)
+            for line in metadata.read_text().splitlines()
+            if '\t' in line
+        )
+        assert metadata_fields['run_id']
+        assert metadata_fields['flow_group'] == ''
+        assert metadata_fields['entry_transfer_identifier'] == 'step1'
+        assert '\tstep1\ttestbox\tinitiated\t' in events.read_text()
+        assert '\tstep2\ttestbox\tcompleted\t' in events.read_text()
         assert (runtime_root / 'scripts' / 'step1.sh').exists()
         assert (runtime_root / 'scripts' / 'step2.sh').exists()
         assert (runtime_root / 'validation_scripts' / 'lz_run_validation.sh').exists()

@@ -352,8 +352,8 @@ server1_main\tserver1\tuser1\t/src/\t/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt\t
 
     def test_parse_rejects_hidden_root_exclude_for_portable_metadata(self, tmp_path):
         """Portable metadata cannot coexist with --exclude='/.*'."""
-        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tflow_group\tis_entry_point
-server1_main\tserver1\tuser1\t/src/\t/dest/\t\t--exclude='/.*'\t\t/tmp/log.txt\t/tmp/lock.txt\tflow_a\tTRUE
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file
+server1_main\tserver1\tuser1\t/src/\t/dest/\t\t--exclude='/.*'\t\t/tmp/log.txt\t/tmp/lock.txt
 """
         test_file = tmp_path / "test_transfers.tsv"
         test_file.write_text(tsv_content)
@@ -362,6 +362,20 @@ server1_main\tserver1\tuser1\t/src/\t/dest/\t\t--exclude='/.*'\t\t/tmp/log.txt\t
             gcf.parse_transfers_file(str(test_file))
 
         assert "portable .landing_zones metadata would not transfer" in str(exc_info.value)
+
+    def test_parse_allows_flow_boundaries_without_flow_group(self, tmp_path):
+        """Flow boundary flags should not require a reporting flow group."""
+        tsv_content = """identifiers\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tis_entry_point\tis_end_point
+server1_main\tserver1\tuser1\t/src/\t/dest/\t\t\t\t/tmp/log.txt\t/tmp/lock.txt\tTRUE\tTRUE
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        df = gcf.parse_transfers_file(str(test_file))
+
+        assert df.iloc[0]['flow_group'] == ''
+        assert df.iloc[0]['is_entry_point'] == 'TRUE'
+        assert df.iloc[0]['is_end_point'] == 'TRUE'
 
     def test_parse_rejects_malformed_remote_endpoint(self, tmp_path):
         """Remote-looking endpoints must include the host:path separator."""
@@ -1021,6 +1035,10 @@ class TestGenerateRsyncCommand:
         assert 'common_status_log_file="output/log/Landing_Zone_server1.transfers.tsv"' in script
         assert 'common_status_lock_file="output/flock/Landing_Zone_server1.transfers.lock"' in script
         assert 'transfer_tags=""' in script
+        assert 'portable_metadata_enabled="1"' in script
+        assert 'flow_group=""' in script
+        assert 'current_flow_group="$flow_group"' in script
+        assert 'missing portable metadata' not in script
         assert "printf 'event_time_utc\\ttransfer_identifier\\tsystem\\trun_id\\trun_name\\tflow_group\\ttags\\torigin_system\\tentry_transfer_identifier\\tcreated_at_utc\\tdirectory\\tsource_path\\tdestination_path\\tstatus\\tmessage\\n'" in script
         assert 'append_common_status "initiated" "$dir_name" "$current_run_source" "$current_run_destination"' in script
         assert 'append_common_status "completed" "$dir_name" "$current_run_source" "$current_run_destination"' in script
@@ -1076,8 +1094,11 @@ class TestGenerateRsyncCommand:
         assert 'portable_events_file_name="landingzone-transfer-events.tsv"' in script
         assert 'current_run_id="$(uuidgen | tr ' in script
         assert 'current_run_name="$dir_name"' in script
+        assert 'current_flow_group="$flow_group"' in script
+        assert 'current_flow_group="$(read_metadata_field_local "$(portable_metadata_file_for_run "$source_dir")" "flow_group")"' in script
         assert 'current_origin_system="$transfer_system"' in script
         assert 'current_entry_transfer_identifier="$transfer_identifier"' in script
+        assert '"$(sanitize_tsv_field "$current_flow_group")"' in script
         assert 'ensure_source_run_bundle || continue' in script
         assert 'append_source_portable_event "initiated"' in script
         assert 'append_destination_portable_event "completed"' in script
@@ -1666,8 +1687,8 @@ class TestGenerateRsyncCommand:
         not (HAS_RSYNC and HAS_FLOCK),
         reason="requires rsync and flock",
     )
-    def test_generated_script_writes_notification_log_and_suppresses_duplicate_success(self, tmp_path, monkeypatch):
-        """Notification delivery should be tracked separately and deduplicated."""
+    def test_generated_script_writes_notification_log_for_distinct_minted_runs(self, tmp_path, monkeypatch):
+        """Notification delivery should record separately minted run identities."""
         fake_bin = tmp_path / "bin"
         fake_bin.mkdir()
         fake_curl = fake_bin / "curl"
@@ -1727,13 +1748,20 @@ class TestGenerateRsyncCommand:
 
         notification_log = managed_root / "log" / "Landing_Zone_server1.notifications.tsv"
         rows = notification_log.read_text().splitlines()
+        first_notification = rows[1].split('\t')
+        second_notification = rows[2].split('\t')
 
         assert proc.returncode == 0
-        assert len(rows) == 2
+        assert len(rows) == 3
         assert rows[0].startswith("event_time_utc\tnotification_time_utc\tidempotency_key")
         assert "\tnotify_success\tserver1\t" in rows[1]
         assert "\theartbeat\t" in rows[1]
         assert "\tcompleted\tsent\t200\t1\t" in rows[1]
+        assert first_notification[5]
+        assert second_notification[5]
+        assert first_notification[5] != second_notification[5]
+        assert first_notification[7] == ''
+        assert second_notification[7] == ''
 
 
 class TestGenerateCronHeader:

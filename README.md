@@ -217,6 +217,8 @@ The operator-facing validation surface has three modes:
 `landingzones validate integration` is the heavier integration-style test mode. It copies toy data into the configured starting locations, generates the real shell scripts, and runs the transfers using the normal log and flock paths.
 Use `landingzones validate integration --slow` when you want the harness to print the result of each completed step and wait for Enter before running the next one.
 
+Generated transfer scripts create portable `.landing_zones` sidecars for every enabled transfer. `flow_group` is optional sidecar metadata: when a transfer mints a new sidecar the value may be blank, and downstream transfers preserve the value already stored in the sidecar.
+
 ### Generated Validation Wrappers
 
 Each `flow_group` with exactly one `is_entry_point=TRUE` row gets a generated wrapper in the configured validation-scripts directory:
