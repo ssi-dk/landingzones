@@ -641,6 +641,58 @@ class TestTestWithData:
             rit_managed,
         )
 
+    def test_runtime_artifact_paths_expand_home_for_python_filesystem_use(
+        self, tmp_path, monkeypatch
+    ):
+        """Python-created integration artifacts should not create literal $HOME dirs."""
+        home_dir = tmp_path / 'home'
+        home_dir.mkdir()
+        monkeypatch.setenv('HOME', str(home_dir))
+        snapshot = cdr.config.snapshot_state()
+
+        try:
+            cdr.config.load_config(
+                rit_managed_locations={'testbox': '$HOME/rit_managed'}
+            )
+            runtime_dirs = cdr.get_test_with_data_runtime_dirs(
+                'testbox', 'runner'
+            )
+        finally:
+            cdr.config.restore_state(snapshot)
+
+        expected_root = (
+            home_dir
+            / 'rit_managed'
+            / 'test_with_data_runtime'
+            / 'testbox.runner'
+        )
+        assert runtime_dirs['root'] == str(expected_root)
+        assert '$HOME' not in runtime_dirs['scripts_dir']
+
+    def test_cleanup_runtime_artifacts_expands_home_paths(
+        self, tmp_path, monkeypatch
+    ):
+        """Cleanup should target the same expanded paths the shell scripts use."""
+        home_dir = tmp_path / 'home'
+        home_dir.mkdir()
+        monkeypatch.setenv('HOME', str(home_dir))
+        log_file = home_dir / 'step.log'
+        latest_log_file = home_dir / 'step.log.latest'
+        mini_log_file = home_dir / 'step.log.mini'
+        flock_file = home_dir / 'step.lock'
+        for path in (log_file, latest_log_file, mini_log_file, flock_file):
+            path.write_text('artifact')
+
+        transfers_df = pd.DataFrame([{
+            'log_file': '$HOME/step.log',
+            'flock_file': '$HOME/step.lock',
+        }])
+
+        cdr.cleanup_test_with_data_runtime_artifacts(transfers_df)
+
+        for path in (log_file, latest_log_file, mini_log_file, flock_file):
+            assert not path.exists()
+
     @pytest.mark.skipif(
         shutil.which('rsync') is None,
         reason='rsync is required for local script-test execution',

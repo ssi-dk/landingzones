@@ -71,6 +71,13 @@ def _restore_config_state(snapshot):
     config.restore_state(snapshot)
 
 
+def expand_local_filesystem_path(path):
+    """Expand shell-style local path shortcuts before Python filesystem use."""
+    if not path:
+        return path
+    return os.path.expandvars(os.path.expanduser(str(path)))
+
+
 def get_repo_root():
     """Return the repository root from the installed package path."""
     return os.path.abspath(
@@ -584,8 +591,12 @@ def cleanup_test_with_data_runtime_artifacts(transfers_df):
     """Remove old lock and log artifacts for the test-with-data transfer subset."""
     artifact_paths = set()
     for _, transfer in transfers_df.iterrows():
-        log_file = str(transfer.get('log_file', '') or '').strip()
-        flock_file = str(transfer.get('flock_file', '') or '').strip()
+        log_file = expand_local_filesystem_path(
+            str(transfer.get('log_file', '') or '').strip()
+        )
+        flock_file = expand_local_filesystem_path(
+            str(transfer.get('flock_file', '') or '').strip()
+        )
         if log_file and log_file != 'nan':
             artifact_paths.update([
                 log_file,
@@ -696,7 +707,9 @@ def load_test_with_data_transfer_graph(transfers_file, base_dir, runtime_ids=Non
 
 def get_test_with_data_runtime_dirs(current_system, current_user):
     """Return writable directories used to generate integration-only artifacts."""
-    base_root = config.get_rit_managed_location(current_system)
+    base_root = expand_local_filesystem_path(
+        config.get_rit_managed_location(current_system)
+    )
     runtime_name = "{0}.{1}".format(
         sanitize_identifier(current_system) or 'system',
         sanitize_identifier(current_user) or 'user',
@@ -750,6 +763,7 @@ def generate_test_scripts(transfers_df, scripts_dir, crontab_dir, validation_scr
 
 def read_log_excerpt(log_file, max_lines=10):
     """Return a short trailing excerpt from a log file when it exists."""
+    log_file = expand_local_filesystem_path(log_file)
     if not log_file or log_file == 'nan' or not os.path.exists(log_file):
         return ''
 
@@ -1385,7 +1399,9 @@ def run_test_with_data(
         if failed_runs:
             first_failure = failed_runs[0]
             log_excerpt = ''
-            log_file = first_failure.get('log_file', '')
+            log_file = expand_local_filesystem_path(
+                first_failure.get('log_file', '')
+            )
             if log_file and os.path.exists(log_file):
                 with open(log_file, 'r') as handle:
                     log_excerpt = handle.read().strip()
