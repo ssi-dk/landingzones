@@ -1186,6 +1186,15 @@ portable_events_file_for_run() {{
     printf '%s/%s' "$(portable_metadata_dir_for_run "$1")" "$portable_events_file_name"
 }}
 
+set_portable_metadata_permissions_local() {{
+    metadata_dir="$1"
+    metadata_path="${{2:-}}"
+    chmod g+rwx "$metadata_dir" 2>/dev/null || true
+    if [ -n "$metadata_path" ] && [ -e "$metadata_path" ]; then
+        chmod g+rw "$metadata_path" 2>/dev/null || true
+    fi
+}}
+
 remote_ssh() {{
     remote_target="$1"
     remote_port="$2"
@@ -1209,9 +1218,11 @@ ensure_portable_events_file_local() {{
     metadata_dir="$1"
     events_file="$2"
     mkdir -p "$metadata_dir"
+    set_portable_metadata_permissions_local "$metadata_dir"
     if [ ! -s "$events_file" ]; then
         printf 'event_time_utc\\trun_id\\tflow_group\\ttransfer_identifier\\tsystem\\tstatus\\tsource_path\\tdestination_path\\tmessage\\n' >> "$events_file"
     fi
+    set_portable_metadata_permissions_local "$metadata_dir" "$events_file"
 }}
 
 ensure_portable_events_file_remote() {{
@@ -1219,12 +1230,15 @@ ensure_portable_events_file_remote() {{
     remote_port="$2"
     metadata_dir="$3"
     events_file="$4"
-    remote_ssh "$remote_target" "$remote_port" mkdir -p "$metadata_dir"
     remote_ssh "$remote_target" "$remote_port" sh -c '
-        if [ ! -s "$1" ]; then
-            printf "%s\\n" "$2" >> "$1"
+        set -e
+        mkdir -p "$1"
+        chmod g+rwx "$1" 2>/dev/null || true
+        if [ ! -s "$2" ]; then
+            printf "%s\\n" "$3" >> "$2"
         fi
-    ' sh "$events_file" 'event_time_utc	run_id	flow_group	transfer_identifier	system	status	source_path	destination_path	message'
+        chmod g+rw "$2" 2>/dev/null || true
+    ' sh "$metadata_dir" "$events_file" 'event_time_utc	run_id	flow_group	transfer_identifier	system	status	source_path	destination_path	message'
 }}
 
 read_run_id_local() {{
@@ -1263,6 +1277,7 @@ write_run_metadata_local() {{
     metadata_file="$(portable_metadata_file_for_run "$run_dir")"
     created_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     mkdir -p "$metadata_dir"
+    set_portable_metadata_permissions_local "$metadata_dir"
     {{
         printf 'schema_version\\t1\\n'
         printf 'run_id\\t%s\\n' "$(sanitize_tsv_field "$current_run_id")"
@@ -1272,6 +1287,7 @@ write_run_metadata_local() {{
         printf 'entry_transfer_identifier\\t%s\\n' "$(sanitize_tsv_field "$transfer_identifier")"
         printf 'created_at_utc\\t%s\\n' "$(sanitize_tsv_field "$created_at_utc")"
     }} > "$metadata_file"
+    set_portable_metadata_permissions_local "$metadata_dir" "$metadata_file"
     ensure_portable_events_file_local "$metadata_dir" "$(portable_events_file_for_run "$run_dir")"
 }}
 
@@ -1282,9 +1298,15 @@ write_run_metadata_remote() {{
     metadata_dir="$(portable_metadata_dir_for_run "$run_dir")"
     metadata_file="$(portable_metadata_file_for_run "$run_dir")"
     created_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    remote_ssh "$remote_target" "$remote_port" mkdir -p "$metadata_dir"
     remote_ssh "$remote_target" "$remote_port" sh -c '
+        set -e
+        mkdir -p "$1"
+        chmod g+rwx "$1" 2>/dev/null || true
+    ' sh "$metadata_dir"
+    remote_ssh "$remote_target" "$remote_port" sh -c '
+        set -e
         printf "%s\\n" "$2" "$3" "$4" "$5" "$6" "$7" "$8" > "$1"
+        chmod g+rw "$1" 2>/dev/null || true
     ' sh "$metadata_file" \
         'schema_version	1' \
         "run_id	$(sanitize_tsv_field "$current_run_id")" \

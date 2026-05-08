@@ -1098,6 +1098,9 @@ class TestGenerateRsyncCommand:
         assert 'portable_metadata_dir_name=".landing_zones"' in script
         assert 'portable_metadata_file_name="landingzone-run-metadata.tsv"' in script
         assert 'portable_events_file_name="landingzone-transfer-events.tsv"' in script
+        assert 'chmod g+rwx "$metadata_dir" 2>/dev/null || true' in script
+        assert 'chmod g+rw "$metadata_path" 2>/dev/null || true' in script
+        assert 'chmod g+rw "$2" 2>/dev/null || true' in script
         assert 'current_run_id="$(uuidgen | tr ' in script
         assert 'current_run_name="$dir_name"' in script
         assert 'current_flow_group="$flow_group"' in script
@@ -1688,6 +1691,45 @@ class TestGenerateRsyncCommand:
         assert "RunGood" in status_text
         assert "completed" in status_text
         assert "source cleanup preflight failed" not in status_text
+
+    @pytest.mark.skipif(
+        not (HAS_RSYNC and HAS_FLOCK),
+        reason="requires rsync and flock",
+    )
+    def test_generated_script_marks_portable_sidecars_group_writable(self, tmp_path):
+        """Portable metadata sidecars should be writable by later group hops."""
+        source_root = tmp_path / "source"
+        destination_root = tmp_path / "destination"
+        run_dir = source_root / "RunPerms"
+        source_root.mkdir()
+        destination_root.mkdir()
+        run_dir.mkdir()
+        (run_dir / "payload.txt").write_text("payload")
+
+        transfer = {
+            'identifiers': 'sidecar_permissions',
+            'system': 'server1',
+            'source': str(source_root / '*'),
+            'source_port': '',
+            'destination': str(destination_root) + '/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': str(tmp_path / 'sidecar_permissions.log'),
+            'flock_file': str(tmp_path / 'sidecar_permissions.lock'),
+            'frequency': '',
+        }
+
+        proc, _ = self._run_generated_transfer_script(tmp_path, transfer)
+
+        destination_sidecar_dir = destination_root / "RunPerms" / ".landing_zones"
+        metadata_file = destination_sidecar_dir / "landingzone-run-metadata.tsv"
+        events_file = destination_sidecar_dir / "landingzone-transfer-events.tsv"
+
+        assert proc.returncode == 0
+        assert destination_sidecar_dir.stat().st_mode & 0o020
+        assert metadata_file.stat().st_mode & 0o020
+        assert events_file.stat().st_mode & 0o020
 
     @pytest.mark.skipif(
         not (HAS_RSYNC and HAS_FLOCK),
