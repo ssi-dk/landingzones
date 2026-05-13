@@ -1104,6 +1104,7 @@ def generate_iterative_script_content(transfer):
     flow_group = str(transfer.get('flow_group', '') or '').strip()
     transfer_tags = normalize_tags_text(transfer.get('tags', ''))
     is_entry_point = str(transfer.get('is_entry_point', 'FALSE') or 'FALSE').strip().upper()
+    is_end_point = str(transfer.get('is_end_point', 'FALSE') or 'FALSE').strip().upper()
     notify_on_success = str(transfer.get('notify_on_success', 'FALSE') or 'FALSE').strip().upper()
     notify_on_error = str(transfer.get('notify_on_error', 'FALSE') or 'FALSE').strip().upper()
     portable_metadata_enabled = '1' if transfer_uses_portable_metadata(transfer) else '0'
@@ -1133,6 +1134,7 @@ flow_group="{flow_group}"
 transfer_tags="{transfer_tags}"
 portable_metadata_enabled="{portable_metadata_enabled}"
 is_entry_point="{is_entry_point}"
+is_end_point="{is_end_point}"
 notify_on_success="{notify_on_success}"
 notify_on_error="{notify_on_error}"
 source_remote_target="{source_remote_target}"
@@ -1143,6 +1145,7 @@ destination_root_runtime="{destination_root_runtime}"
 portable_metadata_dir_name=".landing_zones"
 portable_metadata_file_name="landingzone-run-metadata.tsv"
 portable_events_file_name="landingzone-transfer-events.tsv"
+portable_archive_file_name="landingzone-run-archive.tar"
 run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.rsync.XXXXXX")"
 cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.cleanup.XXXXXX")"
 promote_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.promote.XXXXXX")"
@@ -1186,6 +1189,10 @@ portable_events_file_for_run() {{
     printf '%s/%s' "$(portable_metadata_dir_for_run "$1")" "$portable_events_file_name"
 }}
 
+portable_archive_file_for_run() {{
+    printf '%s/%s' "$(portable_metadata_dir_for_run "$1")" "$portable_archive_file_name"
+}}
+
 set_portable_metadata_permissions_local() {{
     metadata_dir="$1"
     metadata_path="${{2:-}}"
@@ -1211,6 +1218,130 @@ remote_ssh() {{
         ssh -p "$remote_port" "$remote_target" "$remote_command"
     else
         ssh "$remote_target" "$remote_command"
+    fi
+}}
+
+ensure_archived_source_bundle_local() {{
+    run_dir="$1"
+    [ "$is_entry_point" = "TRUE" ] || return 0
+    archive_path="$(portable_archive_file_for_run "$run_dir")"
+    [ -f "$archive_path" ] && return 0
+    if ! find "$run_dir" -mindepth 1 -maxdepth 1 ! -name "$portable_metadata_dir_name" -print | grep -q .; then
+        return 0
+    fi
+    if ! command -v tar >/dev/null 2>&1; then
+        printf '%s\\n' "tar command not found" >&2
+        return 1
+    fi
+    metadata_dir="$(portable_metadata_dir_for_run "$run_dir")"
+    mkdir -p "$metadata_dir"
+    if ! ( cd "$run_dir" && tar --exclude="./$portable_metadata_dir_name" --exclude="./$portable_metadata_dir_name/*" -cf "$archive_path" . ); then
+        return 1
+    fi
+    set_portable_metadata_permissions_local "$metadata_dir" "$archive_path"
+    find "$run_dir" -mindepth 1 -maxdepth 1 ! -name "$portable_metadata_dir_name" -exec rm -rf {{}} +
+}}
+
+ensure_archived_source_bundle_remote() {{
+    [ "$is_entry_point" = "TRUE" ] || return 0
+    remote_ssh "$source_remote_target" "$source_remote_port" sh -c '
+        set -e
+        run_dir="$1"
+        metadata_dir_name="$2"
+        archive_file_name="$3"
+        metadata_dir="$run_dir/$metadata_dir_name"
+        archive_path="$metadata_dir/$archive_file_name"
+        [ -f "$archive_path" ] && exit 0
+        if ! find "$run_dir" -mindepth 1 -maxdepth 1 ! -name "$metadata_dir_name" -print | grep -q .; then
+            exit 0
+        fi
+        command -v tar >/dev/null 2>&1 || {{ printf "%s\\n" "tar command not found" >&2; exit 1; }}
+        mkdir -p "$metadata_dir"
+        ( cd "$run_dir" && tar --exclude="./$metadata_dir_name" --exclude="./$metadata_dir_name/*" -cf "$archive_path" . )
+        chmod g+rwx "$metadata_dir" 2>/dev/null || true
+        chmod g+rw "$archive_path" 2>/dev/null || true
+        find "$run_dir" -mindepth 1 -maxdepth 1 ! -name "$metadata_dir_name" -exec rm -rf {{}} +
+    ' sh "$source_dir" "$portable_metadata_dir_name" "$portable_archive_file_name"
+}}
+
+ensure_archived_source_bundle() {{
+    [ "$is_entry_point" = "TRUE" ] || return 0
+    if [ -n "$source_remote_target" ]; then
+        ensure_archived_source_bundle_remote
+    else
+        ensure_archived_source_bundle_local "$source_dir"
+    fi
+}}
+
+archive_entries_are_safe() {{
+    archive_path="$1"
+    entries_file="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.archive-entries.XXXXXX")" || return 1
+    if ! tar -tf "$archive_path" >"$entries_file"; then
+        rm -f "$entries_file"
+        return 1
+    fi
+    safe_status=0
+    while IFS= read -r archive_entry; do
+        case "$archive_entry" in
+            /*|..|../*|*/../*|*/..) safe_status=1; break ;;
+        esac
+    done <"$entries_file"
+    rm -f "$entries_file"
+    return "$safe_status"
+}}
+
+extract_archived_destination_bundle_local() {{
+    run_dir="$1"
+    archive_path="$(portable_archive_file_for_run "$run_dir")"
+    [ -f "$archive_path" ] || return 0
+    if ! command -v tar >/dev/null 2>&1; then
+        printf '%s\\n' "tar command not found"
+        return 1
+    fi
+    if ! archive_entries_are_safe "$archive_path"; then
+        printf '%s\\n' "archive contains unsafe paths"
+        return 1
+    fi
+    tar -xf "$archive_path" -C "$run_dir"
+    rm -f "$archive_path"
+}}
+
+extract_archived_destination_bundle_remote() {{
+    remote_ssh "$destination_remote_target" "$destination_remote_port" sh -c '
+        set -e
+        run_dir="$1"
+        metadata_dir_name="$2"
+        archive_file_name="$3"
+        archive_path="$run_dir/$metadata_dir_name/$archive_file_name"
+        [ -f "$archive_path" ] || exit 0
+        command -v tar >/dev/null 2>&1 || {{ printf "%s\\n" "tar command not found"; exit 1; }}
+        entries_file="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.archive-entries.XXXXXX")" || exit 1
+        if ! tar -tf "$archive_path" >"$entries_file"; then
+            rm -f "$entries_file"
+            exit 1
+        fi
+        safe_status=0
+        while IFS= read -r archive_entry; do
+            case "$archive_entry" in
+                /*|..|../*|*/../*|*/..) safe_status=1; break ;;
+            esac
+        done <"$entries_file"
+        rm -f "$entries_file"
+        if [ "$safe_status" -ne 0 ]; then
+            printf "%s\\n" "archive contains unsafe paths"
+            exit 1
+        fi
+        tar -xf "$archive_path" -C "$run_dir"
+        rm -f "$archive_path"
+    ' sh "$destination_root_runtime/$dir_name" "$portable_metadata_dir_name" "$portable_archive_file_name"
+}}
+
+extract_archived_destination_bundle() {{
+    [ "$is_end_point" = "TRUE" ] || return 0
+    if [ -n "$destination_remote_target" ]; then
+        extract_archived_destination_bundle_remote
+    else
+        extract_archived_destination_bundle_local "$destination_root_runtime/$dir_name"
     fi
 }}
 
@@ -1753,6 +1884,15 @@ fi
     append_source_portable_event "initiated"
     append_common_status "initiated" "$dir_name" "$current_run_source" "$current_run_destination"
     debug "$dir_name initiated"
+    if ! ensure_archived_source_bundle >"$preflight_log" 2>"$preflight_stderr_log"; then
+        archive_message="archive creation failed: $(summarize_log "$preflight_stderr_log")"
+        log_status "$dir_name error"
+        append_source_portable_event "error" "$archive_message"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$archive_message"
+        debug "$dir_name $archive_message"
+        reset_current_run_context
+        continue
+    fi
     : >"$preflight_log"
     : >"$preflight_stderr_log"
     if ! {source_cleanup_preflight_cmd} >"$preflight_log" 2>"$preflight_stderr_log"; then
@@ -1798,6 +1938,15 @@ fi
         promote_message="staging promote failed: see promote log"
         log_status "$dir_name error"
         append_source_portable_event "error" "$promote_message"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$promote_message"
+        debug "$dir_name $promote_message"
+        reset_current_run_context
+        continue
+    fi
+    if ! extract_archived_destination_bundle </dev/null >>"$promote_log" 2>&1; then
+        promote_message="archive extraction failed: see promote log"
+        log_status "$dir_name error"
+        append_destination_portable_event "error" "$promote_message"
         append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$promote_message"
         debug "$dir_name $promote_message"
         reset_current_run_context
@@ -1863,6 +2012,7 @@ fi
         transfer_tags=transfer_tags.replace('"', '\\"'),
         portable_metadata_enabled=portable_metadata_enabled,
         is_entry_point=is_entry_point,
+        is_end_point=is_end_point,
         notify_on_success=notify_on_success,
         notify_on_error=notify_on_error,
         source_remote_target=source_remote_target.replace('"', '\\"'),

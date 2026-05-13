@@ -106,3 +106,27 @@ def test_github_action_builds_and_uploads_standalone_bundle():
     assert "pixi run build-standalone" in workflow_text
     assert "landingzones-standalone-linux" in workflow_text
     assert "packaging/dist/landingzones-standalone.tar.gz" in workflow_text
+
+
+def test_github_action_creates_release_from_app_version():
+    """The release workflow should create v<version> from the app version."""
+    workflow_path = os.path.join(
+        APP_ROOT,
+        ".github",
+        "workflows",
+        "release-on-version.yml",
+    )
+    with open(workflow_path, "r") as handle:
+        workflow = yaml.safe_load(handle)
+    workflow_text = open(workflow_path, "r").read()
+
+    assert workflow["name"] == "Create Release From Version"
+    assert "workflow_dispatch" in workflow_text
+    assert "branches: [main]" in workflow_text
+    assert "src/landingzones/__init__.py" in workflow_text
+    assert "pixi.toml" in workflow_text
+    assert 'TAG="v${VERSION}"' in workflow_text
+    assert "gh release view" in workflow_text
+    assert "gh release create" in workflow_text
+    assert "--target \"$GITHUB_SHA\"" in workflow_text
+    assert "GH_TOKEN: ${{ github.token }}" in workflow_text
