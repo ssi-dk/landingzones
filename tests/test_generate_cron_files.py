@@ -14,6 +14,7 @@ from landingzones import generate_cron_files as gcf
 
 HAS_RSYNC = shutil.which("rsync") is not None
 HAS_FLOCK = shutil.which("flock") is not None
+HAS_TAR = shutil.which("tar") is not None
 
 
 class TestParseTransfersFile:
@@ -1810,6 +1811,90 @@ class TestGenerateRsyncCommand:
         assert first_notification[5] != second_notification[5]
         assert first_notification[7] == ''
         assert second_notification[7] == ''
+
+    @pytest.mark.skipif(
+        not (HAS_RSYNC and HAS_FLOCK and HAS_TAR),
+        reason="requires rsync, flock, and tar",
+    )
+    def test_entry_and_end_points_archive_across_intermediate_hops(self, tmp_path):
+        """Entry points should package contents until the final end point extracts."""
+        source_root = tmp_path / "source"
+        transit_root = tmp_path / "transit"
+        final_root = tmp_path / "final"
+        run_dir = source_root / "RunManyFiles"
+        nested_dir = run_dir / "nested"
+        source_root.mkdir()
+        transit_root.mkdir()
+        final_root.mkdir()
+        nested_dir.mkdir(parents=True)
+        for index in range(5):
+            (nested_dir / "payload_{0}.txt".format(index)).write_text(
+                "payload {0}".format(index)
+            )
+
+        first_transfer = {
+            'identifiers': 'archive_entry',
+            'system': 'server1',
+            'source': str(source_root / '*'),
+            'source_port': '',
+            'destination': str(transit_root) + '/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': str(tmp_path / 'archive_entry.log'),
+            'flock_file': str(tmp_path / 'archive_entry.lock'),
+            'frequency': '',
+            'is_entry_point': 'TRUE',
+            'flow_group': 'archive_flow',
+        }
+        second_transfer = {
+            'identifiers': 'archive_end',
+            'system': 'server1',
+            'source': str(transit_root / '*'),
+            'source_port': '',
+            'destination': str(final_root) + '/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': str(tmp_path / 'archive_end.log'),
+            'flock_file': str(tmp_path / 'archive_end.lock'),
+            'frequency': '',
+            'is_end_point': 'TRUE',
+            'flow_group': 'archive_flow',
+        }
+
+        first_proc, _ = self._run_generated_transfer_script(tmp_path, first_transfer)
+        transit_run = transit_root / "RunManyFiles"
+        archive_path = (
+            transit_run
+            / ".landing_zones"
+            / "landingzone-run-archive.tar"
+        )
+
+        assert first_proc.returncode == 0
+        assert not run_dir.exists()
+        assert archive_path.exists()
+        assert not (transit_run / "nested" / "payload_0.txt").exists()
+
+        second_proc, _ = self._run_generated_transfer_script(tmp_path, second_transfer)
+        final_run = final_root / "RunManyFiles"
+
+        assert second_proc.returncode == 0
+        assert not transit_run.exists()
+        assert not (
+            final_run
+            / ".landing_zones"
+            / "landingzone-run-archive.tar"
+        ).exists()
+        for index in range(5):
+            assert (
+                final_run / "nested" / "payload_{0}.txt".format(index)
+            ).read_text() == "payload {0}".format(index)
+        assert (
+            final_run
+            / ".landing_zones"
+            / "landingzone-run-metadata.tsv"
+        ).exists()
 
 
 class TestGenerateCronHeader:

@@ -63,6 +63,9 @@ The system is configured via a tab-separated `transfers.tsv` file:
 | `io_nice` | Optional `ionice` settings for `rsync` | `-c2 -n7` |
 | `log_file` | Log file name resolved under the system log folder | `transfers.log` |
 | `flock_file` | Lock file name resolved under the system flock folder | `transfer.lock` |
+| `flow_group` | Optional logical flow label shared by multi-hop transfers | `labnet_to_seqdata` |
+| `is_entry_point` | Optional `TRUE` marker for the first hop of a logical flow | `TRUE` |
+| `is_end_point` | Optional `TRUE` marker for the final hop of a logical flow | `TRUE` |
 
 Future todo: add an optional second, per-remote-host lock for cross-server
 transfers. The existing `flock_file` prevents one transfer from overlapping
@@ -172,6 +175,12 @@ landingzones-standalone-linux-x86_64.tar.gz
 For `v*` tags, the workflow also creates or updates the matching GitHub Release
 and uploads `landingzones-standalone-linux-x86_64.tar.gz` as a release asset.
 
+The GitHub Actions workflow `Create Release From Version` runs on pushes to
+`main` when the app version files change. It reads
+`src/landingzones/__init__.py`, validates `pixi.toml` has the same version, and
+creates the missing `v<version>` GitHub Release. That tag then triggers the
+existing `v*` release and publishing workflows.
+
 The bundle is written to:
 
 ```text
@@ -224,6 +233,15 @@ The operator-facing validation surface has three modes:
 Use `landingzones validate integration --slow` when you want the harness to print the result of each completed step and wait for Enter before running the next one.
 
 Generated transfer scripts create portable `.landing_zones` sidecars for every enabled transfer. `flow_group` is optional sidecar metadata: when a transfer mints a new sidecar the value may be blank, and downstream transfers preserve the value already stored in the sidecar.
+
+When a row has `is_entry_point=TRUE`, the generated script archives each
+top-level run directory into `.landing_zones/landingzone-run-archive.tar` before
+transfer and removes the original unpacked contents from that hop. Intermediate
+hops then move the archive plus the `.landing_zones` metadata instead of
+thousands of individual payload files. When a later row has
+`is_end_point=TRUE`, the generated script extracts the archive after staging
+promotion and removes the archive from the final destination. Archive extraction
+validates that tar entries are relative paths before unpacking.
 
 ### Generated Validation Wrappers
 
@@ -350,3 +368,4 @@ landingzones --help
 - PyYAML >= 5.0.0
 - pandas >= 1.0.0 only for `landingzones report transfers` / `landingzones[report]`
 - System: rsync, ssh, flock
+- System for archived entry/end-point flows: tar
