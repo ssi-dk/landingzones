@@ -5,6 +5,7 @@
 import pandas as pd
 
 from landingzones import plot_transfer_status as pts
+from landingzones import transfer_catalog
 
 
 def make_transfers_tsv(tmp_path):
@@ -267,6 +268,60 @@ def test_main_uses_yaml_runtime_ids_when_cli_filter_is_omitted(tmp_path, monkeyp
 
     assert rc == 0
     assert captured["runtime_ids"] == ["local_dev.local"]
+
+
+def test_load_transfers_for_reporting_uses_reporting_catalog(monkeypatch):
+    """Reporting transfer reads should go through the catalog in reporting mode."""
+    catalog_df = pd.DataFrame(
+        [
+            {
+                "identifiers": "stage_lab",
+                "system": "test_local",
+                "source": "/source/inbox/*",
+                "destination": "/flow/stage/",
+            }
+        ]
+    )
+    calls = []
+
+    def fake_load_reporting_transfer_catalog(
+        config_file=None,
+        transfers_file=None,
+        runtime_ids=None,
+        system=None,
+    ):
+        calls.append(
+            {
+                "config_file": config_file,
+                "transfers_file": transfers_file,
+                "runtime_ids": runtime_ids,
+                "system": system,
+            }
+        )
+        return catalog_df
+
+    monkeypatch.setattr(
+        transfer_catalog,
+        "load_reporting_transfer_catalog",
+        fake_load_reporting_transfer_catalog,
+    )
+
+    result = pts.load_transfers_for_reporting(
+        config_file="/tmp/config.yaml",
+        transfers_file="/tmp/transfers.tsv",
+        system="test_local",
+        runtime_ids=["local_dev.local"],
+    )
+
+    assert result is catalog_df
+    assert calls == [
+        {
+            "config_file": "/tmp/config.yaml",
+            "transfers_file": "/tmp/transfers.tsv",
+            "runtime_ids": ["local_dev.local"],
+            "system": "test_local",
+        }
+    ]
 
 
 def test_build_flow_graph_identifies_terminal_identifier(tmp_path):
