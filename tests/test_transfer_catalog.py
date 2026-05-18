@@ -5,7 +5,10 @@
 from landingzones import generate_cron_files as gcf
 from landingzones import transfer_catalog
 from landingzones.table import TransferTable
-from landingzones.transfer_catalog import load_runtime_transfer_catalog
+from landingzones.transfer_catalog import (
+    load_reporting_transfer_catalog,
+    load_runtime_transfer_catalog,
+)
 
 
 def test_runtime_catalog_preserves_build_loading_invariants(tmp_path):
@@ -145,3 +148,31 @@ def test_build_command_loads_transfers_through_catalog(tmp_path, monkeypatch):
     assert (tmp_path / "output" / "scripts" / "catalog_transfer.sh").exists()
     assert (crontab_dir / "catalog_runtime.Landing_Zone.cron").exists()
     assert not (tmp_path / "output" / "scripts" / "direct_parse.sh").exists()
+
+
+def test_reporting_catalog_relaxes_runtime_file_validation(tmp_path):
+    """Reporting catalog loading should not require runtime log/flock columns."""
+    transfers_file = tmp_path / "transfers.tsv"
+    config_file = tmp_path / "config.yaml"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\ttags",
+                "report_transfer\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\t/source/\t/destination/\treporting",
+            ]
+        )
+    )
+    config_file.write_text(
+        "transfers_file: {0}\n"
+        "runtime_ids:\n"
+        "  - local_dev.local\n".format(transfers_file)
+    )
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        catalog = load_reporting_transfer_catalog(config_file=str(config_file))
+    finally:
+        gcf.config.restore_state(snapshot)
+
+    assert list(catalog["identifiers"]) == ["report_transfer"]
+    assert list(catalog["runtime_id"]) == ["local_dev.local"]

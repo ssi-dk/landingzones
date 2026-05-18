@@ -6,6 +6,7 @@ import os
 
 from landingzones.config import config
 from landingzones import generate_cron_files as gcf
+from landingzones import transfer_catalog
 from landingzones.transfer_definitions import (
     definitions_from_dataframe,
     tags_match_any,
@@ -89,24 +90,21 @@ def load_transfers(
     runtime_ids=None,
     system=None,
 ):
-    """Load normalized transfer definitions after resolving config defaults."""
-    config.load_config(config_file=config_file, transfers_file=transfers_file)
-    if runtime_ids is None:
-        runtime_ids = config.runtime_ids
-    return gcf.parse_transfers_file(
-        config.transfers_file,
+    """Load normalized transfer definitions through the transfer catalog."""
+    return transfer_catalog.load_transfer_catalog(
+        config_file=config_file,
+        transfers_file=transfers_file,
         require_runtime_files=require_runtime_files,
         runtime_ids=runtime_ids,
-        systems=[system] if system else None,
+        system=system,
     )
 
 
 def load_runtime_transfers(config_file=None, transfers_file=None, runtime_ids=None):
     """Load transfers with runtime/generator validation enabled."""
-    return load_transfers(
+    return transfer_catalog.load_runtime_transfer_catalog(
         config_file=config_file,
         transfers_file=transfers_file,
-        require_runtime_files=True,
         runtime_ids=runtime_ids,
     )
 
@@ -118,10 +116,9 @@ def load_reporting_transfers(
     system=None,
 ):
     """Load transfers with analysis/reporting validation enabled."""
-    return load_transfers(
+    return transfer_catalog.load_reporting_transfer_catalog(
         config_file=config_file,
         transfers_file=transfers_file,
-        require_runtime_files=False,
         runtime_ids=runtime_ids,
         system=system,
     )

@@ -4,7 +4,9 @@
 
 import pandas as pd
 
+from landingzones import transfer_catalog
 from landingzones import validate_separation as vsep
+from landingzones.config import config
 
 
 def make_transfers_df():
@@ -221,3 +223,60 @@ def test_main_applies_yaml_runtime_id_filter(tmp_path, capsys):
 
     assert rc == 0
     assert "1 tagged transfer(s) vs 0 other enabled transfer(s)" in captured.out
+
+
+def test_main_loads_transfers_through_reporting_catalog(monkeypatch, capsys):
+    """Separation validation should read transfers through the reporting catalog."""
+    calls = []
+
+    def fake_load_reporting_transfer_catalog(
+        config_file=None,
+        transfers_file=None,
+        runtime_ids=None,
+        system=None,
+    ):
+        calls.append(
+            {
+                "config_file": config_file,
+                "transfers_file": transfers_file,
+                "runtime_ids": runtime_ids,
+                "system": system,
+            }
+        )
+        return make_transfers_df()
+
+    monkeypatch.setattr(
+        transfer_catalog,
+        "load_reporting_transfer_catalog",
+        fake_load_reporting_transfer_catalog,
+    )
+
+    snapshot = config.snapshot_state()
+    try:
+        rc = vsep.main(
+            [
+                "--config",
+                "/tmp/config.yaml",
+                "--transfers",
+                "/tmp/transfers.tsv",
+                "--runtime-id",
+                "local_dev.local",
+                "--tag",
+                "heartbeat",
+            ]
+        )
+    finally:
+        config.restore_state(snapshot)
+
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "Separation check for tags: heartbeat" in captured.out
+    assert calls == [
+        {
+            "config_file": "/tmp/config.yaml",
+            "transfers_file": "/tmp/transfers.tsv",
+            "runtime_ids": ["local_dev.local"],
+            "system": None,
+        }
+    ]
