@@ -2474,10 +2474,12 @@ def main(argv=None):
     if not os.path.exists(validation_scripts_dir):
         os.makedirs(validation_scripts_dir)
     
-    # Parse transfers into DataFrame using pandas
+    # Load transfers through the catalog seam used by build/runtime paths.
     try:
-        transfers_df = parse_transfers_file(
-            transfers_file,
+        from landingzones import transfer_catalog
+
+        transfers_df = transfer_catalog.load_runtime_transfer_catalog(
+            transfers_file=transfers_file,
             runtime_ids=config.runtime_ids,
         )
     except ValueError as exc:
