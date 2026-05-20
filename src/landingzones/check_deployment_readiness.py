@@ -1110,7 +1110,12 @@ def print_runtime_filter_status(runtime_ids, runtime_filter_source):
     )
 
 
-def run_cron_deployment_prompt(runtime_ids=None, runtime_filter_source=None):
+def run_cron_deployment_prompt(
+    runtime_ids=None,
+    runtime_filter_source=None,
+    cron_scope='selected',
+    confirm_activation=False,
+):
     """Offer an interactive cron deployment for the current system/user."""
     print_runtime_filter_status(runtime_ids, runtime_filter_source)
 
@@ -1145,18 +1150,13 @@ def run_cron_deployment_prompt(runtime_ids=None, runtime_filter_source=None):
         "{0}@{1}".format(current_user, current_system),
     )
 
-    if not ask_yes_no("Do you want to deploy the cron files now?"):
-        print_status(
-            "Cron deployment",
-            "INFO",
-            "Skipped. Re-run `landingzones deploy cron` when ready.",
-        )
-        return False
-
     deploy_ok = deploy_cron_files(
         current_system,
         current_user,
         runtime_ids=runtime_ids,
+        cron_scope=cron_scope,
+        confirm_activation=confirm_activation,
+        prompt_confirmation=ask_yes_no,
     )
     if deploy_ok:
         print_status(
@@ -1535,6 +1535,17 @@ def main(argv=None):
         action='store_true',
         help='Prompt to deploy the generated cron files for the current system/user'
     )
+    parser.add_argument(
+        '--confirm-cron-activation',
+        action='store_true',
+        help='Allow non-interactive cron activation after previewing the selected scope'
+    )
+    parser.add_argument(
+        '--cron-scope',
+        choices=['selected', 'expected', 'staged'],
+        default='selected',
+        help='Cron fragment activation scope: selected, expected, or staged'
+    )
     args = parser.parse_args(argv)
     
     # Load configuration from file and/or command line arguments
@@ -1560,6 +1571,8 @@ def main(argv=None):
         return run_cron_deployment_prompt(
             runtime_ids=runtime_ids,
             runtime_filter_source=runtime_filter_source,
+            cron_scope=args.cron_scope,
+            confirm_activation=args.confirm_cron_activation,
         )
     
     print("{0}{1}".format(Colors.BOLD, Colors.BLUE))

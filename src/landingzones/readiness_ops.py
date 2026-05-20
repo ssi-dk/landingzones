@@ -3,7 +3,6 @@
 """Shared readiness, preflight, and deployment helpers."""
 
 import errno
-import glob
 from io import StringIO
 import os
 import re
@@ -14,8 +13,18 @@ import subprocess
 import sys
 
 from landingzones.config import config
-from landingzones.generate_cron_files import cron_file_name, shell_path
-from landingzones.transfer_loading import load_runtime_transfers
+from landingzones.generate_cron_files import (
+    configured_artifact_prefix,
+    cron_file_name,
+    runtime_filter_metadata_path,
+    shell_path,
+)
+from landingzones.transfer_loading import (
+    discover_runtime_ids_from_crontabs,
+    load_runtime_transfers,
+    normalize_runtime_id_args,
+    read_runtime_filter_metadata,
+)
 
 
 class Colors:
@@ -505,10 +514,316 @@ def setup_crontab_directory():
         return False, "Cannot create directory {0}: {1}".format(crontab_dir, str(exc))
 
 
-def deploy_cron_files(current_system, current_user=None, runtime_ids=None):
+def staged_crontab_directory():
+    """Return the operator's staged cron fragment directory."""
+    return os.path.expandvars(os.path.expanduser("~/crontab.d"))
+
+
+def cron_runtime_id_from_filename(filename):
+    """Return a runtime_id for generated Landing Zone cron filenames."""
+    suffix = '.Landing_Zone.cron'
+    if not filename.endswith(suffix):
+        return None
+    stem = filename[:-len(suffix)]
+    prefix = configured_artifact_prefix()
+    if prefix:
+        prefix_text = "{0}.".format(prefix)
+        if not stem.startswith(prefix_text):
+            return None
+        stem = stem[len(prefix_text):]
+    return stem or None
+
+
+def staged_cron_fragments(crontab_dir):
+    """Return sorted staged .cron fragment paths."""
+    if not os.path.isdir(crontab_dir):
+        return []
+    return [
+        os.path.join(crontab_dir, entry)
+        for entry in sorted(os.listdir(crontab_dir))
+        if entry.endswith('.cron') and os.path.isfile(os.path.join(crontab_dir, entry))
+    ]
+
+
+def classify_cron_fragments(cron_files):
+    """Classify staged cron fragments as generated runtime or unidentified."""
+    identified = []
+    unidentified = []
+    for path in cron_files:
+        filename = os.path.basename(path)
+        runtime_id = cron_runtime_id_from_filename(filename)
+        if runtime_id:
+            identified.append({
+                'filename': filename,
+                'path': path,
+                'runtime_id': runtime_id,
+            })
+        else:
+            unidentified.append({
+                'filename': filename,
+                'path': path,
+            })
+    return identified, unidentified
+
+
+def print_cron_fragment_list(title, fragments, status="INFO"):
+    """Print a deterministic cron fragment preview line."""
+    filenames = [fragment['filename'] for fragment in fragments]
+    details = ', '.join(filenames) if filenames else '(none)'
+    print_status(title, status, details)
+
+
+def print_cron_activation_preview(
+    cron_scope,
+    activated_runtime_fragments,
+    preserved_unidentified_fragments,
+    excluded_runtime_fragments,
+):
+    """Show the operator exactly which staged cron fragments will be activated."""
+    print_header("Cron Activation Preview")
+    print_status("Cron activation scope", "INFO", cron_scope)
+    if cron_scope == 'staged':
+        print_status(
+            "Staged cron activation",
+            "WARN",
+            "Every staged .cron file will be activated.",
+        )
+    print_cron_fragment_list(
+        "Activated runtime fragments",
+        activated_runtime_fragments,
+        "OK" if activated_runtime_fragments else "WARN",
+    )
+    print_cron_fragment_list(
+        "Preserved Unidentified Cron Fragments",
+        preserved_unidentified_fragments,
+    )
+    print_cron_fragment_list(
+        "Excluded runtime cron fragments",
+        excluded_runtime_fragments,
+    )
+
+
+def is_interactive_terminal():
+    """Return whether stdin can receive an operator confirmation prompt."""
+    return sys.stdin.isatty()
+
+
+def cron_activation_confirmed(
+    cron_scope,
+    confirm_activation=False,
+    prompt_confirmation=None,
+):
+    """Require explicit approval before replacing the active crontab."""
+    if confirm_activation:
+        return True
+    if not is_interactive_terminal():
+        print_status(
+            "Crontab activation",
+            "ERROR",
+            (
+                "Non-interactive cron activation for scope '{0}' requires "
+                "--confirm-cron-activation."
+            ).format(cron_scope),
+        )
+        return False
+    if prompt_confirmation is None:
+        response = input(
+            "Replace active crontab using cron scope '{0}'? (y/N): ".format(
+                cron_scope
+            )
+        ).strip().lower()
+        return response in ('y', 'yes')
+    return prompt_confirmation(
+        "Replace active crontab using cron scope '{0}'?".format(cron_scope)
+    )
+
+
+def activate_cron_fragments(cron_files):
+    """Replace the active crontab with the provided cron fragment contents."""
+    content_parts = []
+    for cron_file in cron_files:
+        with open(cron_file, 'r') as handle:
+            content = handle.read()
+        content_parts.append(content)
+        if content and not content.endswith('\n'):
+            content_parts.append('\n')
+    active_content = ''.join(content_parts).encode('utf-8')
+
+    proc = subprocess.Popen(
+        ['crontab', '-'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    _, stderr = proc.communicate(input=active_content)
+    result_stderr = stderr.decode('utf-8')
+
+    if proc.returncode != 0:
+        print_status(
+            "Crontab activation",
+            "ERROR",
+            "Failed: {0}".format(result_stderr.strip()),
+        )
+        return False
+
+    print_status(
+        "Crontab activation",
+        "OK",
+        "Activated {0} cron files".format(len(cron_files)),
+    )
+    verify_proc = subprocess.Popen(
+        ['crontab', '-l'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    verify_stdout, _ = verify_proc.communicate()
+    if verify_proc.returncode == 0:
+        lines = verify_stdout.decode('utf-8').split('\n')
+        active_jobs = len([
+            line for line in lines
+            if line.strip() and not line.startswith('#')
+        ])
+        print_status(
+            "Crontab verification",
+            "OK",
+            "Total active cron jobs: {0}".format(active_jobs),
+        )
+    return True
+
+
+def copy_generated_runtime_crons(
+    runtime_ids,
+    crontab_dir,
+    repair_missing=False,
+    confirm_activation=False,
+    prompt_confirmation=None,
+):
+    """Copy generated selected runtime cron fragments into the staged directory."""
+    copied_files = []
+    missing_runtime_ids = []
+    for runtime_id in runtime_ids:
+        filename = cron_file_name(runtime_id)
+        generated_path = os.path.join(config.crontab_dir, filename)
+        staged_path = os.path.join(crontab_dir, filename)
+        if os.path.exists(generated_path):
+            if repair_missing and os.path.exists(staged_path):
+                continue
+            if repair_missing and not confirm_activation:
+                if not is_interactive_terminal():
+                    print_status(
+                        "Cron staged-file repair",
+                        "ERROR",
+                        (
+                            "Missing expected runtime cron fragment {0} cannot "
+                            "be repaired non-interactively without "
+                            "--confirm-cron-activation."
+                        ).format(filename),
+                    )
+                    return None, None
+                if prompt_confirmation is None:
+                    response = input(
+                        "Copy missing expected runtime cron fragment {0} "
+                        "into ~/crontab.d before activation? (y/N): ".format(
+                            filename
+                        )
+                    ).strip().lower()
+                    should_copy = response in ('y', 'yes')
+                else:
+                    should_copy = prompt_confirmation(
+                        (
+                            "Copy missing expected runtime cron fragment {0} "
+                            "into ~/crontab.d before activation?"
+                        ).format(filename)
+                    )
+                if not should_copy:
+                    print_status(
+                        "Cron staged-file repair",
+                        "ERROR",
+                        "Missing expected runtime cron fragment was not copied: {0}".format(
+                            filename
+                        ),
+                    )
+                    return None, None
+            try:
+                shutil.copy2(generated_path, staged_path)
+                copied_files.append(filename)
+                print_status(
+                    "Copy {0}".format(filename),
+                    "OK",
+                    "Copied to {0}".format(staged_path),
+                )
+            except Exception as exc:
+                print_status(
+                    "Copy {0}".format(generated_path),
+                    "ERROR",
+                    "Failed: {0}".format(str(exc)),
+                )
+                return None, None
+        elif not os.path.exists(staged_path):
+            missing_runtime_ids.append(runtime_id)
+    return copied_files, missing_runtime_ids
+
+
+def resolve_expected_runtime_ids():
+    """Resolve runtime IDs represented by the latest generated cron output."""
+    metadata_path = runtime_filter_metadata_path(config.crontab_dir)
+    if os.path.exists(metadata_path):
+        runtime_ids = read_runtime_filter_metadata(config.crontab_dir)
+        if runtime_ids:
+            print_status(
+                "Expected runtime metadata",
+                "OK",
+                "Using {0}".format(metadata_path),
+            )
+        return runtime_ids
+
+    runtime_ids = discover_runtime_ids_from_crontabs(config.crontab_dir)
+    if runtime_ids:
+        print_status(
+            "Expected runtime metadata",
+            "WARN",
+            (
+                "Missing {0}; discovered expected runtime IDs from generated "
+                "cron filenames."
+            ).format(metadata_path),
+        )
+    return runtime_ids
+
+
+def select_cron_fragments_for_activation(cron_scope, runtime_ids, crontab_dir):
+    """Select staged cron fragments according to the requested activation scope."""
+    cron_files = staged_cron_fragments(crontab_dir)
+    identified, unidentified = classify_cron_fragments(cron_files)
+    runtime_id_set = set(runtime_ids or [])
+    if cron_scope in ('selected', 'expected'):
+        activated_runtime = [
+            fragment for fragment in identified
+            if fragment['runtime_id'] in runtime_id_set
+        ]
+        excluded_runtime = [
+            fragment for fragment in identified
+            if fragment['runtime_id'] not in runtime_id_set
+        ]
+        active_files = [
+            fragment['path']
+            for fragment in activated_runtime + unidentified
+        ]
+        return active_files, activated_runtime, unidentified, excluded_runtime
+    return cron_files, identified, unidentified, []
+
+
+def deploy_cron_files(
+    current_system,
+    current_user=None,
+    runtime_ids=None,
+    cron_scope='selected',
+    confirm_activation=False,
+    prompt_confirmation=None,
+):
     """Deploy cron files for the current system and user."""
     if runtime_ids is None:
         runtime_ids = config.runtime_ids
+    runtime_ids = normalize_runtime_id_args(runtime_ids)
     if current_user is None:
         current_user = os.environ.get('USER', os.environ.get('USERNAME', ''))
 
@@ -520,6 +835,9 @@ def deploy_cron_files(current_system, current_user=None, runtime_ids=None):
     if not dir_ok:
         return False
 
+    if cron_scope == 'expected':
+        runtime_ids = resolve_expected_runtime_ids()
+
     print_status("Generating cron files", "INFO", "Using landingzones.generate_cron_files")
     gen_ok, gen_msg = generate_cron_files(runtime_ids=runtime_ids)
     if not gen_ok:
@@ -528,64 +846,67 @@ def deploy_cron_files(current_system, current_user=None, runtime_ids=None):
     else:
         print_status("Cron file generation", "OK", gen_msg)
 
-    try:
-        if runtime_ids:
-            cron_files = [
-                os.path.join(config.crontab_dir, cron_file_name(runtime_id))
-                for runtime_id in runtime_ids
-            ]
-            cron_files = [path for path in cron_files if os.path.exists(path)]
-            expected = ', '.join(runtime_ids)
-        else:
-            pattern = os.path.join(
-                config.crontab_dir,
-                "{0}.{1}.Landing_Zone.cron".format(current_system, current_user),
-            )
-            cron_files = glob.glob(pattern)
-            expected = "{0}@{1}".format(current_user, current_system)
-        if not cron_files:
-            msg = "No new cron files for '{0}'. Using existing crontab.d/".format(expected)
-            print_status("Cron file discovery", "WARN", msg)
-            return True
-        print_status("Cron file discovery", "OK", "Found {0} files".format(len(cron_files)))
-    except Exception as exc:
-        print_status("Cron file discovery", "ERROR", "Search failed: {0}".format(str(exc)))
+    crontab_dir = staged_crontab_directory()
+    if cron_scope in ('selected', 'expected') and not runtime_ids:
+        scope_label = "selected" if cron_scope == 'selected' else "expected"
+        print_status(
+            "Cron file discovery",
+            "ERROR",
+            "No {0} runtime IDs available for cron activation.".format(
+                scope_label
+            ),
+        )
         return False
 
-    crontab_dir = os.path.expandvars(os.path.expanduser("~/crontab.d"))
-    copied_files = []
-    for cron_file in cron_files:
-        try:
-            filename = os.path.basename(cron_file)
-            dest_path = os.path.join(crontab_dir, filename)
-            shutil.copy2(cron_file, dest_path)
-            copied_files.append(filename)
-            print_status("Copy {0}".format(filename), "OK", "Copied to {0}".format(dest_path))
-        except Exception as exc:
-            print_status("Copy {0}".format(cron_file), "ERROR", "Failed: {0}".format(str(exc)))
-            return False
+    copied_files, missing_runtime_ids = copy_generated_runtime_crons(
+        runtime_ids,
+        crontab_dir,
+        repair_missing=cron_scope == 'expected',
+        confirm_activation=confirm_activation,
+        prompt_confirmation=prompt_confirmation,
+    )
+    if copied_files is None:
+        return False
+    if missing_runtime_ids:
+        print_status(
+            "Cron file discovery",
+            "ERROR",
+            "Missing generated or staged cron fragments for runtime_id: {0}. Rebuild generated cron output before retrying.".format(
+                ', '.join(missing_runtime_ids)
+            ),
+        )
+        return False
 
-    if not copied_files:
-        return True
+    active_files, activated_runtime, unidentified, excluded_runtime = (
+        select_cron_fragments_for_activation(cron_scope, runtime_ids, crontab_dir)
+    )
+    if not active_files:
+        print_status(
+            "Cron file discovery",
+            "ERROR",
+            "No staged cron fragments selected for activation.",
+        )
+        return False
+    print_cron_activation_preview(
+        cron_scope,
+        activated_runtime,
+        unidentified,
+        excluded_runtime,
+    )
+    if not cron_activation_confirmed(
+        cron_scope,
+        confirm_activation=confirm_activation,
+        prompt_confirmation=prompt_confirmation,
+    ):
+        print_status(
+            "Crontab activation",
+            "INFO",
+            "Skipped activation for cron scope '{0}'.".format(cron_scope),
+        )
+        return False
 
     try:
-        cmd = "cat {0} | crontab -".format(os.path.join(crontab_dir, "*.cron"))
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        _, stderr = proc.communicate()
-        result_stderr = stderr.decode('utf-8')
-
-        if proc.returncode != 0:
-            print_status("Crontab activation", "ERROR", "Failed: {0}".format(result_stderr.strip()))
-            return False
-
-        print_status("Crontab activation", "OK", "Activated {0} cron files".format(len(copied_files)))
-        verify_proc = subprocess.Popen(['crontab', '-l'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        verify_stdout, _ = verify_proc.communicate()
-        if verify_proc.returncode == 0:
-            lines = verify_stdout.decode('utf-8').split('\n')
-            active_jobs = len([line for line in lines if line.strip() and not line.startswith('#')])
-            print_status("Crontab verification", "OK", "Total active cron jobs: {0}".format(active_jobs))
-        return True
+        return activate_cron_fragments(active_files)
     except Exception as exc:
         print_status("Crontab activation", "ERROR", "Error: {0}".format(str(exc)))
         return False
