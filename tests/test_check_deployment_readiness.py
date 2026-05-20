@@ -227,6 +227,67 @@ class TestRuntimeIdentityDetection:
         assert result is True
         assert captured['runtime_ids'] == ['local_dev.local']
 
+    def test_validate_deployment_prints_shared_main_lock_warnings(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Deployment validation should surface shared main-lock audit warnings."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        dst.mkdir()
+        transfers_file = tmp_path / "transfers.tsv"
+        transfers_file.write_text("placeholder\n")
+        df = pd.DataFrame([
+            {
+                'runtime_id': 'local_dev.local',
+                'system': 'local_dev',
+                'users': 'local',
+                'source': str(src),
+                'source_port': '',
+                'destination': str(dst),
+                'destination_port': '',
+                'log_file': str(tmp_path / 'log' / 'first.log'),
+                'flock_file': str(tmp_path / 'flock' / 'shared.lock'),
+            },
+            {
+                'runtime_id': 'local_dev.local',
+                'system': 'local_dev',
+                'users': 'local',
+                'source': str(src),
+                'source_port': '',
+                'destination': str(dst),
+                'destination_port': '',
+                'log_file': str(tmp_path / 'log' / 'second.log'),
+                'flock_file': str(tmp_path / 'flock' / 'shared.lock'),
+            },
+        ])
+        df.attrs['shared_main_lock_warnings'] = [
+            "Shared main lock: runtime_id='local_dev.local', "
+            "flock_file='{0}', transfers=first (frequency=*/2 * * * *), "
+            "second (frequency=*/2 * * * *)".format(tmp_path / 'flock' / 'shared.lock')
+        ]
+
+        monkeypatch.setattr(cdr, 'check_required_tools', lambda: True)
+        monkeypatch.setattr(cdr, 'check_flock_command', lambda system: True)
+        monkeypatch.setattr(
+            cdr,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: df,
+        )
+
+        config_snapshot = cdr.config.snapshot_state()
+        try:
+            cdr.config._runtime_config = {}
+            result = cdr.main(['--transfers', str(transfers_file)])
+        finally:
+            cdr.config.restore_state(config_snapshot)
+
+        captured = capsys.readouterr()
+        assert result is True
+        assert 'Shared main transfer locks detected' in captured.out
+        assert 'local_dev.local' in captured.out
+        assert 'shared.lock' in captured.out
+
 
 class TestCheckLocalDirectory:
     """Test the check_local_directory function"""

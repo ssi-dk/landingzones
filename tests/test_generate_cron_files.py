@@ -489,6 +489,92 @@ second\tserver1\tuser1\t/src2/\t/dest2/\t\t\t\t/tmp/shared.log\t/tmp/shared.lock
         assert "first" in warnings[0]
         assert "second" in warnings[0]
 
+    def test_parse_records_shared_main_lock_warnings(self, tmp_path):
+        """Duplicate main locks should be reported even when logs differ."""
+        tsv_content = """identifiers\truntime_id\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tfrequency
+first\truntime_a\tserver1\tuser1\t/src1/\t/dest1/\t\t\t\t/tmp/first.log\tshared.lock\t*/2 * * * *
+second\truntime_a\tserver1\tuser1\t/src2/\t/dest2/\t\t\t\t/tmp/second.log\tshared.lock\t*/5 * * * *
+third\truntime_a\tserver1\tuser1\t/src3/\t/dest3/\t\t\t\t/tmp/third.log\tunique.lock\t*/2 * * * *
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        original_runtime_config = dict(gcf.config._runtime_config)
+        gcf.config._runtime_config['rit_managed_locations'] = {
+            'server1': '/srv/rit_managed'
+        }
+        gcf.config._runtime_config['rit_managed_folder_structure'] = {
+            'flock': 'flock',
+            'log': 'log',
+        }
+        try:
+            df = gcf.parse_transfers_file(str(test_file))
+        finally:
+            gcf.config._runtime_config = original_runtime_config
+
+        warnings = df.attrs['shared_main_lock_warnings']
+        assert len(warnings) == 1
+        assert "runtime_a" in warnings[0]
+        assert "/srv/rit_managed/flock/shared.lock" in warnings[0]
+        assert "first (frequency=*/2 * * * *)" in warnings[0]
+        assert "second (frequency=*/5 * * * *)" in warnings[0]
+        assert "third" not in warnings[0]
+
+    def test_parse_shared_main_lock_audit_handles_empty_unique_and_home_paths(self, tmp_path):
+        """Only duplicate non-empty main locks in the same runtime should warn."""
+        tsv_content = """identifiers\truntime_id\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tfrequency
+home_first\truntime_a\tserver1\tuser1\t/src1/\t/dest1/\t\t\t\t/tmp/first.log\t$HOME/shared.lock\t*/2 * * * *
+home_second\truntime_a\tserver1\tuser1\t/src2/\t/dest2/\t\t\t\t/tmp/second.log\t$HOME/shared.lock\t*/2 * * * *
+other_runtime\truntime_b\tserver1\tuser1\t/src3/\t/dest3/\t\t\t\t/tmp/third.log\t$HOME/shared.lock\t*/2 * * * *
+unique\truntime_a\tserver1\tuser1\t/src4/\t/dest4/\t\t\t\t/tmp/unique.log\t/tmp/unique.lock\t*/2 * * * *
+empty\truntime_a\tserver1\tuser1\t/src5/\t/dest5/\t\t\t\t/tmp/empty.log\t\t*/2 * * * *
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        df = gcf.parse_transfers_file(str(test_file))
+
+        warnings = df.attrs['shared_main_lock_warnings']
+        assert len(warnings) == 1
+        assert "runtime_a" in warnings[0]
+        assert "$HOME/shared.lock" in warnings[0]
+        assert "home_first" in warnings[0]
+        assert "home_second" in warnings[0]
+        assert "other_runtime" not in warnings[0]
+        assert "unique" not in warnings[0]
+        assert "empty" not in warnings[0]
+
+    def test_parse_shared_main_lock_audit_reports_prod_like_calc_groups(self, tmp_path):
+        """The audit should represent calc prod-style three-job shared locks."""
+        tsv_content = """identifiers\truntime_id\tsystem\tusers\tsource\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tfrequency
+NS_KMA_HVH_2of3\tcalc_prod.f041664\tcalc\tf041664\t/src1/\t/dest1/\t\t\t\tNS_KMA_HVH_2of3.log\tNS_KMA_HVH.lock\t*/2 * * * *
+NS_KMA_HVH_3of3\tcalc_prod.f041664\tcalc\tf041664\t/src2/\t/dest2/\t\t\t\tNS_KMA_HVH_3of3.log\tNS_KMA_HVH.lock\t*/2 * * * *
+HVH_transition\tcalc_prod.f041664\tcalc\tf041664\t/src3/\t/dest3/\t\t\t\tHVH_transition.log\tNS_KMA_HVH.lock\t*/2 * * * *
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        original_runtime_config = dict(gcf.config._runtime_config)
+        gcf.config._runtime_config['rit_managed_locations'] = {
+            'calc': '/srv/data/NGS_Kaare/rit_managed'
+        }
+        gcf.config._runtime_config['rit_managed_folder_structure'] = {
+            'flock': 'flock',
+            'log': 'log',
+        }
+        try:
+            df = gcf.parse_transfers_file(str(test_file))
+        finally:
+            gcf.config._runtime_config = original_runtime_config
+
+        warnings = df.attrs['shared_main_lock_warnings']
+        assert len(warnings) == 1
+        assert "calc_prod.f041664" in warnings[0]
+        assert "/srv/data/NGS_Kaare/rit_managed/flock/NS_KMA_HVH.lock" in warnings[0]
+        assert "HVH_transition (frequency=*/2 * * * *)" in warnings[0]
+        assert "NS_KMA_HVH_2of3 (frequency=*/2 * * * *)" in warnings[0]
+        assert "NS_KMA_HVH_3of3 (frequency=*/2 * * * *)" in warnings[0]
+
     def test_parse_reporting_mode_allows_minimal_transfer_metadata(self, tmp_path):
         """Reporting/analysis mode should not require runtime log fields."""
         tsv_content = """identifiers\tenabled\tsystem\tusers\tsource\tdestination
@@ -1057,7 +1143,7 @@ class TestGenerateRsyncCommand:
         assert 'od -An -N4 -tu4 /dev/urandom' in script
         assert 'print $1 % max' in script
         assert 'random_start_delay 60' in script
-        assert script.index('/opt/bin/flock -n 9') < script.index('random_start_delay 60')
+        assert script.index('random_start_delay 60') < script.index('/opt/bin/flock -n 9')
         assert 'log_status "$dir_name initiated"' in script
         assert 'log_status "$dir_name completed"' in script
         assert 'if ! [ -d "/source" ]; then' in script
@@ -1156,6 +1242,65 @@ class TestGenerateRsyncCommand:
         assert 'grep "^run_id" "$1" | head -n 1 | cut -f2-' in script
         assert 'cut -f2-' in script
         assert 'append_portable_event_remote "$destination_remote_target" "$destination_remote_port" "$destination_run_dir" "$event_status" "$event_message"' in script
+
+    def test_remote_transfer_delays_before_main_lock(self):
+        """Remote endpoint wrappers should jitter before trying the main lock."""
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': '/source/',
+            'source_port': '',
+            'destination': 'user@host:/dest/',
+            'destination_port': '2222',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': '',
+        }
+
+        original_runtime_config = dict(gcf.config._runtime_config)
+        gcf.config._runtime_config['flock_paths'] = {'server1': '/opt/bin/flock'}
+        try:
+            script = gcf.generate_script_content(transfer)
+        finally:
+            gcf.config._runtime_config = original_runtime_config
+
+        assert 'destination_remote_target="user@host"' in script
+        remote_guard_index = script.index(
+            'if [ -n "$source_remote_target" ] || [ -n "$destination_remote_target" ]; then'
+        )
+        delay_index = script.index('random_start_delay 60')
+        open_lock_index = script.index('exec 9>"$flock_file"')
+        nonblocking_lock_index = script.index('/opt/bin/flock -n 9')
+
+        assert remote_guard_index < delay_index < open_lock_index < nonblocking_lock_index
+
+    def test_local_transfer_startup_delay_is_guarded_by_empty_remote_targets(self):
+        """Local-only wrappers should not run startup jitter at runtime."""
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': '/source/',
+            'source_port': '',
+            'destination': '/dest/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': '',
+        }
+
+        script = gcf.generate_script_content(transfer)
+
+        assert 'source_remote_target=""' in script
+        assert 'destination_remote_target=""' in script
+        assert (
+            'if [ -n "$source_remote_target" ] || [ -n "$destination_remote_target" ]; then\n'
+            '    random_start_delay 60\n'
+            'fi'
+        ) in script
 
     def test_generate_script_content_includes_notification_delivery(self):
         """Generated scripts should derive notification attempts from status events."""
@@ -2023,6 +2168,43 @@ second\tlocalhost\ttestuser\t/tmp/src2/\t\t/tmp/dest2/\t\t\t\t/tmp/shared.log\t/
         assert 'first' in captured.out
         assert 'second' in captured.out
         assert (validation_scripts_dir / "lz_run_validation.sh").exists()
+
+    def test_main_prints_shared_main_lock_warning(self, tmp_path, monkeypatch, capsys):
+        """Generation should warn when different transfers share a main lock."""
+        transfers_file = tmp_path / "test_transfers.tsv"
+        output_dir = tmp_path / "crontab.d"
+        log_dir = tmp_path / "log"
+        scripts_dir = tmp_path / "scripts"
+        validation_scripts_dir = tmp_path / "validation_scripts"
+        transfers_file.write_text(
+            """identifiers\truntime_id\tsystem\tusers\tsource\tsource_port\tdestination\tdestination_port\trsync_options\tio_nice\tlog_file\tflock_file\tfrequency
+first\tlocalhost.testuser\tlocalhost\ttestuser\t/tmp/src1/\t\t/tmp/dest1/\t\t\t\t/tmp/first.log\t/tmp/shared.lock\t*/2 * * * *
+second\tlocalhost.testuser\tlocalhost\ttestuser\t/tmp/src2/\t\t/tmp/dest2/\t\t\t\t/tmp/second.log\t/tmp/shared.lock\t*/5 * * * *
+"""
+        )
+
+        monkeypatch.setattr(
+            sys,
+            'argv',
+            [
+                'generate_cron_files.py',
+                '--transfers', str(transfers_file),
+                '--output-dir', str(output_dir),
+                '--log-dir', str(log_dir),
+                '--scripts-dir', str(scripts_dir),
+                '--validation-scripts-dir', str(validation_scripts_dir),
+            ],
+        )
+
+        rc = gcf.main()
+        captured = capsys.readouterr()
+
+        assert rc == 0
+        assert 'Shared main transfer locks detected' in captured.out
+        assert 'localhost.testuser' in captured.out
+        assert '/tmp/shared.lock' in captured.out
+        assert 'first (frequency=*/2 * * * *)' in captured.out
+        assert 'second (frequency=*/5 * * * *)' in captured.out
 
 
 class TestEnvironmentVariableExpansion:
