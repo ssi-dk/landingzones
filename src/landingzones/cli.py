@@ -198,6 +198,17 @@ def build_cli_parser():
     deploy_cron_parser.add_argument('--transfers', '-t', default=None)
     deploy_cron_parser.add_argument('--validation-scripts-dir', default=None)
     deploy_cron_parser.add_argument('--runtime-id', action='append', default=None)
+    deploy_cron_parser.add_argument(
+        '--cron-scope',
+        choices=['selected', 'expected', 'staged'],
+        default=None,
+        help='Cron fragment activation scope: selected, expected, or staged',
+    )
+    deploy_cron_parser.add_argument(
+        '--confirm-cron-activation',
+        action='store_true',
+        help='Allow non-interactive cron activation after previewing the selected scope',
+    )
     deploy_cron_parser.set_defaults(handler=handle_deploy_cron)
 
     report_parser = subparsers.add_parser(
@@ -332,6 +343,9 @@ def handle_deploy_cron(args, extra_args):
     append_option(argv, '--transfers', args.transfers)
     append_option(argv, '--validation-scripts-dir', args.validation_scripts_dir)
     append_runtime_options(argv, effective_runtime_ids(args))
+    append_option(argv, '--cron-scope', args.cron_scope)
+    if args.confirm_cron_activation:
+        argv.append('--confirm-cron-activation')
     argv.append('--deploy-cron')
     return normalize_exit_code(cdr.main(argv))
 

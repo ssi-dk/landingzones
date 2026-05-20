@@ -394,6 +394,30 @@ class TestOperatorCli:
             '--deploy-cron',
         ]
 
+    def test_deploy_cron_routes_scope_and_confirmation(self, monkeypatch):
+        """`landingzones deploy cron` should forward cron-scope activation options."""
+        captured = {}
+
+        def fake_main(argv=None):
+            captured['argv'] = argv
+            return True
+
+        monkeypatch.setattr(cli.cdr, 'main', fake_main)
+
+        rc = cli.main([
+            'deploy',
+            'cron',
+            '--cron-scope', 'expected',
+            '--confirm-cron-activation',
+        ])
+
+        assert rc == 0
+        assert captured['argv'] == [
+            '--cron-scope', 'expected',
+            '--confirm-cron-activation',
+            '--deploy-cron',
+        ]
+
     def test_report_transfers_routes_to_dashboard(self, monkeypatch):
         """`landingzones report transfers` should forward its dashboard arguments."""
         captured = {}
