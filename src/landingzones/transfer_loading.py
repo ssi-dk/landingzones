@@ -100,9 +100,35 @@ def load_transfers(
     )
 
 
+def load_transfer_definitions(
+    config_file=None,
+    transfers_file=None,
+    require_runtime_files=True,
+    runtime_ids=None,
+    system=None,
+):
+    """Load normalized transfer definitions through the transfer catalog."""
+    return transfer_catalog.load_transfer_definitions(
+        config_file=config_file,
+        transfers_file=transfers_file,
+        require_runtime_files=require_runtime_files,
+        runtime_ids=runtime_ids,
+        system=system,
+    )
+
+
 def load_runtime_transfers(config_file=None, transfers_file=None, runtime_ids=None):
     """Load transfers with runtime/generator validation enabled."""
     return transfer_catalog.load_runtime_transfer_catalog(
+        config_file=config_file,
+        transfers_file=transfers_file,
+        runtime_ids=runtime_ids,
+    )
+
+
+def load_runtime_transfer_definitions(config_file=None, transfers_file=None, runtime_ids=None):
+    """Load transfer definitions with runtime/generator validation enabled."""
+    return transfer_catalog.load_runtime_transfer_definitions(
         config_file=config_file,
         transfers_file=transfers_file,
         runtime_ids=runtime_ids,
@@ -117,6 +143,21 @@ def load_reporting_transfers(
 ):
     """Load transfers with analysis/reporting validation enabled."""
     return transfer_catalog.load_reporting_transfer_catalog(
+        config_file=config_file,
+        transfers_file=transfers_file,
+        runtime_ids=runtime_ids,
+        system=system,
+    )
+
+
+def load_reporting_transfer_definitions(
+    config_file=None,
+    transfers_file=None,
+    runtime_ids=None,
+    system=None,
+):
+    """Load transfer definitions with analysis/reporting validation enabled."""
+    return transfer_catalog.load_reporting_transfer_definitions(
         config_file=config_file,
         transfers_file=transfers_file,
         runtime_ids=runtime_ids,

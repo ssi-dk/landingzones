@@ -2,10 +2,13 @@
 # -*- coding: utf-8 -*-
 """Tests for transfer catalog loading."""
 
+import pytest
+
 from landingzones import generate_cron_files as gcf
 from landingzones import transfer_catalog
 from landingzones.table import TransferTable
 from landingzones.transfer_catalog import (
+    load_reporting_transfer_definitions,
     load_reporting_transfer_catalog,
     load_runtime_transfer_catalog,
 )
@@ -18,11 +21,12 @@ def test_runtime_catalog_preserves_build_loading_invariants(tmp_path):
     transfers_file.write_text(
         "\n".join(
             [
-                "runtime_id\tenabled\tsystem\tusers\tsource\tdestination\tlog_file\tflock_file\tflow_group\tis_entry_point\tnotify_on_success",
-                "local_dev.local\tTRUE\tlocal_dev\tlocal\t${SRC_ROOT}/in/\t${DST_ROOT}/out/\ttransfer.log\ttransfer.lock\tflow one\tyes\t1",
-                "local_dev.local\tTRUE\tlocal_dev\tlocal\t${SRC_ROOT}/second/\t${DST_ROOT}/second/\ttransfer.log\ttransfer.lock\tflow one\tfalse\tfalse",
-                "disabled.local\tFALSE\tlocal_dev\tlocal\t${SRC_ROOT}/disabled/\t${DST_ROOT}/disabled/\tdisabled.log\tdisabled.lock\t\t\t",
-                "#commented.local\tTRUE\tlocal_dev\tlocal\t${SRC_ROOT}/commented/\t${DST_ROOT}/commented/\tcommented.log\tcommented.lock\t\t\t",
+                "runtime_id\tenabled\tsystem\tusers\tsource\tdestination\tlog_file\tflock_file\tflow_group\ttags\tis_entry_point\tnotify_on_success",
+                "local_dev.local\tTRUE\tlocal_dev\tlocal\t${SRC_ROOT}/in/\t${DST_ROOT}/out/\ttransfer.log\ttransfer.lock\tflow one\tLab, heartbeat\tyes\t1",
+                "local_dev.local\tTRUE\tlocal_dev\tlocal\t${SRC_ROOT}/second/\t${DST_ROOT}/second/\ttransfer.log\ttransfer.lock\tflow one\tLAB\tfalse\tfalse",
+                "other.local\tTRUE\tlocal_dev\tlocal\t${SRC_ROOT}/other/\t${DST_ROOT}/other/\tother.log\tother.lock\tflow one\tother\tfalse\tfalse",
+                "disabled.local\tFALSE\tlocal_dev\tlocal\t${SRC_ROOT}/disabled/\t${DST_ROOT}/disabled/\tdisabled.log\tdisabled.lock\t\t\t\t",
+                "#commented.local\tTRUE\tlocal_dev\tlocal\t${SRC_ROOT}/commented/\t${DST_ROOT}/commented/\tcommented.log\tcommented.lock\t\t\t\t",
             ]
         )
     )
@@ -59,8 +63,11 @@ def test_runtime_catalog_preserves_build_loading_invariants(tmp_path):
     assert catalog.iloc[0]["script_name"] == "prod_server__transfer_001.sh"
     assert catalog.iloc[0]["is_entry_point"] == "TRUE"
     assert catalog.iloc[0]["notify_on_success"] == "TRUE"
+    assert catalog.iloc[0]["tags"] == "heartbeat,lab"
     assert catalog.iloc[1]["is_entry_point"] == "FALSE"
+    assert catalog.iloc[1]["tags"] == "lab"
     assert catalog.attrs["shared_file_pair_warnings"]
+    assert catalog.attrs["shared_main_lock_warnings"]
 
 
 def test_build_command_loads_transfers_through_catalog(tmp_path, monkeypatch):
@@ -176,3 +183,91 @@ def test_reporting_catalog_relaxes_runtime_file_validation(tmp_path):
 
     assert list(catalog["identifiers"]) == ["report_transfer"]
     assert list(catalog["runtime_id"]) == ["local_dev.local"]
+
+
+def test_runtime_catalog_keeps_runtime_file_validation_distinct_from_reporting(tmp_path):
+    """Runtime-validation mode should reject TSVs accepted by reporting mode."""
+    transfers_file = tmp_path / "transfers.tsv"
+    config_file = tmp_path / "config.yaml"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\ttags",
+                "report_transfer\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\t/source/\t/destination/\treporting",
+            ]
+        )
+    )
+    config_file.write_text(
+        "transfers_file: {0}\n"
+        "runtime_ids:\n"
+        "  - local_dev.local\n".format(transfers_file)
+    )
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        reporting_catalog = load_reporting_transfer_catalog(config_file=str(config_file))
+        with pytest.raises(ValueError, match="log_file"):
+            load_runtime_transfer_catalog(config_file=str(config_file))
+    finally:
+        gcf.config.restore_state(snapshot)
+
+    assert list(reporting_catalog["identifiers"]) == ["report_transfer"]
+
+
+def test_reporting_catalog_exposes_normalized_definitions_and_keeps_dataframe_compatibility(tmp_path):
+    """Catalog callers can use typed transfer facts without losing dataframe rows."""
+    transfers_file = tmp_path / "transfers.tsv"
+    config_file = tmp_path / "config.yaml"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\tsource_port\tdestination_port\ttags\tis_entry_point\tis_end_point\tnotify_on_success\tnotify_on_error",
+                "stage_lab\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\t${SRC_ROOT}/in/*\tremote:${DST_ROOT}/out/\t2222\t2200.0\tLab, heartbeat\tYES\t0\t1\tfalse",
+            ]
+        )
+    )
+    config_file.write_text(
+        "transfers_file: {0}\n"
+        "runtime_ids:\n"
+        "  - local_dev.local\n"
+        "path_variables:\n"
+        "  SRC_ROOT: {1}\n"
+        "  DST_ROOT: {2}\n".format(
+            transfers_file,
+            tmp_path / "source",
+            tmp_path / "destination",
+        )
+    )
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        definitions = load_reporting_transfer_definitions(config_file=str(config_file))
+        catalog = load_reporting_transfer_catalog(config_file=str(config_file))
+    finally:
+        gcf.config.restore_state(snapshot)
+
+    assert len(definitions) == 1
+    definition = definitions[0]
+    assert definition.identifier == "stage_lab"
+    assert definition.runtime_id == "local_dev.local"
+    assert definition.system_user == "local_dev.local"
+    assert definition.system == "local_dev"
+    assert definition.user == "local"
+    assert definition.source == str(tmp_path / "source" / "in") + "/*"
+    assert definition.destination == "remote:{0}/out/".format(tmp_path / "destination")
+    assert definition.source_port == "2222"
+    assert definition.destination_port == "2200"
+    assert definition.tags == ("heartbeat", "lab")
+    assert definition.is_entry_point is True
+    assert definition.is_end_point is False
+    assert definition.notify_on_success is True
+    assert definition.notify_on_error is False
+    assert definition.script_name == "stage_lab.sh"
+
+    assert list(catalog["identifiers"]) == ["stage_lab"]
+    assert catalog.iloc[0]["is_entry_point"] == "TRUE"
+    assert catalog.iloc[0]["is_end_point"] == "FALSE"
+    assert catalog.iloc[0]["notify_on_success"] == "TRUE"
+    assert catalog.iloc[0]["notify_on_error"] == "FALSE"
+    assert catalog.iloc[0]["tags"] == "heartbeat,lab"
+    assert catalog.iloc[0]["destination_port"] == "2200"

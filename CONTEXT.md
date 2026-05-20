@@ -28,6 +28,21 @@ _Avoid_: Runtime prefix, artifact prefix, user selection
 The build-written list of **Runtime IDs** represented by generated runtime artifacts.
 _Avoid_: Transfer inventory, runtime scan
 
+**Transfer Catalog**:
+The owner of transfer loading invariants for normalized transfer rows.
+_Avoid_: Per-command transfer parsing, report-only parser
+
+**Build/Runtime Catalog Loading**:
+The transfer catalog mode used by build and runtime validation commands. It
+requires runnable-script fields such as `log_file` and `flock_file`.
+_Avoid_: Generator parser, strict report loading
+
+**Reporting Catalog Loading**:
+The transfer catalog mode used by reporting analysis. It reads normalized
+transfer facts while allowing reporting-only inventories to omit runtime-only
+file columns.
+_Avoid_: Dashboard parser, loose runtime loading
+
 **Unidentified Cron Fragment**:
 A staged `.cron` file that does not carry a **Runtime ID** in its filename.
 _Avoid_: Unknown runtime, invalid cron
@@ -49,6 +64,9 @@ _Avoid_: Runtime identity, deploy boundary
 - A **Cron Fragment Set** can intentionally contain cron files for multiple **Runtime IDs** on the same **Execution Context**.
 - A **Runtime Selection** defaults to the selected **Runtime ID** exactly.
 - **Generated Runtime Metadata** describes the **Runtime IDs** represented by generated runtime artifacts.
+- The **Transfer Catalog** owns transfer loading invariants before command code consumes rows.
+- **Build/Runtime Catalog Loading** validates runnable transfer artifacts for `build`, deployment validation, and integration validation.
+- **Reporting Catalog Loading** preserves normalized transfer facts for dashboard analysis without requiring runtime-only file columns.
 - An **Unidentified Cron Fragment** can be preserved during activation without being treated as a **Landing Zone Runtime**.
 - An **Excluded Runtime Cron Fragment** may remain staged while being omitted from the active crontab.
 

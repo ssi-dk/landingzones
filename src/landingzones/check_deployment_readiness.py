@@ -18,7 +18,6 @@ import argparse
 
 from landingzones.config import config
 from landingzones.generate_cron_files import (
-    parse_transfers_file,
     normalize_source_path,
     sanitize_identifier,
     split_remote_path,
@@ -715,7 +714,10 @@ def load_test_with_data_transfers(
 
 def load_test_with_data_transfer_graph(transfers_file, base_dir, runtime_ids=None):
     """Load all test-with-data transfers with local endpoints absolutized."""
-    df = parse_transfers_file(transfers_file, runtime_ids=runtime_ids)
+    df = load_runtime_transfers(
+        transfers_file=transfers_file,
+        runtime_ids=runtime_ids,
+    )
     for column in ('source', 'destination'):
         df[column] = df[column].apply(
             lambda value: absolutize_local_endpoint(value, base_dir)

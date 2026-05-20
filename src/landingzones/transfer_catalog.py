@@ -8,6 +8,7 @@ while command paths move behind this smaller interface.
 """
 
 from landingzones.config import config
+from landingzones.transfer_definitions import definitions_from_dataframe
 
 
 def load_transfer_catalog(
@@ -36,9 +37,40 @@ def load_transfer_catalog(
     )
 
 
+def load_transfer_definitions(
+    config_file=None,
+    transfers_file=None,
+    require_runtime_files=True,
+    runtime_ids=None,
+    system=None,
+    systems=None,
+):
+    """Load normalized transfer definitions after resolving config defaults."""
+    return definitions_from_dataframe(
+        load_transfer_catalog(
+            config_file=config_file,
+            transfers_file=transfers_file,
+            require_runtime_files=require_runtime_files,
+            runtime_ids=runtime_ids,
+            system=system,
+            systems=systems,
+        )
+    )
+
+
 def load_runtime_transfer_catalog(config_file=None, transfers_file=None, runtime_ids=None):
     """Load transfers with build/runtime validation enabled."""
     return load_transfer_catalog(
+        config_file=config_file,
+        transfers_file=transfers_file,
+        require_runtime_files=True,
+        runtime_ids=runtime_ids,
+    )
+
+
+def load_runtime_transfer_definitions(config_file=None, transfers_file=None, runtime_ids=None):
+    """Load transfer definitions with build/runtime validation enabled."""
+    return load_transfer_definitions(
         config_file=config_file,
         transfers_file=transfers_file,
         require_runtime_files=True,
@@ -54,6 +86,22 @@ def load_reporting_transfer_catalog(
 ):
     """Load transfers with reporting/analysis validation enabled."""
     return load_transfer_catalog(
+        config_file=config_file,
+        transfers_file=transfers_file,
+        require_runtime_files=False,
+        runtime_ids=runtime_ids,
+        system=system,
+    )
+
+
+def load_reporting_transfer_definitions(
+    config_file=None,
+    transfers_file=None,
+    runtime_ids=None,
+    system=None,
+):
+    """Load transfer definitions with reporting/analysis validation enabled."""
+    return load_transfer_definitions(
         config_file=config_file,
         transfers_file=transfers_file,
         require_runtime_files=False,

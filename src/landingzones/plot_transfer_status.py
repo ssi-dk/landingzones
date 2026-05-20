@@ -18,6 +18,7 @@ from landingzones.config import config
 from landingzones import generate_cron_files as gcf
 from landingzones.transfer_loading import (
     definitions_for_system,
+    load_reporting_transfer_definitions,
     load_reporting_transfers,
     resolve_runtime_ids,
 )
@@ -859,12 +860,15 @@ def infer_report_system(config_file=None, transfers_file=None, runtime_ids=None)
     """Infer a system for default report-log resolution without prompting."""
     hostname = socket.gethostname().lower()
     try:
-        transfers_df = load_reporting_transfers(
+        definitions = load_reporting_transfer_definitions(
             config_file=config_file,
             transfers_file=transfers_file,
             runtime_ids=runtime_ids,
         )
-        systems = transfers_df["system"].unique()
+        systems = []
+        for definition in definitions:
+            if definition.system not in systems:
+                systems.append(definition.system)
         for system in systems:
             if str(system).lower() in hostname:
                 return system
