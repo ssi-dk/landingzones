@@ -108,6 +108,46 @@ landingzones report transfers output/log/Landing_Zone_server1_prod.user1.transfe
 */15 * * * * /bin/sh output/scripts/local_copy.sh
 ```
 
+### Shared Main Transfer Locks
+
+`flock_file` is the top-level transfer lock for one generated script. Remote
+transfers run startup jitter before acquiring the main `flock_file`, then use
+non-blocking `flock -n` for the main lock. This spreads same-minute cron starts
+before the lock race, but a transfer can still skip a run if another process
+keeps the same main lock busy after the jitter. This behavior does not change
+the cron cadence in `transfers.tsv`; for example, a `*/2 * * * *` row remains a
+two-minute schedule.
+
+`landingzones build` and `landingzones validate deployment` warn with `Shared
+main transfer locks detected` when multiple transfer rows in the same runtime
+resolve to the same main `flock_file`. Treat that warning as an operator review
+item: either the shared lock is intentional serialization, or one of the rows
+should get a distinct `flock_file`.
+
+The shared main-lock warning is different from the generated
+transfer-status and notification-status locks. Files such as
+`Landing_Zone_<system>.transfers.lock` and
+`Landing_Zone_<system>.notifications.lock` protect short TSV append sections and
+are expected to be shared by all scripts for a runtime.
+
+To verify a generated script manually, hold its resolved `flock_file`, run the
+script with debug output, and check the message order:
+
+```bash
+script=/path/to/generated_transfer.sh
+lock=$(sed -n 's/^flock_file="\([^"]*\)"/\1/p' "$script" | sed "s|\$HOME|$HOME|")
+mkdir -p "$(dirname "$lock")"
+(
+  exec 200>"$lock"
+  flock -n 200
+  LZ_DEBUG_CLI=1 /bin/sh "$script"
+) 2>&1
+```
+
+For remote transfers, debug output should show `startup delay ...` before
+`using lock file ...`; if the held lock wins, the script then reports
+`lock busy, exiting`.
+
 ## Installation
 
 ```bash
