@@ -103,6 +103,24 @@ def list_visible_directories(path):
     ]
 
 
+def print_shared_main_lock_warnings(transfers_df):
+    """Print shared main-lock audit warnings attached to a transfer catalog."""
+    warnings = getattr(transfers_df, 'attrs', {}).get(
+        'shared_main_lock_warnings', []
+    )
+    if not warnings:
+        return
+    print_header("Shared Main Transfer Locks")
+    print_status(
+        "Shared main transfer locks detected",
+        "WARN",
+        "Review whether shared top-level flock files are intentional serialization.",
+    )
+    for warning in warnings:
+        print("  - {0}".format(warning))
+    print()
+
+
 def endpoint_key(value):
     """Return a normalized endpoint key for comparing transfer roots."""
     remote, path = split_remote_path(value)
@@ -1573,6 +1591,8 @@ def main(argv=None):
     except Exception as e:
         print_status("Configuration file", "ERROR", "Cannot read transfers.tsv: {0}".format(e))
         return False
+
+    print_shared_main_lock_warnings(df)
     
     # Determine current system and user
     current_system = get_current_system(transfers_df=df, runtime_ids=runtime_ids)

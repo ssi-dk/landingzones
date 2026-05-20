@@ -264,6 +264,10 @@ def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None,
     validate_flow_metadata(df)
     df = resolve_transfer_file_paths(df)
     df.attrs['shared_file_pair_warnings'] = audit_shared_file_pairs(df)
+    df.attrs['shared_main_lock_groups'] = audit_shared_main_locks(df)
+    df.attrs['shared_main_lock_warnings'] = format_shared_main_lock_warnings(
+        df.attrs['shared_main_lock_groups']
+    )
     
     return df
 
@@ -560,6 +564,66 @@ def audit_shared_file_pairs(df):
                 log_file,
                 flock_file,
                 ', '.join(identifiers),
+            )
+        )
+    return warnings
+
+
+def audit_shared_main_locks(df):
+    """Return structured groups for transfers sharing a main flock file."""
+    grouped = {}
+    for _, row in df.iterrows():
+        flock_file = clean_tsv_value(row.get('flock_file', ''))
+        if not flock_file:
+            continue
+        runtime_id = clean_tsv_value(
+            row.get('runtime_id', row.get('system_user', ''))
+        )
+        if not runtime_id:
+            runtime_id = legacy_runtime_id(row)
+        key = (runtime_id, flock_file)
+        grouped.setdefault(key, []).append({
+            'identifier': clean_tsv_value(row.get('identifiers', '')),
+            'frequency': clean_tsv_value(row.get('frequency', '')),
+            'log_file': clean_tsv_value(row.get('log_file', '')),
+            'system': clean_tsv_value(row.get('system', '')),
+            'user': clean_tsv_value(row.get('users', row.get('user', ''))),
+        })
+
+    shared_groups = []
+    for (runtime_id, flock_file), transfers in grouped.items():
+        if len(transfers) < 2:
+            continue
+        transfers = sorted(transfers, key=lambda item: item['identifier'])
+        shared_groups.append({
+            'runtime_id': runtime_id,
+            'flock_file': flock_file,
+            'transfers': transfers,
+        })
+    return sorted(
+        shared_groups,
+        key=lambda group: (group['runtime_id'], group['flock_file']),
+    )
+
+
+def format_shared_main_lock_warnings(shared_lock_groups):
+    """Format shared-main-lock audit groups for operator output."""
+    warnings = []
+    for group in shared_lock_groups:
+        transfers = []
+        for transfer in group['transfers']:
+            frequency = transfer.get('frequency', '') or 'default'
+            transfers.append(
+                "{0} (frequency={1})".format(
+                    transfer.get('identifier', ''),
+                    frequency,
+                )
+            )
+        warnings.append(
+            "Shared main lock: runtime_id='{0}', flock_file='{1}', transfers={2}".format(
+                group.get('runtime_id', ''),
+                group.get('flock_file', ''),
+                ', '.join(transfers),
             )
         )
     return warnings
@@ -1845,14 +1909,14 @@ on_exit() {{
 trap on_exit EXIT HUP INT TERM
 
 mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")" "$(dirname "$common_status_log_file")" "$(dirname "$common_status_lock_file")" "$(dirname "$notification_status_log_file")" "$(dirname "$notification_status_lock_file")"
+if [ -n "$source_remote_target" ] || [ -n "$destination_remote_target" ]; then
+    random_start_delay 60
+fi
 debug "using lock file $flock_file"
 exec 9>"$flock_file"
 if ! {flock_command} -n 9; then
     debug "lock busy, exiting"
     exit 0
-fi
-if [ -n "$source_remote_target" ] || [ -n "$destination_remote_target" ]; then
-    random_start_delay 60
 fi
 {remote_destination_setup}
 
@@ -2509,6 +2573,16 @@ def main(argv=None):
             print("\n" + warning)
         print("\n" + "=" * 60)
         print("Review transfer definitions for accidental log/lock reuse.")
+        print("Continuing with generation...\n")
+
+    shared_main_lock_warnings = transfers_df.attrs.get('shared_main_lock_warnings', [])
+    if shared_main_lock_warnings:
+        print("\n\033[93m⚠ WARNING: Shared main transfer locks detected!\033[0m")
+        print("=" * 60)
+        for warning in shared_main_lock_warnings:
+            print("\n" + warning)
+        print("\n" + "=" * 60)
+        print("Review whether shared top-level flock files are intentional serialization.")
         print("Continuing with generation...\n")
     
     remove_stale_generated_scripts(
