@@ -6,6 +6,7 @@ import pandas as pd
 
 from landingzones import plot_transfer_status as pts
 from landingzones import transfer_catalog
+from landingzones.transfer_definitions import TransferDefinition
 
 
 def make_transfers_tsv(tmp_path):
@@ -320,6 +321,59 @@ def test_load_transfers_for_reporting_uses_reporting_catalog(monkeypatch):
             "transfers_file": "/tmp/transfers.tsv",
             "runtime_ids": ["local_dev.local"],
             "system": "test_local",
+        }
+    ]
+
+
+def test_infer_report_system_uses_reporting_definitions(monkeypatch):
+    """System inference reads transfer facts through normalized definitions."""
+    calls = []
+
+    def fake_load_reporting_transfer_definitions(
+        config_file=None,
+        transfers_file=None,
+        runtime_ids=None,
+        system=None,
+    ):
+        calls.append(
+            {
+                "config_file": config_file,
+                "transfers_file": transfers_file,
+                "runtime_ids": runtime_ids,
+                "system": system,
+            }
+        )
+        return [
+            TransferDefinition(
+                identifier="stage_lab",
+                system="test-local-host",
+                user="local",
+                source="/source/inbox/*",
+                destination="/flow/stage/",
+                runtime_id="local_dev.local",
+            )
+        ]
+
+    monkeypatch.setattr(
+        pts,
+        "load_reporting_transfer_definitions",
+        fake_load_reporting_transfer_definitions,
+    )
+    monkeypatch.setattr(pts.socket, "gethostname", lambda: "test-local-host-01")
+
+    result = pts.infer_report_system(
+        config_file="/tmp/config.yaml",
+        transfers_file="/tmp/transfers.tsv",
+        runtime_ids=["local_dev.local"],
+    )
+
+    assert result == "test-local-host"
+    assert calls == [
+        {
+            "config_file": "/tmp/config.yaml",
+            "transfers_file": "/tmp/transfers.tsv",
+            "runtime_ids": ["local_dev.local"],
+            "system": None,
         }
     ]
 

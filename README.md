@@ -108,6 +108,33 @@ landingzones report transfers output/log/Landing_Zone_server1_prod.user1.transfe
 */15 * * * * /bin/sh output/scripts/local_copy.sh
 ```
 
+### Transfer Catalog Loading Modes
+
+The transfer catalog is the owner of transfer loading invariants. Future
+transfer-column, filtering, endpoint-expansion, validation, artifact-naming,
+boolean, tag, and warning behavior should land at the catalog seam before
+command code consumes the rows.
+
+`load_runtime_transfer_catalog` is the build/runtime loading mode. It keeps
+runtime validation enabled, including required runtime file columns such as
+`log_file` and `flock_file`, disabled-row filtering, exact `runtime_id`
+filtering, path-variable endpoint expansion, generated artifact names, boolean
+normalization, tag normalization, and shared lock/log warning metadata.
+
+`load_reporting_transfer_catalog` is the reporting/analysis loading mode. It
+uses the same normalized transfer facts, filtering, endpoint expansion,
+booleans, tags, and artifact naming, but reporting analysis can omit
+runtime-only `log_file` and `flock_file` columns because dashboards inspect
+transfer metadata and status logs instead of generating runnable scripts.
+
+Command boundaries:
+
+- `landingzones build` uses the runtime catalog.
+- `landingzones validate deployment` uses the runtime catalog.
+- `landingzones validate integration` uses the runtime catalog.
+- `landingzones validate separation` uses the reporting catalog.
+- `landingzones report transfers` uses the reporting catalog.
+
 ### Shared Main Transfer Locks
 
 `flock_file` is the top-level transfer lock for one generated script. Remote

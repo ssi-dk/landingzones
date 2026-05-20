@@ -11,6 +11,8 @@ import pandas as pd
 
 from landingzones import check_deployment_readiness as cdr
 from landingzones import readiness_ops as ro
+from landingzones import transfer_catalog
+from landingzones.table import TransferTable
 
 
 class TestParseRemoteDestination:
@@ -833,6 +835,67 @@ class TestRuntimeIdentityDetection:
 
         assert result is True
         assert captured['runtime_ids'] == ['local_dev.local']
+
+    def test_validate_deployment_loads_transfers_through_runtime_catalog(
+        self, tmp_path, monkeypatch
+    ):
+        """Deployment validation should use the catalog runtime-validation path."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        dst.mkdir()
+        transfers_file = tmp_path / "transfers.tsv"
+        transfers_file.write_text("placeholder\n")
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "transfers_file: {0}\n"
+            "runtime_ids:\n"
+            "  - local_dev.local\n".format(transfers_file)
+        )
+        catalog_row = {
+            'runtime_id': 'local_dev.local',
+            'system': 'local_dev',
+            'users': 'local',
+            'source': str(src),
+            'source_port': '',
+            'destination': str(dst),
+            'destination_port': '',
+            'log_file': '',
+            'flock_file': '',
+        }
+        loaded = TransferTable([catalog_row], columns=list(catalog_row))
+        calls = []
+
+        def fake_load_runtime_transfer_catalog(
+            config_file=None, transfers_file=None, runtime_ids=None
+        ):
+            calls.append({
+                'config_file': config_file,
+                'transfers_file': transfers_file,
+                'runtime_ids': runtime_ids,
+            })
+            return loaded
+
+        config_snapshot = cdr.config.snapshot_state()
+        monkeypatch.setattr(cdr, 'check_required_tools', lambda: True)
+        monkeypatch.setattr(cdr, 'check_flock_command', lambda system: True)
+        monkeypatch.setattr(
+            transfer_catalog,
+            'load_runtime_transfer_catalog',
+            fake_load_runtime_transfer_catalog,
+        )
+
+        try:
+            result = cdr.main(['--config', str(config_file)])
+        finally:
+            cdr.config.restore_state(config_snapshot)
+
+        assert result is True
+        assert calls == [{
+            'config_file': None,
+            'transfers_file': str(transfers_file),
+            'runtime_ids': ['local_dev.local'],
+        }]
 
     def test_validate_deployment_prints_shared_main_lock_warnings(
         self, tmp_path, monkeypatch, capsys
@@ -1746,6 +1809,77 @@ class TestTestWithData:
 
         assert subset_df['source'].tolist() == ['$LZ_TEST_ROOT/source/']
         assert subset_df['destination'].tolist() == ['$LZ_TEST_ROOT/dest/']
+
+    def test_load_test_with_data_transfer_graph_uses_runtime_catalog(
+        self, tmp_path, monkeypatch
+    ):
+        """test-with-data transfer selection should load through the runtime catalog."""
+        transfers_file = tmp_path / 'transfers.tsv'
+        transfers_file.write_text(
+            "\n".join([
+                "identifiers\truntime_id\tsystem\tusers\tsource\tdestination\tlog_file\tflock_file",
+                "direct_parse\tignored.runtime\ttestbox\trunner\tdirect_src/\tdirect_dst/\tdirect.log\tdirect.lock",
+                "",
+            ])
+        )
+        catalog_row = {
+            'identifiers': 'catalog_transfer',
+            'runtime_id': 'selected.runtime',
+            'system_user': 'selected.runtime',
+            'system': 'testbox',
+            'users': 'runner',
+            'source': 'catalog_src/',
+            'source_port': '',
+            'destination': 'catalog_dst/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'frequency': '',
+            'log_file': str(tmp_path / 'catalog.log'),
+            'flock_file': str(tmp_path / 'catalog.lock'),
+            'flow_group': '',
+            'tags': '',
+            'is_entry_point': 'FALSE',
+            'is_end_point': 'FALSE',
+            'notify_on_success': 'FALSE',
+            'notify_on_error': 'FALSE',
+            'script_name': 'catalog_transfer.sh',
+        }
+        loaded = TransferTable([catalog_row], columns=list(catalog_row))
+        calls = []
+
+        def fake_load_runtime_transfer_catalog(
+            config_file=None, transfers_file=None, runtime_ids=None
+        ):
+            calls.append({
+                'config_file': config_file,
+                'transfers_file': transfers_file,
+                'runtime_ids': runtime_ids,
+            })
+            return loaded
+
+        monkeypatch.setattr(
+            transfer_catalog,
+            'load_runtime_transfer_catalog',
+            fake_load_runtime_transfer_catalog,
+        )
+
+        transfers_df = cdr.load_test_with_data_transfer_graph(
+            str(transfers_file),
+            str(tmp_path),
+            runtime_ids=['selected.runtime'],
+        )
+
+        assert calls == [{
+            'config_file': None,
+            'transfers_file': str(transfers_file),
+            'runtime_ids': ['selected.runtime'],
+        }]
+        assert transfers_df['identifiers'].tolist() == ['catalog_transfer']
+        assert transfers_df['source'].tolist() == [str(tmp_path / 'catalog_src') + '/']
+        assert transfers_df['destination'].tolist() == [
+            str(tmp_path / 'catalog_dst') + '/'
+        ]
 
     def test_build_test_with_data_handoffs_identifies_next_system_user(self, tmp_path):
         """A destination that feeds another system should produce a handoff hint."""
