@@ -278,8 +278,8 @@ class TestConfigClass:
         assert cfg.path_variables['RUNTIME_ONLY'] == '/runtime/root'
         assert cfg.path_variables['SHARED_ROOT'] == '/runtime/shared'
 
-    def test_rit_managed_paths_preserve_configured_paths(self, tmp_path, monkeypatch):
-        """Test that rit_managed config values are preserved verbatim."""
+    def test_rit_managed_paths_expand_configured_paths(self, tmp_path, monkeypatch):
+        """Test that rit_managed config values expand shell-style paths."""
         config_file = tmp_path / "config.yaml"
         config_file.write_text(
             "rit_managed_locations:\n"
@@ -294,9 +294,9 @@ class TestConfigClass:
 
         cfg = config.Config()
 
-        assert cfg.get_rit_managed_location('server1') == "~/server1/output"
-        assert cfg.get_rit_managed_location('Promethion_1') == "$TEST_ROOT/prom/output"
-        assert cfg.get_rit_managed_path('server1', 'sh_output') == "~/server1/output/scripts/out/"
+        assert cfg.get_rit_managed_location('server1') == os.path.expanduser("~/server1/output")
+        assert cfg.get_rit_managed_location('Promethion_1') == "/tmp/test-root/prom/output"
+        assert cfg.get_rit_managed_path('server1', 'sh_output') == os.path.expanduser("~/server1/output/scripts/out/")
 
     def test_resolve_managed_file_path_from_filename(self, tmp_path, monkeypatch):
         """Test resolving a filename against a system-specific managed directory."""
@@ -325,13 +325,14 @@ class TestConfigClass:
         config_file = tmp_path / "config.yaml"
         config_file.write_text(
             "flock_paths:\n"
-            "  server1: /opt/bin/flock\n"
+            "  server1: $TEST_ROOT/bin/flock\n"
         )
 
         monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("TEST_ROOT", "/tmp/test-root")
         cfg = config.Config()
 
-        assert cfg.get_flock_path('server1') == '/opt/bin/flock'
+        assert cfg.get_flock_path('server1') == '/tmp/test-root/bin/flock'
         assert cfg.get_flock_path('other') == '/usr/bin/flock'
 
     def test_notifications_from_yaml_runtime_and_env(self, tmp_path, monkeypatch):

@@ -712,20 +712,32 @@ def build_staging_paths(destination, identifier):
     }
 
 
+def build_staging_prepare_command(staging_root, staging_dir, remote=None, port=''):
+    """Create staging directories and make them group writable."""
+    full_cmd = (
+        "mkdir -p {0} && "
+        "(chmod g+rwx {1} {0} 2>/dev/null || true)"
+    ).format(
+        shell_quote(staging_dir),
+        shell_quote(staging_root),
+    )
+    if remote:
+        ssh_cmd = build_ssh_command(remote, port)
+        return '{0} "{1}"'.format(ssh_cmd, full_cmd)
+    return full_cmd
+
+
 def build_promote_command(destination_dir, staging_dir, remote=None, port=''):
     """Move staged content into the final destination."""
-    staging_root = os.path.dirname(staging_dir)
     full_cmd = (
         "if [ -d {0} ]; then "
         "find {1} -mindepth 1 -maxdepth 1 ! -name '.staging' -exec mv {{}} {0}/ \\; && "
         "rmdir {1}; "
         "else "
         "mv {1} {0}; "
-        "fi && "
-        "rmdir {2} 2>/dev/null || true".format(
+        "fi".format(
             shell_quote(destination_dir),
             shell_quote(staging_dir),
-            shell_quote(staging_root),
         )
     )
     if remote:
@@ -944,8 +956,8 @@ def build_transfer_commands(transfer):
     else:
         find_cmd = find_inner_cmd
 
-    prepare_cmd = build_directory_command(
-        "mkdir -p",
+    prepare_cmd = build_staging_prepare_command(
+        staging_paths['staging_root'],
         staging_paths['staging_dir'],
         staging_paths['destination_remote'],
         destination_port,
@@ -1101,9 +1113,9 @@ def generate_iterative_script_content(transfer):
             escaped_destination_root = runtime_destination_root
         else:
             escaped_destination_root = escape_local_shell_vars(runtime_destination_root)
-        mkdir_cmd = '{0} "mkdir -p \\"{1}\\""'.format(
+        mkdir_cmd = '{0} "mkdir -p \\"{1}/.staging/$dir_name\\" && (chmod g+rwx \\"{1}/.staging\\" \\"{1}/.staging/$dir_name\\" 2>/dev/null || true)"'.format(
             build_ssh_command(destination_remote, destination_port),
-            "{0}/.staging/$dir_name".format(escaped_destination_root),
+            escaped_destination_root,
         )
         promote_cmd = (
             '{0} "set -eu; if [ -d \\"{1}/$dir_name\\" ]; then '
@@ -1111,8 +1123,7 @@ def generate_iterative_script_content(transfer):
             'rmdir \\"{1}/.staging/$dir_name\\"; '
             'else '
             'mv \\"{1}/.staging/$dir_name\\" \\"{1}/$dir_name\\"; '
-            'fi; '
-            'rmdir \\"{1}/.staging\\" 2>/dev/null || true"'
+            'fi"'
         ).format(
             build_ssh_command(destination_remote, destination_port),
             escaped_destination_root,
@@ -1122,27 +1133,27 @@ def generate_iterative_script_content(transfer):
             escaped_destination_root,
         )
         cleanup_staging_cmd = (
-            '{0} "rmdir \\"{1}/.staging/$dir_name\\" 2>/dev/null || true; '
-            'rmdir \\"{1}/.staging\\" 2>/dev/null || true"'
+            '{0} "rmdir \\"{1}/.staging/$dir_name\\" 2>/dev/null || true"'
         ).format(
             build_ssh_command(destination_remote, destination_port),
             escaped_destination_root,
         )
     else:
-        mkdir_cmd = 'mkdir -p "{0}/.staging/$dir_name"'.format(destination_root)
+        mkdir_cmd = (
+            'mkdir -p "{0}/.staging/$dir_name" && '
+            '(chmod g+rwx "{0}/.staging" "{0}/.staging/$dir_name" 2>/dev/null || true)'
+        ).format(destination_root)
         promote_cmd = (
             'if [ -d "{0}/$dir_name" ]; then '
             'find "{0}/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {{}} "{0}/$dir_name"/ \\; && '
             'rmdir "{0}/.staging/$dir_name"; '
             'else '
             'mv "{0}/.staging/$dir_name" "{0}/$dir_name"; '
-            'fi; '
-            'rmdir "{0}/.staging" 2>/dev/null || true'
+            'fi'
         ).format(destination_root)
         rsync_destination = '"{0}/.staging/$dir_name/"'.format(destination_root)
         cleanup_staging_cmd = (
-            'rmdir "{0}/.staging/$dir_name" 2>/dev/null || true; '
-            'rmdir "{0}/.staging" 2>/dev/null || true'
+            'rmdir "{0}/.staging/$dir_name" 2>/dev/null || true'
         ).format(destination_root)
 
     if source_remote:

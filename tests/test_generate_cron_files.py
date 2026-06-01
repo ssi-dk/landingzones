@@ -3,6 +3,7 @@
 """Test suite for generate_cron_files.py"""
 
 import os
+import stat
 import sys
 import tempfile
 import shutil
@@ -670,6 +671,8 @@ class TestGenerateRsyncCommand:
         assert '--remove-source-files' in cmd
         assert '/source/path/' in cmd
         assert '/dest/path/.staging/transfer/' in cmd
+        assert 'chmod g+rwx /dest/path/.staging /dest/path/.staging/transfer' in cmd
+        assert 'rmdir /dest/path/.staging ' not in cmd
         assert '/tmp/test.log' in cmd
     
     def test_rsync_with_ssh_port(self):
@@ -755,7 +758,7 @@ class TestGenerateRsyncCommand:
 
         assert 'destination_root_runtime="\\${resolved_destination_root}"' in script
         assert 'resolved_destination_root="$(ssh remotealias \'printf %s "$HOME/Landing_Zone"\')"' in script
-        assert 'ssh remotealias "mkdir -p \\"${resolved_destination_root}/.staging/$dir_name\\"" </dev/null' in script
+        assert 'ssh remotealias "mkdir -p \\"${resolved_destination_root}/.staging/$dir_name\\" && (chmod g+rwx \\"${resolved_destination_root}/.staging\\" \\"${resolved_destination_root}/.staging/$dir_name\\" 2>/dev/null || true)" </dev/null' in script
         assert 'rsync -av --remove-source-files "$source_dir/" "remotealias:${resolved_destination_root}/.staging/$dir_name/" </dev/null' in script
 
     def test_loop_commands_detach_stdin_for_remote_transfers(self):
@@ -968,9 +971,10 @@ class TestGenerateRsyncCommand:
 
         cmd = gcf.generate_rsync_command(transfer)
 
-        assert 'ssh -p 2222 user@host "mkdir -p /dest/.staging/sample"' in cmd
+        assert 'ssh -p 2222 user@host "mkdir -p /dest/.staging/sample && (chmod g+rwx /dest/.staging /dest/.staging/sample 2>/dev/null || true)"' in cmd
         assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' /source/ user@host:/dest/.staging/sample/' in cmd
-        assert 'ssh -p 2222 user@host "set -eu; if [ -d /dest ]; then find /dest/.staging/sample -mindepth 1 -maxdepth 1 ! -name \'.staging\' -exec mv {} /dest/ \\; && rmdir /dest/.staging/sample; else mv /dest/.staging/sample /dest; fi && rmdir /dest/.staging 2>/dev/null || true"' in cmd
+        assert 'ssh -p 2222 user@host "set -eu; if [ -d /dest ]; then find /dest/.staging/sample -mindepth 1 -maxdepth 1 ! -name \'.staging\' -exec mv {} /dest/ \\; && rmdir /dest/.staging/sample; else mv /dest/.staging/sample /dest; fi"' in cmd
+        assert 'rmdir /dest/.staging 2>/dev/null || true' not in cmd
 
     def test_rsync_cleans_remote_sources_via_ssh(self):
         """Test that remote source cleanup runs on the remote host."""
@@ -1105,7 +1109,9 @@ class TestGenerateRsyncCommand:
         assert 'rsync --dry-run -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$preflight_log" 2>&1' in script
         assert 'if ! rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1; then' in script
         assert 'rsync_message="rsync failed: $(summarize_log "$run_log")"' in script
-        assert 'if ! ( if [ -d "/dest/$dir_name" ]; then find "/dest/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {} "/dest/$dir_name"/ \\; && rmdir "/dest/.staging/$dir_name"; else mv "/dest/.staging/$dir_name" "/dest/$dir_name"; fi; rmdir "/dest/.staging" 2>/dev/null || true ) </dev/null >>"$promote_log" 2>&1; then' in script
+        assert 'mkdir -p "/dest/.staging/$dir_name" && (chmod g+rwx "/dest/.staging" "/dest/.staging/$dir_name" 2>/dev/null || true)' in script
+        assert 'if ! ( if [ -d "/dest/$dir_name" ]; then find "/dest/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {} "/dest/$dir_name"/ \\; && rmdir "/dest/.staging/$dir_name"; else mv "/dest/.staging/$dir_name" "/dest/$dir_name"; fi ) </dev/null >>"$promote_log" 2>&1; then' in script
+        assert 'rmdir "/dest/.staging" 2>/dev/null || true' not in script
         assert 'preflight_message="source cleanup preflight command failed: $(summarize_log "$preflight_stderr_log")"' in script
         assert 'preflight_message="source cleanup preflight failed: $(summarize_log "$preflight_log")"' in script
         assert 'preflight_message="rsync dry-run failed: $(summarize_log "$preflight_log")"' in script
@@ -1645,10 +1651,11 @@ class TestGenerateRsyncCommand:
             gcf.config._runtime_config = original_runtime_config
 
         assert 'find "input" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | while IFS= read -r source_dir; do' in script
-        assert 'mkdir -p "output/.staging/$dir_name"' in script
+        assert 'mkdir -p "output/.staging/$dir_name" && (chmod g+rwx "output/.staging" "output/.staging/$dir_name" 2>/dev/null || true)' in script
         assert 'rsync -av --remove-source-files "$source_dir/" "output/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'mv "output/.staging/$dir_name" "output/$dir_name"' in script
         assert 'find "output/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {} "output/$dir_name"/ \\;' in script
+        assert 'rmdir "output/.staging" 2>/dev/null || true' not in script
         assert 'current_run_source="$source_dir"' in script
         assert 'current_run_destination="output/$dir_name"' in script
         assert 'log_status "$dir_name initiated"' in script
@@ -1681,13 +1688,91 @@ class TestGenerateRsyncCommand:
             gcf.config._runtime_config = original_runtime_config
 
         assert 'find "/source" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | while IFS= read -r source_dir; do' in script
-        assert 'ssh -p 2222 user@host "mkdir -p \\"/dest/.staging/$dir_name\\""' in script
+        assert 'ssh -p 2222 user@host "mkdir -p \\"/dest/.staging/$dir_name\\" && (chmod g+rwx \\"/dest/.staging\\" \\"/dest/.staging/$dir_name\\" 2>/dev/null || true)"' in script
         assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' "$source_dir/" "user@host:/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'ssh -p 2222 user@host "set -eu; if [ -d \\"/dest/$dir_name\\" ]; then ' in script
         assert 'find \\"/dest/.staging/$dir_name\\" -mindepth 1 -maxdepth 1 ! -name \\".staging\\" -exec mv {} \\"/dest/$dir_name/\\" \\;' in script
+        assert 'rmdir \\"/dest/.staging\\" 2>/dev/null || true' not in script
         assert 'current_run_destination="user@host:/dest/$dir_name"' in script
         assert 'if ! [ -d "/source" ]; then' in script
         assert 'source directory missing: /source' in script
+
+    @pytest.mark.skipif(
+        not HAS_RSYNC,
+        reason="requires rsync to execute generated transfer script",
+    )
+    def test_generated_script_preserves_group_writable_staging_root(self, tmp_path):
+        """A successful transfer should leave a group-writable .staging root."""
+        source_root = tmp_path / "source"
+        run_dir = source_root / "run1"
+        destination_root = tmp_path / "destination"
+        log_root = tmp_path / "log"
+        flock_root = tmp_path / "flock"
+        run_dir.mkdir(parents=True)
+        destination_root.mkdir()
+        log_root.mkdir()
+        flock_root.mkdir()
+        (run_dir / "payload.txt").write_text("payload", encoding="utf-8")
+
+        transfer = {
+            'identifiers': 'sample',
+            'system': 'server1',
+            'source': str(source_root / '*'),
+            'source_port': '',
+            'destination': str(destination_root) + '/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': str(log_root / 'transfer.log'),
+            'flock_file': str(flock_root / 'transfer.lock'),
+            'frequency': '',
+        }
+
+        snapshot = gcf.config.snapshot_state()
+        gcf.config.load_config(
+            flock_paths={'server1': '/usr/bin/true'},
+            rit_managed_locations={'server1': str(tmp_path)},
+            rit_managed_folder_structure={
+                'log': 'log',
+                'flock': 'flock',
+                'sh_output': 'scripts',
+                'crontabs': 'crontab.d',
+            },
+        )
+        try:
+            script = gcf.generate_script_content(transfer)
+        finally:
+            gcf.config.restore_state(snapshot)
+
+        script_path = tmp_path / "transfer.sh"
+        script_path.write_text(script, encoding="utf-8")
+        script_path.chmod(0o755)
+
+        env = dict(os.environ)
+        rsync_path = shutil.which("rsync")
+        if rsync_path:
+            env["PATH"] = os.pathsep.join([
+                os.path.dirname(rsync_path),
+                env.get("PATH", ""),
+            ])
+        proc = subprocess.run(
+            [str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(tmp_path),
+            env=env,
+        )
+
+        assert proc.returncode == 0, proc.stderr
+        staging_root = destination_root / ".staging"
+        assert staging_root.is_dir()
+        mode = staging_root.stat().st_mode
+        assert mode & stat.S_IRGRP
+        assert mode & stat.S_IWGRP
+        assert mode & stat.S_IXGRP
+        assert not (staging_root / "run1").exists()
+        assert (destination_root / "run1" / "payload.txt").read_text() == "payload"
 
     def test_generate_script_content_iterates_remote_source_dirs(self):
         """Test shell script content for remote source to local destination."""

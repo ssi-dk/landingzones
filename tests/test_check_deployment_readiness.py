@@ -4,6 +4,7 @@
 
 import os
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 import pytest
@@ -1562,7 +1563,12 @@ class TestTestWithData:
             'flow_one',
             'flow_two',
         ]
-        assert not (final_root / '.staging').exists()
+        staging_root = final_root / '.staging'
+        assert staging_root.is_dir()
+        mode = staging_root.stat().st_mode
+        assert mode & stat.S_IRGRP
+        assert mode & stat.S_IWGRP
+        assert mode & stat.S_IXGRP
 
     @pytest.mark.skipif(
         shutil.which('rsync') is None,

@@ -79,6 +79,14 @@ def _expand_path(path):
     return path
 
 
+def _expand_path_mapping(values):
+    """Return a copy of a mapping with shell-style paths expanded."""
+    return {
+        key: _expand_path(value)
+        for key, value in dict(values).items()
+    }
+
+
 def _normalize_runtime_ids(value):
     """Normalize runtime_id config values to a de-duplicated list."""
     if value is None:
@@ -362,11 +370,11 @@ class Config:
         """Configured rit_managed base locations for each system."""
         runtime_value = self._runtime_config.get('rit_managed_locations')
         if runtime_value is not None:
-            return dict(runtime_value)
+            return _expand_path_mapping(runtime_value)
 
         yaml_value = self._yaml_config.get('rit_managed_locations')
         if yaml_value is not None:
-            return dict(yaml_value)
+            return _expand_path_mapping(yaml_value)
 
         return {}
 
@@ -375,11 +383,11 @@ class Config:
         """Configured folder suffixes under each rit_managed base location."""
         runtime_value = self._runtime_config.get('rit_managed_folder_structure')
         if runtime_value is not None:
-            return dict(runtime_value)
+            return _expand_path_mapping(runtime_value)
 
         yaml_value = self._yaml_config.get('rit_managed_folder_structure')
         if yaml_value is not None:
-            return dict(yaml_value)
+            return _expand_path_mapping(yaml_value)
 
         return dict(DEFAULT_RIT_MANAGED_FOLDER_STRUCTURE)
 
@@ -388,11 +396,11 @@ class Config:
         """Configured flock binary paths by system."""
         runtime_value = self._runtime_config.get('flock_paths')
         if runtime_value is not None:
-            return dict(runtime_value)
+            return _expand_path_mapping(runtime_value)
 
         yaml_value = self._yaml_config.get('flock_paths')
         if yaml_value is not None:
-            return dict(yaml_value)
+            return _expand_path_mapping(yaml_value)
 
         return {}
 
