@@ -912,7 +912,7 @@ class TestGenerateRsyncCommand:
         assert '--chown=:group' in cmd
         assert '--chmod=Du=rwx' in cmd
         assert 'ionice -c2 -n4 rsync' in cmd
-        assert 'if [ -d /dest ]; then find /dest/.staging/transfer -mindepth 1 -maxdepth 1 ! -name \'.staging\' -exec mv {} /dest/ \\; && rmdir /dest/.staging/transfer; else mv /dest/.staging/transfer /dest; fi' in cmd
+        assert 'if [ -d /dest ]; then rsync -a --remove-source-files /dest/.staging/transfer/ /dest/ && find /dest/.staging/transfer -mindepth 1 -depth -type d -empty -delete && rmdir /dest/.staging/transfer; else mv /dest/.staging/transfer /dest; fi' in cmd
 
     def test_rsync_with_io_nice_arguments_only(self):
         """Test that bare io_nice arguments are prefixed with ionice."""
@@ -973,7 +973,7 @@ class TestGenerateRsyncCommand:
 
         assert 'ssh -p 2222 user@host "mkdir -p /dest/.staging/sample && (chmod g+rwx /dest/.staging /dest/.staging/sample 2>/dev/null || true)"' in cmd
         assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' /source/ user@host:/dest/.staging/sample/' in cmd
-        assert 'ssh -p 2222 user@host "set -eu; if [ -d /dest ]; then find /dest/.staging/sample -mindepth 1 -maxdepth 1 ! -name \'.staging\' -exec mv {} /dest/ \\; && rmdir /dest/.staging/sample; else mv /dest/.staging/sample /dest; fi"' in cmd
+        assert 'ssh -p 2222 user@host "set -eu; if [ -d /dest ]; then rsync -a --remove-source-files /dest/.staging/sample/ /dest/ && find /dest/.staging/sample -mindepth 1 -depth -type d -empty -delete && rmdir /dest/.staging/sample; else mv /dest/.staging/sample /dest; fi"' in cmd
         assert 'rmdir /dest/.staging 2>/dev/null || true' not in cmd
 
     def test_rsync_cleans_remote_sources_via_ssh(self):
@@ -1110,7 +1110,7 @@ class TestGenerateRsyncCommand:
         assert 'if ! rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1; then' in script
         assert 'rsync_message="rsync failed: $(summarize_log "$run_log")"' in script
         assert 'mkdir -p "/dest/.staging/$dir_name" && (chmod g+rwx "/dest/.staging" "/dest/.staging/$dir_name" 2>/dev/null || true)' in script
-        assert 'if ! ( if [ -d "/dest/$dir_name" ]; then find "/dest/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {} "/dest/$dir_name"/ \\; && rmdir "/dest/.staging/$dir_name"; else mv "/dest/.staging/$dir_name" "/dest/$dir_name"; fi ) </dev/null >>"$promote_log" 2>&1; then' in script
+        assert 'if ! ( if [ -d "/dest/$dir_name" ]; then rsync -a --remove-source-files "/dest/.staging/$dir_name/" "/dest/$dir_name/" && find "/dest/.staging/$dir_name" -mindepth 1 -depth -type d -empty -delete && rmdir "/dest/.staging/$dir_name"; else mv "/dest/.staging/$dir_name" "/dest/$dir_name"; fi ) </dev/null >>"$promote_log" 2>&1; then' in script
         assert 'rmdir "/dest/.staging" 2>/dev/null || true' not in script
         assert 'preflight_message="source cleanup preflight command failed: $(summarize_log "$preflight_stderr_log")"' in script
         assert 'preflight_message="source cleanup preflight failed: $(summarize_log "$preflight_log")"' in script
@@ -1654,7 +1654,7 @@ class TestGenerateRsyncCommand:
         assert 'mkdir -p "output/.staging/$dir_name" && (chmod g+rwx "output/.staging" "output/.staging/$dir_name" 2>/dev/null || true)' in script
         assert 'rsync -av --remove-source-files "$source_dir/" "output/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'mv "output/.staging/$dir_name" "output/$dir_name"' in script
-        assert 'find "output/.staging/$dir_name" -mindepth 1 -maxdepth 1 ! -name ".staging" -exec mv {} "output/$dir_name"/ \\;' in script
+        assert 'rsync -a --remove-source-files "output/.staging/$dir_name/" "output/$dir_name/" && find "output/.staging/$dir_name" -mindepth 1 -depth -type d -empty -delete' in script
         assert 'rmdir "output/.staging" 2>/dev/null || true' not in script
         assert 'current_run_source="$source_dir"' in script
         assert 'current_run_destination="output/$dir_name"' in script
@@ -1691,7 +1691,7 @@ class TestGenerateRsyncCommand:
         assert 'ssh -p 2222 user@host "mkdir -p \\"/dest/.staging/$dir_name\\" && (chmod g+rwx \\"/dest/.staging\\" \\"/dest/.staging/$dir_name\\" 2>/dev/null || true)"' in script
         assert 'rsync -av --remove-source-files -e \'ssh -p 2222\' "$source_dir/" "user@host:/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'ssh -p 2222 user@host "set -eu; if [ -d \\"/dest/$dir_name\\" ]; then ' in script
-        assert 'find \\"/dest/.staging/$dir_name\\" -mindepth 1 -maxdepth 1 ! -name \\".staging\\" -exec mv {} \\"/dest/$dir_name/\\" \\;' in script
+        assert 'rsync -a --remove-source-files \\"/dest/.staging/$dir_name/\\" \\"/dest/$dir_name/\\" && find \\"/dest/.staging/$dir_name\\" -mindepth 1 -depth -type d -empty -delete' in script
         assert 'rmdir \\"/dest/.staging\\" 2>/dev/null || true' not in script
         assert 'current_run_destination="user@host:/dest/$dir_name"' in script
         assert 'if ! [ -d "/source" ]; then' in script
@@ -1963,8 +1963,8 @@ class TestGenerateRsyncCommand:
         assert events_file.stat().st_mode & 0o020
 
     @pytest.mark.skipif(
-        not (HAS_RSYNC and HAS_FLOCK),
-        reason="requires rsync and flock",
+        not HAS_RSYNC,
+        reason="requires rsync",
     )
     def test_generated_script_writes_notification_log_for_distinct_minted_runs(self, tmp_path, monkeypatch):
         """Notification delivery should record separately minted run identities."""
@@ -1973,6 +1973,9 @@ class TestGenerateRsyncCommand:
         fake_curl = fake_bin / "curl"
         fake_curl.write_text("#!/bin/sh\nprintf '200'\n")
         fake_curl.chmod(0o755)
+        fake_flock = fake_bin / "flock"
+        fake_flock.write_text("#!/bin/sh\nexit 0\n")
+        fake_flock.chmod(0o755)
         monkeypatch.setenv("LANDINGZONES_CURL", str(fake_curl))
         monkeypatch.setenv(
             "PATH",
