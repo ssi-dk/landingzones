@@ -17,6 +17,8 @@ Example config.yaml:
     log_dir: log
     output_dir: output
     crontab_dir: output/crontab.d
+    cron_fragment_exclusions:
+      - old-runtime.Landing_Zone.cron
     rit_managed_locations:
       localhost: /srv/rit_managed/
     flock_paths:
@@ -106,6 +108,25 @@ def _normalize_runtime_ids(value):
     return normalized
 
 
+def _normalize_string_list(value):
+    """Normalize list-like config values to de-duplicated strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values = value.split(',')
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = value
+    else:
+        raw_values = [value]
+
+    normalized = []
+    for raw_value in raw_values:
+        text = str(raw_value).strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
 def _load_yaml_config(config_file=None):
     """Load configuration from a YAML file.
     
@@ -164,6 +185,7 @@ class Config:
         - LZ_VALIDATION_SCRIPTS_DIR: Default validation wrapper output directory
         - LZ_RUNTIME_IDS: Comma-separated runtime_id filter values
         - LZ_RUNTIME_ID: Single runtime_id filter value
+        - LZ_CRON_FRAGMENT_EXCLUSIONS: Comma-separated staged cron filenames to exclude
         - LZ_CRON_FREQUENCY: Default cron schedule expression
         - LZ_NOTIFICATION_ENDPOINT: Optional notification API endpoint
         - LZ_NOTIFICATION_TOKEN_ENV: Optional env var name containing bearer token
@@ -366,6 +388,22 @@ class Config:
         return []
 
     @property
+    def cron_fragment_exclusions(self):
+        """Exact staged cron filenames to exclude from activation."""
+        key = 'cron_fragment_exclusions'
+        if key in self._runtime_config:
+            return _normalize_string_list(self._runtime_config[key])
+
+        env_value = os.environ.get('LZ_CRON_FRAGMENT_EXCLUSIONS')
+        if env_value:
+            return _normalize_string_list(env_value)
+
+        if key in self._yaml_config:
+            return _normalize_string_list(self._yaml_config[key])
+
+        return []
+
+    @property
     def rit_managed_locations(self):
         """Configured rit_managed base locations for each system."""
         runtime_value = self._runtime_config.get('rit_managed_locations')
@@ -508,6 +546,7 @@ class Config:
             'artifact_owner_id': self.artifact_owner_id,
             'artifact_prefix': self.artifact_prefix,
             'runtime_ids': self.runtime_ids,
+            'cron_fragment_exclusions': self.cron_fragment_exclusions,
             'rit_managed_locations': self.rit_managed_locations,
             'flock_paths': self.flock_paths,
             'notifications': self.notifications,

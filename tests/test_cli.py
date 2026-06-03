@@ -408,12 +408,14 @@ class TestOperatorCli:
             'deploy',
             'cron',
             '--cron-scope', 'expected',
+            '--exclude-cron-fragment', 'manual-maintenance.cron',
             '--confirm-cron-activation',
         ])
 
         assert rc == 0
         assert captured['argv'] == [
             '--cron-scope', 'expected',
+            '--exclude-cron-fragment', 'manual-maintenance.cron',
             '--confirm-cron-activation',
             '--deploy-cron',
         ]

@@ -21,6 +21,10 @@ output_dir: output
 # Directory for generated cron files (default: output_dir/crontab.d)
 crontab_dir: output/crontab.d
 
+# Exact staged cron filenames to omit from active cron during deploy cron.
+# Missing filenames are shown in the preview but do not block activation.
+cron_fragment_exclusions: []
+
 # Base rit_managed locations by system.
 rit_managed_locations:
   localhost: /srv/rit_managed/

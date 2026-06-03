@@ -110,10 +110,67 @@ class TestCronDeploymentPrompt:
 
         assert result is True
 
-    def test_deploy_cron_defaults_to_selected_runtime_scope(
+    def test_build_cron_activation_plan_classifies_execution_context_fragments(
+        self, tmp_path
+    ):
+        """Execution-context planning should classify mixed staged cron fragments."""
+        staged_dir = tmp_path / "crontab.d"
+        staged_dir.mkdir()
+        selected_name = "local_dev.local.Landing_Zone.cron"
+        preserved_name = "local_prod.local.Landing_Zone.cron"
+        foreign_name = "other.runner.Landing_Zone.cron"
+        unresolved_name = "stale.runner.Landing_Zone.cron"
+        manual_name = "manual-maintenance.cron"
+        backup_name = "manual-maintenance.cron.bak"
+        for filename in [
+            selected_name,
+            preserved_name,
+            foreign_name,
+            unresolved_name,
+            manual_name,
+            backup_name,
+        ]:
+            (staged_dir / filename).write_text("* * * * * {0}\n".format(filename))
+
+        plan = ro.build_cron_activation_plan(
+            'execution-context',
+            ['local_dev.local'],
+            str(staged_dir),
+            'calc',
+            'operator',
+            runtime_contexts={
+                'local_dev.local': {('calc', 'operator')},
+                'local_prod.local': {('calc', 'operator')},
+                'other.runner': {('other', 'operator')},
+            },
+            cron_fragment_exclusions=[
+                manual_name,
+                'missing-runtime.Landing_Zone.cron',
+            ],
+        )
+
+        assert [f['filename'] for f in plan.activated_runtime_fragments] == [
+            selected_name
+        ]
+        assert [f['filename'] for f in plan.preserved_runtime_fragments] == [
+            preserved_name
+        ]
+        assert [f['filename'] for f in plan.foreign_runtime_fragments] == [
+            foreign_name
+        ]
+        assert [f['filename'] for f in plan.unresolved_runtime_fragments] == [
+            unresolved_name
+        ]
+        assert [f['filename'] for f in plan.applied_exclusions] == [manual_name]
+        assert [f['filename'] for f in plan.missing_exclusions] == [
+            'missing-runtime.Landing_Zone.cron'
+        ]
+        assert all(backup_name not in path for path in plan.active_files)
+
+    def test_deploy_cron_defaults_to_execution_context_scope(
         self, tmp_path, monkeypatch, capsys
     ):
-        """Default cron activation should activate selected runtimes and preserve unidentified crons."""
+        """Default cron activation should preserve same-context runtime crons."""
         home_dir = tmp_path / "home"
         staged_dir = home_dir / "crontab.d"
         generated_dir = tmp_path / "output" / "crontab.d"
@@ -121,10 +178,14 @@ class TestCronDeploymentPrompt:
         generated_dir.mkdir(parents=True)
 
         selected_name = "local_dev.local.Landing_Zone.cron"
-        excluded_name = "other.local.Landing_Zone.cron"
+        preserved_name = "local_prod.local.Landing_Zone.cron"
+        foreign_name = "other.runner.Landing_Zone.cron"
+        unresolved_name = "stale.runner.Landing_Zone.cron"
         unidentified_name = "manual-maintenance.cron"
         (generated_dir / selected_name).write_text("* * * * * selected-runtime\n")
-        (staged_dir / excluded_name).write_text("* * * * * excluded-runtime\n")
+        (staged_dir / preserved_name).write_text("* * * * * preserved-runtime\n")
+        (staged_dir / foreign_name).write_text("* * * * * foreign-runtime\n")
+        (staged_dir / unresolved_name).write_text("* * * * * unresolved-runtime\n")
         (staged_dir / unidentified_name).write_text("* * * * * manual-maintenance\n")
         config_file = tmp_path / "config.yaml"
         config_file.write_text("crontab_dir: {0}\n".format(generated_dir))
@@ -156,6 +217,27 @@ class TestCronDeploymentPrompt:
         responses = iter(['y'])
         monkeypatch.setenv('HOME', str(home_dir))
         monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'local_prod.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'other.runner',
+                    'system': 'other',
+                    'users': 'runner',
+                },
+            ]),
+        )
         monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
         monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: True, raising=False)
         monkeypatch.setattr(
@@ -194,10 +276,207 @@ class TestCronDeploymentPrompt:
 
         assert result is True
         assert "selected-runtime" in activated['content']
+        assert "preserved-runtime" in activated['content']
         assert "manual-maintenance" in activated['content']
-        assert "excluded-runtime" not in activated['content']
-        assert excluded_name in captured.out
+        assert "foreign-runtime" not in activated['content']
+        assert "unresolved-runtime" not in activated['content']
+        assert preserved_name in captured.out
+        assert foreign_name in captured.out
+        assert unresolved_name in captured.out
+        assert "Preserved runtime cron fragments" in captured.out
         assert "Excluded runtime cron fragments" in captured.out
+
+    def test_deploy_cron_replace_selected_excludes_same_context_runtime(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """replace-selected should retain the old selected-runtime replacement behavior."""
+        home_dir = tmp_path / "home"
+        staged_dir = home_dir / "crontab.d"
+        generated_dir = tmp_path / "output" / "crontab.d"
+        staged_dir.mkdir(parents=True)
+        generated_dir.mkdir(parents=True)
+
+        selected_name = "local_dev.local.Landing_Zone.cron"
+        nonselected_name = "local_prod.local.Landing_Zone.cron"
+        manual_name = "manual-maintenance.cron"
+        (generated_dir / selected_name).write_text("* * * * * selected-runtime\n")
+        (staged_dir / nonselected_name).write_text("* * * * * nonselected-runtime\n")
+        (staged_dir / manual_name).write_text("* * * * * manual-maintenance\n")
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("crontab_dir: {0}\n".format(generated_dir))
+        activated = {}
+
+        class DummyProcess:
+            def __init__(self, args, stdout=None, stderr=None, stdin=None):
+                self.args = args
+                self.returncode = 0
+
+            def communicate(self, input=None):
+                if self.args == ['crontab', '-']:
+                    activated['content'] = input.decode('utf-8')
+                    return b'', b''
+                if self.args == ['crontab', '-l']:
+                    return activated.get('content', '').encode('utf-8'), b''
+                return b'', b''
+
+        snapshot = cdr.config.snapshot_state()
+        monkeypatch.setenv('HOME', str(home_dir))
+        monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'local_prod.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+            ]),
+        )
+        monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
+        monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: False, raising=False)
+        monkeypatch.setattr(
+            cdr,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                }
+            ]),
+        )
+        monkeypatch.setattr(
+            cdr,
+            'get_current_system',
+            lambda transfers_df=None, runtime_ids=None: 'local_dev',
+        )
+        monkeypatch.setattr(
+            cdr,
+            'get_current_user',
+            lambda transfers_df=None, runtime_ids=None: 'local',
+        )
+
+        try:
+            result = cdr.main([
+                '--config', str(config_file),
+                '--runtime-id', 'local_dev.local',
+                '--deploy-cron',
+                '--cron-scope', 'replace-selected',
+                '--confirm-cron-activation',
+            ])
+        finally:
+            cdr.config.restore_state(snapshot)
+
+        captured = capsys.readouterr()
+
+        assert result is True
+        assert "selected-runtime" in activated['content']
+        assert "manual-maintenance" in activated['content']
+        assert "nonselected-runtime" not in activated['content']
+        assert "Replacement cron activation" in captured.out
+        assert nonselected_name in captured.out
+
+    def test_deploy_cron_combines_config_and_cli_exact_exclusions(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Exact cron exclusions should combine config and CLI values."""
+        home_dir = tmp_path / "home"
+        staged_dir = home_dir / "crontab.d"
+        generated_dir = tmp_path / "output" / "crontab.d"
+        staged_dir.mkdir(parents=True)
+        generated_dir.mkdir(parents=True)
+
+        selected_name = "local_dev.local.Landing_Zone.cron"
+        manual_name = "manual-maintenance.cron"
+        missing_name = "missing-maintenance.cron"
+        (generated_dir / selected_name).write_text("* * * * * selected-runtime\n")
+        (staged_dir / manual_name).write_text("* * * * * manual-maintenance\n")
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "crontab_dir: {0}\ncron_fragment_exclusions:\n  - {1}\n".format(
+                generated_dir,
+                manual_name,
+            )
+        )
+        activated = {}
+
+        class DummyProcess:
+            def __init__(self, args, stdout=None, stderr=None, stdin=None):
+                self.args = args
+                self.returncode = 0
+
+            def communicate(self, input=None):
+                if self.args == ['crontab', '-']:
+                    activated['content'] = input.decode('utf-8')
+                    return b'', b''
+                if self.args == ['crontab', '-l']:
+                    return activated.get('content', '').encode('utf-8'), b''
+                return b'', b''
+
+        snapshot = cdr.config.snapshot_state()
+        monkeypatch.setenv('HOME', str(home_dir))
+        monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                }
+            ]),
+        )
+        monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
+        monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: False, raising=False)
+        monkeypatch.setattr(
+            cdr,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                }
+            ]),
+        )
+        monkeypatch.setattr(
+            cdr,
+            'get_current_system',
+            lambda transfers_df=None, runtime_ids=None: 'local_dev',
+        )
+        monkeypatch.setattr(
+            cdr,
+            'get_current_user',
+            lambda transfers_df=None, runtime_ids=None: 'local',
+        )
+
+        try:
+            result = cdr.main([
+                '--config', str(config_file),
+                '--runtime-id', 'local_dev.local',
+                '--deploy-cron',
+                '--exclude-cron-fragment', missing_name,
+                '--confirm-cron-activation',
+            ])
+        finally:
+            cdr.config.restore_state(snapshot)
+
+        captured = capsys.readouterr()
+
+        assert result is True
+        assert "selected-runtime" in activated['content']
+        assert "manual-maintenance" not in activated['content']
+        assert manual_name in captured.out
+        assert missing_name in captured.out
+        assert "Applied cron fragment exclusions" in captured.out
+        assert "Missing cron fragment exclusions" in captured.out
 
     def test_deploy_cron_confirm_option_allows_noninteractive_activation(
         self, tmp_path, monkeypatch
@@ -231,6 +510,27 @@ class TestCronDeploymentPrompt:
         snapshot = cdr.config.snapshot_state()
         monkeypatch.setenv('HOME', str(home_dir))
         monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'server2.runner',
+                    'system': 'server2',
+                    'users': 'runner',
+                },
+                {
+                    'runtime_id': 'other.local',
+                    'system': 'other',
+                    'users': 'local',
+                },
+            ]),
+        )
         monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
         monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: False, raising=False)
         monkeypatch.setattr(
@@ -314,6 +614,27 @@ class TestCronDeploymentPrompt:
         snapshot = cdr.config.snapshot_state()
         monkeypatch.setenv('HOME', str(home_dir))
         monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'server2.runner',
+                    'system': 'server2',
+                    'users': 'runner',
+                },
+                {
+                    'runtime_id': 'other.local',
+                    'system': 'other',
+                    'users': 'local',
+                },
+            ]),
+        )
         monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
         monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: False, raising=False)
         monkeypatch.setattr(
@@ -353,11 +674,12 @@ class TestCronDeploymentPrompt:
 
         assert result is True
         assert "first-expected" in activated['content']
-        assert "second-expected" in activated['content']
+        assert "second-expected" not in activated['content']
         assert "manual-maintenance" in activated['content']
         assert "excluded-runtime" not in activated['content']
         assert "Cron activation scope" in captured.out
         assert "expected" in captured.out
+        assert second_name in captured.out
         assert excluded_name in captured.out
 
     def test_deploy_cron_expected_scope_prompts_to_repair_missing_staged_cron(
@@ -403,6 +725,22 @@ class TestCronDeploymentPrompt:
         snapshot = cdr.config.snapshot_state()
         monkeypatch.setenv('HOME', str(home_dir))
         monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'server2.runner',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+            ]),
+        )
         monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
         monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: True, raising=False)
         monkeypatch.setattr(cdr, 'ask_yes_no', confirm)
@@ -479,6 +817,22 @@ class TestCronDeploymentPrompt:
         snapshot = cdr.config.snapshot_state()
         monkeypatch.setenv('HOME', str(home_dir))
         monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'server2.runner',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+            ]),
+        )
         monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
         monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: False, raising=False)
         monkeypatch.setattr(
@@ -714,7 +1068,7 @@ class TestCronDeploymentPrompt:
 
         assert result is False
         assert 'content' not in activated
-        assert "scope 'selected'" in captured.out
+        assert "scope 'execution-context'" in captured.out
         assert "--confirm-cron-activation" in captured.out
 
 

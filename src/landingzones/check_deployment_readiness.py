@@ -1115,7 +1115,8 @@ def print_runtime_filter_status(runtime_ids, runtime_filter_source):
 def run_cron_deployment_prompt(
     runtime_ids=None,
     runtime_filter_source=None,
-    cron_scope='selected',
+    cron_scope='execution-context',
+    cron_fragment_exclusions=None,
     confirm_activation=False,
 ):
     """Offer an interactive cron deployment for the current system/user."""
@@ -1157,6 +1158,7 @@ def run_cron_deployment_prompt(
         current_user,
         runtime_ids=runtime_ids,
         cron_scope=cron_scope,
+        cron_fragment_exclusions=cron_fragment_exclusions,
         confirm_activation=confirm_activation,
         prompt_confirmation=ask_yes_no,
     )
@@ -1544,9 +1546,18 @@ def main(argv=None):
     )
     parser.add_argument(
         '--cron-scope',
-        choices=['selected', 'expected', 'staged'],
-        default='selected',
-        help='Cron fragment activation scope: selected, expected, or staged'
+        choices=['execution-context', 'expected', 'replace-selected', 'selected', 'staged'],
+        default='execution-context',
+        help=(
+            'Cron fragment activation scope: execution-context, expected, '
+            'replace-selected, or staged'
+        )
+    )
+    parser.add_argument(
+        '--exclude-cron-fragment',
+        action='append',
+        default=None,
+        help='Exact staged cron filename to omit from active cron; repeatable'
     )
     args = parser.parse_args(argv)
     
@@ -1574,6 +1585,7 @@ def main(argv=None):
             runtime_ids=runtime_ids,
             runtime_filter_source=runtime_filter_source,
             cron_scope=args.cron_scope,
+            cron_fragment_exclusions=args.exclude_cron_fragment,
             confirm_activation=args.confirm_cron_activation,
         )
     

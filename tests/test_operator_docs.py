@@ -51,3 +51,18 @@ def test_context_names_transfer_catalog_as_invariant_owner():
     assert "owner of transfer loading invariants" in normalized_context_text
     assert "Build/Runtime Catalog Loading" in context_text
     assert "Reporting Catalog Loading" in context_text
+
+
+def test_readme_documents_execution_context_cron_activation():
+    """README should describe the safe cron activation default."""
+    readme_path = os.path.join(APP_ROOT, "README.md")
+    readme_text = open(readme_path, "r").read()
+    normalized_readme_text = " ".join(readme_text.split())
+
+    assert "`--cron-scope execution-context`" in readme_text
+    assert "same-context staged runtime cron fragments are preserved" in normalized_readme_text
+    assert "`replace-selected`" in readme_text
+    assert "`staged`" in readme_text
+    assert "--exclude-cron-fragment" in readme_text
+    assert "old-runtime.Landing_Zone.cron" in readme_text
+    assert "Missing exclusion filenames are shown in the preview" in normalized_readme_text

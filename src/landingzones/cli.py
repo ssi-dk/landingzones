@@ -200,9 +200,18 @@ def build_cli_parser():
     deploy_cron_parser.add_argument('--runtime-id', action='append', default=None)
     deploy_cron_parser.add_argument(
         '--cron-scope',
-        choices=['selected', 'expected', 'staged'],
+        choices=['execution-context', 'expected', 'replace-selected', 'selected', 'staged'],
         default=None,
-        help='Cron fragment activation scope: selected, expected, or staged',
+        help=(
+            'Cron fragment activation scope: execution-context, expected, '
+            'replace-selected, or staged'
+        ),
+    )
+    deploy_cron_parser.add_argument(
+        '--exclude-cron-fragment',
+        action='append',
+        default=None,
+        help='Exact staged cron filename to omit from active cron; repeatable',
     )
     deploy_cron_parser.add_argument(
         '--confirm-cron-activation',
@@ -344,6 +353,8 @@ def handle_deploy_cron(args, extra_args):
     append_option(argv, '--validation-scripts-dir', args.validation_scripts_dir)
     append_runtime_options(argv, effective_runtime_ids(args))
     append_option(argv, '--cron-scope', args.cron_scope)
+    for filename in args.exclude_cron_fragment or []:
+        append_option(argv, '--exclude-cron-fragment', filename)
     if args.confirm_cron_activation:
         argv.append('--confirm-cron-activation')
     argv.append('--deploy-cron')
