@@ -1928,6 +1928,83 @@ class TestTestWithData:
         shutil.which('rsync') is None,
         reason='rsync is required for local script-test execution',
     )
+    def test_run_test_with_data_blocker_cleanup_preserves_empty_staging_root(
+        self, tmp_path, monkeypatch
+    ):
+        """Blocker cleanup should not churn an empty managed staging root."""
+        (
+            config_file,
+            transfers_file,
+            source_root,
+            _,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        (source_root / 'old_run').mkdir()
+        staging_root = final_root / '.staging'
+        staging_root.mkdir()
+        staging_inode = staging_root.stat().st_ino
+
+        responses = iter(['b', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+
+        assert result is True
+        assert not (source_root / 'old_run').exists()
+        assert staging_root.is_dir()
+        assert staging_root.stat().st_ino == staging_inode
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_blocker_cleanup_removes_stale_staging_root(
+        self, tmp_path, monkeypatch
+    ):
+        """Blocker cleanup should remove stale staging contents before seeding."""
+        (
+            config_file,
+            transfers_file,
+            _,
+            _,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        staging_root = final_root / '.staging'
+        (staging_root / 'stale_run').mkdir(parents=True)
+        stale_inode = staging_root.stat().st_ino
+
+        responses = iter(['b', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+
+        assert result is True
+        assert staging_root.is_dir()
+        assert staging_root.stat().st_ino != stale_inode
+        assert not (staging_root / 'stale_run').exists()
+        assert cdr.list_visible_entries(str(final_root)) == [
+            'flow_one',
+            'flow_two',
+        ]
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
     def test_run_test_with_data_all_cleanup_removes_destination_extras(
         self, tmp_path, monkeypatch
     ):
@@ -1954,6 +2031,42 @@ class TestTestWithData:
         )
 
         assert result is True
+        assert cdr.list_visible_entries(str(final_root)) == ['flow_one', 'flow_two']
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_all_cleanup_removes_empty_staging_root(
+        self, tmp_path, monkeypatch
+    ):
+        """Full cleanup should remove all pre-existing endpoint entries."""
+        (
+            config_file,
+            transfers_file,
+            _,
+            _,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        staging_root = final_root / '.staging'
+        staging_root.mkdir()
+        staging_inode = staging_root.stat().st_ino
+
+        responses = iter(['a', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+
+        assert result is True
+        assert staging_root.is_dir()
+        assert staging_root.stat().st_ino != staging_inode
         assert cdr.list_visible_entries(str(final_root)) == ['flow_one', 'flow_two']
 
     @pytest.mark.skipif(
@@ -1988,6 +2101,76 @@ class TestTestWithData:
 
         assert result is False
         assert "Blocking entries left in place" in captured.out
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_leave_allows_empty_managed_staging(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Leaving only an empty managed staging root in place should allow reruns."""
+        (
+            config_file,
+            transfers_file,
+            _,
+            _,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        (final_root / '.staging').mkdir()
+        responses = iter(['l', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+        captured = capsys.readouterr()
+
+        assert result is True
+        assert "managed: .staging" in captured.out
+        assert cdr.list_visible_entries(str(final_root)) == [
+            'flow_one',
+            'flow_two',
+        ]
+        assert (final_root / '.staging').is_dir()
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_leave_rejects_non_empty_staging(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Leaving stale staging contents in place should fail closed."""
+        (
+            config_file,
+            transfers_file,
+            _,
+            _,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        (final_root / '.staging' / 'stale_run').mkdir(parents=True)
+        responses = iter(['l'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+        captured = capsys.readouterr()
+
+        assert result is False
+        assert "blockers: .staging (non-empty staging root)" in captured.out
+        assert (final_root / '.staging' / 'stale_run').is_dir()
 
     def test_build_run_test_plan_identifies_initial_and_terminal_roots(self, tmp_path):
         """Intermediate destinations should not be treated as initial or terminal."""
@@ -2109,7 +2292,7 @@ class TestTestWithData:
         }
 
     def test_build_test_with_data_existing_state_classifies_blockers(self, tmp_path):
-        """Existing endpoint contents should distinguish blockers from extras."""
+        """Existing endpoint contents should distinguish blockers, extras, and managed state."""
         source_root = tmp_path / 'source_root'
         destination_root = tmp_path / 'destination_root'
         source_root.mkdir()
@@ -2141,16 +2324,149 @@ class TestTestWithData:
             for item in existing_state
         }
 
-        assert state_by_root[str(source_root)]['blockers'] == [
-            '.staging',
-            'old_run',
-        ]
+        assert state_by_root[str(source_root)]['blockers'] == ['old_run']
         assert state_by_root[str(source_root)]['extras'] == ['.cache']
+        assert state_by_root[str(source_root)]['managed_entries'] == ['.staging']
         assert state_by_root[str(destination_root)]['blockers'] == [
-            '.staging',
             'flow_one',
         ]
         assert state_by_root[str(destination_root)]['extras'] == ['archived_run']
+        assert state_by_root[str(destination_root)]['managed_entries'] == [
+            '.staging'
+        ]
+
+    def test_summarize_test_with_data_existing_state_reports_managed_staging(self):
+        """Endpoint summaries should make safe managed staging roots visible."""
+        summary = cdr.summarize_test_with_data_existing_state([
+            {
+                'display': '/tmp/final_root',
+                'blockers': [],
+                'extras': ['archived_run'],
+                'managed_entries': ['.staging'],
+            },
+        ])
+
+        assert "managed: .staging" in summary
+        assert "extras: archived_run" in summary
+
+    def test_build_test_with_data_existing_state_reports_stale_staging_contents(
+        self, tmp_path
+    ):
+        """Non-empty staging roots should remain visible blockers."""
+        destination_root = tmp_path / 'destination_root'
+        destination_root.mkdir()
+        (destination_root / '.staging' / 'stale_run').mkdir(parents=True)
+
+        test_plan = {
+            'all_sources': [],
+            'all_destinations': [
+                {'value': str(destination_root) + '/', 'port': ''},
+            ],
+        }
+
+        existing_state = cdr.build_test_with_data_existing_state(
+            test_plan,
+            ['flow_one'],
+        )
+        summary = cdr.summarize_test_with_data_existing_state(existing_state)
+
+        assert existing_state[0]['blockers'] == ['.staging']
+        assert "blockers: .staging (non-empty staging root)" in summary
+
+    def test_build_test_with_data_existing_state_blocks_staging_file(
+        self, tmp_path
+    ):
+        """A staging path that is not a directory should fail closed."""
+        destination_root = tmp_path / 'destination_root'
+        destination_root.mkdir()
+        (destination_root / '.staging').write_text('not a directory')
+
+        test_plan = {
+            'all_sources': [],
+            'all_destinations': [
+                {'value': str(destination_root) + '/', 'port': ''},
+            ],
+        }
+
+        existing_state = cdr.build_test_with_data_existing_state(
+            test_plan,
+            ['flow_one'],
+        )
+        summary = cdr.summarize_test_with_data_existing_state(existing_state)
+
+        assert existing_state[0]['blockers'] == ['.staging']
+        assert "blockers: .staging (not a usable directory)" in summary
+
+    def test_remote_empty_staging_root_is_managed_state(self, monkeypatch):
+        """Remote empty staging inspection should match local endpoint behavior."""
+        def fake_run_remote_shell(user, host, command, port=''):
+            if '-exec basename' in command:
+                return 0, '.staging\n', ''
+            return 0, 'empty-directory\n', ''
+
+        monkeypatch.setattr(cdr, 'run_remote_shell', fake_run_remote_shell)
+        test_plan = {
+            'all_sources': [],
+            'all_destinations': [
+                {'value': 'runner@example.org:/srv/final/', 'port': '2222'},
+            ],
+        }
+
+        existing_state = cdr.build_test_with_data_existing_state(
+            test_plan,
+            ['flow_one'],
+        )
+
+        assert existing_state[0]['blockers'] == []
+        assert existing_state[0]['managed_entries'] == ['.staging']
+
+    def test_remote_non_empty_staging_root_is_blocking(self, monkeypatch):
+        """Remote stale staging inspection should match local endpoint behavior."""
+        def fake_run_remote_shell(user, host, command, port=''):
+            if '-exec basename' in command:
+                return 0, '.staging\n', ''
+            return 0, 'non-empty-directory\n', ''
+
+        monkeypatch.setattr(cdr, 'run_remote_shell', fake_run_remote_shell)
+        test_plan = {
+            'all_sources': [],
+            'all_destinations': [
+                {'value': 'runner@example.org:/srv/final/', 'port': '2222'},
+            ],
+        }
+
+        existing_state = cdr.build_test_with_data_existing_state(
+            test_plan,
+            ['flow_one'],
+        )
+        summary = cdr.summarize_test_with_data_existing_state(existing_state)
+
+        assert existing_state[0]['blockers'] == ['.staging']
+        assert "blockers: .staging (non-empty staging root)" in summary
+
+    def test_remote_inaccessible_staging_root_is_blocking(self, monkeypatch):
+        """Remote inspection failures should not be treated as safe staging."""
+        def fake_run_remote_shell(user, host, command, port=''):
+            if '-exec basename' in command:
+                return 0, '.staging\n', ''
+            return 1, '', 'permission denied'
+
+        monkeypatch.setattr(cdr, 'run_remote_shell', fake_run_remote_shell)
+        test_plan = {
+            'all_sources': [],
+            'all_destinations': [
+                {'value': 'runner@example.org:/srv/final/', 'port': '2222'},
+            ],
+        }
+
+        existing_state = cdr.build_test_with_data_existing_state(
+            test_plan,
+            ['flow_one'],
+        )
+        summary = cdr.summarize_test_with_data_existing_state(existing_state)
+
+        assert existing_state[0]['blockers'] == ['.staging']
+        assert "blockers: .staging (cannot inspect staging root)" in summary
 
     def test_load_test_with_data_transfers_preserves_env_var_paths(self, tmp_path):
         """test-with-data should keep env-var based paths unchanged."""

@@ -416,6 +416,75 @@ def list_endpoint_entries(endpoint):
     )
 
 
+def inspect_endpoint_staging_state(endpoint):
+    """Classify the endpoint's managed staging root for preflight decisions."""
+    root = get_endpoint_root(endpoint)
+    staging_path = os.path.join(root, '.staging')
+    user, host, _ = parse_remote_destination(endpoint['value'])
+    port = endpoint.get('port', '')
+
+    if host:
+        command = (
+            "p={0}; "
+            "if [ -L \"$p\" ]; then echo non-directory; "
+            "elif [ ! -e \"$p\" ]; then echo absent; "
+            "elif [ ! -d \"$p\" ]; then echo non-directory; "
+            "elif ! listing=$(find \"$p\" -mindepth 1 -maxdepth 1 "
+            "-print -quit 2>/dev/null); then echo inaccessible; "
+            "elif [ -n \"$listing\" ]; then echo non-empty-directory; "
+            "else echo empty-directory; fi"
+        ).format(shell_path(staging_path))
+        rc, stdout, _ = run_remote_shell(user, host, command, port)
+        if rc != 0:
+            return 'inaccessible'
+        state = stdout.strip().splitlines()[-1] if stdout.strip() else ''
+        if state in (
+            'absent',
+            'empty-directory',
+            'non-empty-directory',
+            'non-directory',
+        ):
+            return state
+        return 'inaccessible'
+
+    if os.path.islink(staging_path):
+        return 'non-directory'
+    if not os.path.exists(staging_path):
+        return 'absent'
+    if not os.path.isdir(staging_path):
+        return 'non-directory'
+    try:
+        with os.scandir(staging_path) as entries:
+            if any(True for _ in entries):
+                return 'non-empty-directory'
+    except OSError:
+        return 'inaccessible'
+    return 'empty-directory'
+
+
+def describe_staging_blocker_state(staging_state):
+    """Return an operator-facing reason for a blocking staging root."""
+    if staging_state == 'non-empty-directory':
+        return 'non-empty staging root'
+    if staging_state == 'non-directory':
+        return 'not a usable directory'
+    if staging_state == 'inaccessible':
+        return 'cannot inspect staging root'
+    return 'not usable as managed staging'
+
+
+def format_entries_with_reasons(entry_names, entry_reasons):
+    """Format entry names with optional operator-facing reasons."""
+    formatted = []
+    for entry_name in entry_names:
+        reason = entry_reasons.get(entry_name)
+        if reason:
+            formatted.append("{0} ({1})".format(entry_name, reason))
+        else:
+            formatted.append(entry_name)
+    return ', '.join(formatted)
+
+
 def build_test_with_data_existing_state(test_plan, expected_entry_names):
     """Classify existing endpoint contents before seeding toy data."""
     source_keys = {
@@ -433,11 +502,20 @@ def build_test_with_data_existing_state(test_plan, expected_entry_names):
         endpoint_is_source = endpoint_key(endpoint['value']) in source_keys
         blockers = []
         extras = []
+        managed_entries = []
+        blocker_reasons = {}
         for entry_name in entries:
             is_hidden = entry_name.startswith('.')
             is_expected = entry_name in expected_entry_names
             is_blocker = False
             if entry_name == '.staging':
+                staging_state = inspect_endpoint_staging_state(endpoint)
+                if staging_state == 'empty-directory':
+                    managed_entries.append(entry_name)
+                    continue
+                blocker_reasons[entry_name] = describe_staging_blocker_state(
+                    staging_state
+                )
                 is_blocker = True
             elif endpoint_is_source and not is_hidden:
                 is_blocker = True
@@ -455,7 +533,9 @@ def build_test_with_data_existing_state(test_plan, expected_entry_names):
             'is_source': endpoint_is_source,
             'entries': entries,
             'blockers': blockers,
+            'blocker_reasons': blocker_reasons,
             'extras': extras,
+            'managed_entries': managed_entries,
         })
 
     return endpoint_state
@@ -468,11 +548,20 @@ def summarize_test_with_data_existing_state(existing_state):
         lines.append(item['display'])
         if item['blockers']:
             lines.append(
-                "blockers: {0}".format(', '.join(item['blockers']))
+                "blockers: {0}".format(
+                    format_entries_with_reasons(
+                        item['blockers'],
+                        item.get('blocker_reasons', {}),
+                    )
+                )
             )
         if item['extras']:
             lines.append(
                 "extras: {0}".format(', '.join(item['extras']))
+            )
+        if item.get('managed_entries'):
+            lines.append(
+                "managed: {0}".format(', '.join(item['managed_entries']))
             )
     return '\n'.join(lines)
 

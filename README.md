@@ -401,6 +401,15 @@ What it does:
 - Executes the scripts in transfer order
 - Validates that the seeded top-level directories reached the terminal destinations
 
+Before seeding, integration validation summarizes pre-existing endpoint entries.
+Expected toy-data directories and visible source entries are blockers because a
+new run would mix old and new test data. Unrelated destination leftovers are
+reported as extras. An empty `.staging` directory is reported as managed
+persistent staging state and does not block reruns, because successful Landing
+Zone Runtime transfers preserve that group-writable staging root. A `.staging`
+path still blocks when it is non-empty, not a usable directory, or cannot be
+inspected.
+
 After a successful run it asks whether you want cleanup. Answer `y` to remove the propagated test directories plus generated log and lock artifacts so the next run starts from the initial state. Answer `n` to inspect the final tree and logs.
 
 ## Deployment
