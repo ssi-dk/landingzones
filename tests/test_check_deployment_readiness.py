@@ -110,10 +110,67 @@ class TestCronDeploymentPrompt:
 
         assert result is True
 
-    def test_deploy_cron_defaults_to_selected_runtime_scope(
+    def test_build_cron_activation_plan_classifies_execution_context_fragments(
+        self, tmp_path
+    ):
+        """Execution-context planning should classify mixed staged cron fragments."""
+        staged_dir = tmp_path / "crontab.d"
+        staged_dir.mkdir()
+        selected_name = "local_dev.local.Landing_Zone.cron"
+        preserved_name = "local_prod.local.Landing_Zone.cron"
+        foreign_name = "other.runner.Landing_Zone.cron"
+        unresolved_name = "stale.runner.Landing_Zone.cron"
+        manual_name = "manual-maintenance.cron"
+        backup_name = "manual-maintenance.cron.bak"
+        for filename in [
+            selected_name,
+            preserved_name,
+            foreign_name,
+            unresolved_name,
+            manual_name,
+            backup_name,
+        ]:
+            (staged_dir / filename).write_text("* * * * * {0}\n".format(filename))
+
+        plan = ro.build_cron_activation_plan(
+            'execution-context',
+            ['local_dev.local'],
+            str(staged_dir),
+            'calc',
+            'operator',
+            runtime_contexts={
+                'local_dev.local': {('calc', 'operator')},
+                'local_prod.local': {('calc', 'operator')},
+                'other.runner': {('other', 'operator')},
+            },
+            cron_fragment_exclusions=[
+                manual_name,
+                'missing-runtime.Landing_Zone.cron',
+            ],
+        )
+
+        assert [f['filename'] for f in plan.activated_runtime_fragments] == [
+            selected_name
+        ]
+        assert [f['filename'] for f in plan.preserved_runtime_fragments] == [
+            preserved_name
+        ]
+        assert [f['filename'] for f in plan.foreign_runtime_fragments] == [
+            foreign_name
+        ]
+        assert [f['filename'] for f in plan.unresolved_runtime_fragments] == [
+            unresolved_name
+        ]
+        assert [f['filename'] for f in plan.applied_exclusions] == [manual_name]
+        assert [f['filename'] for f in plan.missing_exclusions] == [
+            'missing-runtime.Landing_Zone.cron'
+        ]
+        assert all(backup_name not in path for path in plan.active_files)
+
+    def test_deploy_cron_defaults_to_execution_context_scope(
         self, tmp_path, monkeypatch, capsys
     ):
-        """Default cron activation should activate selected runtimes and preserve unidentified crons."""
+        """Default cron activation should preserve same-context runtime crons."""
         home_dir = tmp_path / "home"
         staged_dir = home_dir / "crontab.d"
         generated_dir = tmp_path / "output" / "crontab.d"
@@ -121,10 +178,14 @@ class TestCronDeploymentPrompt:
         generated_dir.mkdir(parents=True)
 
         selected_name = "local_dev.local.Landing_Zone.cron"
-        excluded_name = "other.local.Landing_Zone.cron"
+        preserved_name = "local_prod.local.Landing_Zone.cron"
+        foreign_name = "other.runner.Landing_Zone.cron"
+        unresolved_name = "stale.runner.Landing_Zone.cron"
         unidentified_name = "manual-maintenance.cron"
         (generated_dir / selected_name).write_text("* * * * * selected-runtime\n")
-        (staged_dir / excluded_name).write_text("* * * * * excluded-runtime\n")
+        (staged_dir / preserved_name).write_text("* * * * * preserved-runtime\n")
+        (staged_dir / foreign_name).write_text("* * * * * foreign-runtime\n")
+        (staged_dir / unresolved_name).write_text("* * * * * unresolved-runtime\n")
         (staged_dir / unidentified_name).write_text("* * * * * manual-maintenance\n")
         config_file = tmp_path / "config.yaml"
         config_file.write_text("crontab_dir: {0}\n".format(generated_dir))
@@ -156,6 +217,27 @@ class TestCronDeploymentPrompt:
         responses = iter(['y'])
         monkeypatch.setenv('HOME', str(home_dir))
         monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'local_prod.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'other.runner',
+                    'system': 'other',
+                    'users': 'runner',
+                },
+            ]),
+        )
         monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
         monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: True, raising=False)
         monkeypatch.setattr(
@@ -194,10 +276,207 @@ class TestCronDeploymentPrompt:
 
         assert result is True
         assert "selected-runtime" in activated['content']
+        assert "preserved-runtime" in activated['content']
         assert "manual-maintenance" in activated['content']
-        assert "excluded-runtime" not in activated['content']
-        assert excluded_name in captured.out
+        assert "foreign-runtime" not in activated['content']
+        assert "unresolved-runtime" not in activated['content']
+        assert preserved_name in captured.out
+        assert foreign_name in captured.out
+        assert unresolved_name in captured.out
+        assert "Preserved runtime cron fragments" in captured.out
         assert "Excluded runtime cron fragments" in captured.out
+
+    def test_deploy_cron_replace_selected_excludes_same_context_runtime(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """replace-selected should retain the old selected-runtime replacement behavior."""
+        home_dir = tmp_path / "home"
+        staged_dir = home_dir / "crontab.d"
+        generated_dir = tmp_path / "output" / "crontab.d"
+        staged_dir.mkdir(parents=True)
+        generated_dir.mkdir(parents=True)
+
+        selected_name = "local_dev.local.Landing_Zone.cron"
+        nonselected_name = "local_prod.local.Landing_Zone.cron"
+        manual_name = "manual-maintenance.cron"
+        (generated_dir / selected_name).write_text("* * * * * selected-runtime\n")
+        (staged_dir / nonselected_name).write_text("* * * * * nonselected-runtime\n")
+        (staged_dir / manual_name).write_text("* * * * * manual-maintenance\n")
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("crontab_dir: {0}\n".format(generated_dir))
+        activated = {}
+
+        class DummyProcess:
+            def __init__(self, args, stdout=None, stderr=None, stdin=None):
+                self.args = args
+                self.returncode = 0
+
+            def communicate(self, input=None):
+                if self.args == ['crontab', '-']:
+                    activated['content'] = input.decode('utf-8')
+                    return b'', b''
+                if self.args == ['crontab', '-l']:
+                    return activated.get('content', '').encode('utf-8'), b''
+                return b'', b''
+
+        snapshot = cdr.config.snapshot_state()
+        monkeypatch.setenv('HOME', str(home_dir))
+        monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'local_prod.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+            ]),
+        )
+        monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
+        monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: False, raising=False)
+        monkeypatch.setattr(
+            cdr,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                }
+            ]),
+        )
+        monkeypatch.setattr(
+            cdr,
+            'get_current_system',
+            lambda transfers_df=None, runtime_ids=None: 'local_dev',
+        )
+        monkeypatch.setattr(
+            cdr,
+            'get_current_user',
+            lambda transfers_df=None, runtime_ids=None: 'local',
+        )
+
+        try:
+            result = cdr.main([
+                '--config', str(config_file),
+                '--runtime-id', 'local_dev.local',
+                '--deploy-cron',
+                '--cron-scope', 'replace-selected',
+                '--confirm-cron-activation',
+            ])
+        finally:
+            cdr.config.restore_state(snapshot)
+
+        captured = capsys.readouterr()
+
+        assert result is True
+        assert "selected-runtime" in activated['content']
+        assert "manual-maintenance" in activated['content']
+        assert "nonselected-runtime" not in activated['content']
+        assert "Replacement cron activation" in captured.out
+        assert nonselected_name in captured.out
+
+    def test_deploy_cron_combines_config_and_cli_exact_exclusions(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Exact cron exclusions should combine config and CLI values."""
+        home_dir = tmp_path / "home"
+        staged_dir = home_dir / "crontab.d"
+        generated_dir = tmp_path / "output" / "crontab.d"
+        staged_dir.mkdir(parents=True)
+        generated_dir.mkdir(parents=True)
+
+        selected_name = "local_dev.local.Landing_Zone.cron"
+        manual_name = "manual-maintenance.cron"
+        missing_name = "missing-maintenance.cron"
+        (generated_dir / selected_name).write_text("* * * * * selected-runtime\n")
+        (staged_dir / manual_name).write_text("* * * * * manual-maintenance\n")
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "crontab_dir: {0}\ncron_fragment_exclusions:\n  - {1}\n".format(
+                generated_dir,
+                manual_name,
+            )
+        )
+        activated = {}
+
+        class DummyProcess:
+            def __init__(self, args, stdout=None, stderr=None, stdin=None):
+                self.args = args
+                self.returncode = 0
+
+            def communicate(self, input=None):
+                if self.args == ['crontab', '-']:
+                    activated['content'] = input.decode('utf-8')
+                    return b'', b''
+                if self.args == ['crontab', '-l']:
+                    return activated.get('content', '').encode('utf-8'), b''
+                return b'', b''
+
+        snapshot = cdr.config.snapshot_state()
+        monkeypatch.setenv('HOME', str(home_dir))
+        monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                }
+            ]),
+        )
+        monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
+        monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: False, raising=False)
+        monkeypatch.setattr(
+            cdr,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                }
+            ]),
+        )
+        monkeypatch.setattr(
+            cdr,
+            'get_current_system',
+            lambda transfers_df=None, runtime_ids=None: 'local_dev',
+        )
+        monkeypatch.setattr(
+            cdr,
+            'get_current_user',
+            lambda transfers_df=None, runtime_ids=None: 'local',
+        )
+
+        try:
+            result = cdr.main([
+                '--config', str(config_file),
+                '--runtime-id', 'local_dev.local',
+                '--deploy-cron',
+                '--exclude-cron-fragment', missing_name,
+                '--confirm-cron-activation',
+            ])
+        finally:
+            cdr.config.restore_state(snapshot)
+
+        captured = capsys.readouterr()
+
+        assert result is True
+        assert "selected-runtime" in activated['content']
+        assert "manual-maintenance" not in activated['content']
+        assert manual_name in captured.out
+        assert missing_name in captured.out
+        assert "Applied cron fragment exclusions" in captured.out
+        assert "Missing cron fragment exclusions" in captured.out
 
     def test_deploy_cron_confirm_option_allows_noninteractive_activation(
         self, tmp_path, monkeypatch
@@ -231,6 +510,27 @@ class TestCronDeploymentPrompt:
         snapshot = cdr.config.snapshot_state()
         monkeypatch.setenv('HOME', str(home_dir))
         monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'server2.runner',
+                    'system': 'server2',
+                    'users': 'runner',
+                },
+                {
+                    'runtime_id': 'other.local',
+                    'system': 'other',
+                    'users': 'local',
+                },
+            ]),
+        )
         monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
         monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: False, raising=False)
         monkeypatch.setattr(
@@ -314,6 +614,27 @@ class TestCronDeploymentPrompt:
         snapshot = cdr.config.snapshot_state()
         monkeypatch.setenv('HOME', str(home_dir))
         monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'server2.runner',
+                    'system': 'server2',
+                    'users': 'runner',
+                },
+                {
+                    'runtime_id': 'other.local',
+                    'system': 'other',
+                    'users': 'local',
+                },
+            ]),
+        )
         monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
         monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: False, raising=False)
         monkeypatch.setattr(
@@ -353,11 +674,12 @@ class TestCronDeploymentPrompt:
 
         assert result is True
         assert "first-expected" in activated['content']
-        assert "second-expected" in activated['content']
+        assert "second-expected" not in activated['content']
         assert "manual-maintenance" in activated['content']
         assert "excluded-runtime" not in activated['content']
         assert "Cron activation scope" in captured.out
         assert "expected" in captured.out
+        assert second_name in captured.out
         assert excluded_name in captured.out
 
     def test_deploy_cron_expected_scope_prompts_to_repair_missing_staged_cron(
@@ -403,6 +725,22 @@ class TestCronDeploymentPrompt:
         snapshot = cdr.config.snapshot_state()
         monkeypatch.setenv('HOME', str(home_dir))
         monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'server2.runner',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+            ]),
+        )
         monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
         monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: True, raising=False)
         monkeypatch.setattr(cdr, 'ask_yes_no', confirm)
@@ -479,6 +817,22 @@ class TestCronDeploymentPrompt:
         snapshot = cdr.config.snapshot_state()
         monkeypatch.setenv('HOME', str(home_dir))
         monkeypatch.setattr(ro, 'generate_cron_files', lambda runtime_ids=None: (True, "generated"))
+        monkeypatch.setattr(
+            ro,
+            'load_runtime_transfers',
+            lambda transfers_file=None, runtime_ids=None: pd.DataFrame([
+                {
+                    'runtime_id': 'local_dev.local',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+                {
+                    'runtime_id': 'server2.runner',
+                    'system': 'local_dev',
+                    'users': 'local',
+                },
+            ]),
+        )
         monkeypatch.setattr(ro.subprocess, 'Popen', DummyProcess)
         monkeypatch.setattr(ro, 'is_interactive_terminal', lambda: False, raising=False)
         monkeypatch.setattr(
@@ -714,7 +1068,7 @@ class TestCronDeploymentPrompt:
 
         assert result is False
         assert 'content' not in activated
-        assert "scope 'selected'" in captured.out
+        assert "scope 'execution-context'" in captured.out
         assert "--confirm-cron-activation" in captured.out
 
 
@@ -1574,6 +1928,83 @@ class TestTestWithData:
         shutil.which('rsync') is None,
         reason='rsync is required for local script-test execution',
     )
+    def test_run_test_with_data_blocker_cleanup_preserves_empty_staging_root(
+        self, tmp_path, monkeypatch
+    ):
+        """Blocker cleanup should not churn an empty managed staging root."""
+        (
+            config_file,
+            transfers_file,
+            source_root,
+            _,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        (source_root / 'old_run').mkdir()
+        staging_root = final_root / '.staging'
+        staging_root.mkdir()
+        staging_inode = staging_root.stat().st_ino
+
+        responses = iter(['b', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+
+        assert result is True
+        assert not (source_root / 'old_run').exists()
+        assert staging_root.is_dir()
+        assert staging_root.stat().st_ino == staging_inode
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_blocker_cleanup_removes_stale_staging_root(
+        self, tmp_path, monkeypatch
+    ):
+        """Blocker cleanup should remove stale staging contents before seeding."""
+        (
+            config_file,
+            transfers_file,
+            _,
+            _,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        staging_root = final_root / '.staging'
+        (staging_root / 'stale_run').mkdir(parents=True)
+        stale_inode = staging_root.stat().st_ino
+
+        responses = iter(['b', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+
+        assert result is True
+        assert staging_root.is_dir()
+        assert staging_root.stat().st_ino != stale_inode
+        assert not (staging_root / 'stale_run').exists()
+        assert cdr.list_visible_entries(str(final_root)) == [
+            'flow_one',
+            'flow_two',
+        ]
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
     def test_run_test_with_data_all_cleanup_removes_destination_extras(
         self, tmp_path, monkeypatch
     ):
@@ -1600,6 +2031,42 @@ class TestTestWithData:
         )
 
         assert result is True
+        assert cdr.list_visible_entries(str(final_root)) == ['flow_one', 'flow_two']
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_all_cleanup_removes_empty_staging_root(
+        self, tmp_path, monkeypatch
+    ):
+        """Full cleanup should remove all pre-existing endpoint entries."""
+        (
+            config_file,
+            transfers_file,
+            _,
+            _,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        staging_root = final_root / '.staging'
+        staging_root.mkdir()
+        staging_inode = staging_root.stat().st_ino
+
+        responses = iter(['a', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+
+        assert result is True
+        assert staging_root.is_dir()
+        assert staging_root.stat().st_ino != staging_inode
         assert cdr.list_visible_entries(str(final_root)) == ['flow_one', 'flow_two']
 
     @pytest.mark.skipif(
@@ -1634,6 +2101,76 @@ class TestTestWithData:
 
         assert result is False
         assert "Blocking entries left in place" in captured.out
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_leave_allows_empty_managed_staging(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Leaving only an empty managed staging root in place should allow reruns."""
+        (
+            config_file,
+            transfers_file,
+            _,
+            _,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        (final_root / '.staging').mkdir()
+        responses = iter(['l', 'n'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+        captured = capsys.readouterr()
+
+        assert result is True
+        assert "managed: .staging" in captured.out
+        assert cdr.list_visible_entries(str(final_root)) == [
+            'flow_one',
+            'flow_two',
+        ]
+        assert (final_root / '.staging').is_dir()
+
+    @pytest.mark.skipif(
+        shutil.which('rsync') is None,
+        reason='rsync is required for local script-test execution',
+    )
+    def test_run_test_with_data_leave_rejects_non_empty_staging(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Leaving stale staging contents in place should fail closed."""
+        (
+            config_file,
+            transfers_file,
+            _,
+            _,
+            final_root,
+            _,
+        ) = self._write_test_with_data_fixture(tmp_path)
+        monkeypatch.setattr(cdr, 'get_current_system', lambda: 'testbox')
+        monkeypatch.setattr(cdr, 'get_current_user', lambda: 'runner')
+
+        (final_root / '.staging' / 'stale_run').mkdir(parents=True)
+        responses = iter(['l'])
+        monkeypatch.setattr('builtins.input', lambda: next(responses))
+
+        result = cdr.run_test_with_data(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+        )
+        captured = capsys.readouterr()
+
+        assert result is False
+        assert "blockers: .staging (non-empty staging root)" in captured.out
+        assert (final_root / '.staging' / 'stale_run').is_dir()
 
     def test_build_run_test_plan_identifies_initial_and_terminal_roots(self, tmp_path):
         """Intermediate destinations should not be treated as initial or terminal."""
@@ -1755,7 +2292,7 @@ class TestTestWithData:
         }
 
     def test_build_test_with_data_existing_state_classifies_blockers(self, tmp_path):
-        """Existing endpoint contents should distinguish blockers from extras."""
+        """Existing endpoint contents should distinguish blockers, extras, and managed state."""
         source_root = tmp_path / 'source_root'
         destination_root = tmp_path / 'destination_root'
         source_root.mkdir()
@@ -1787,16 +2324,149 @@ class TestTestWithData:
             for item in existing_state
         }
 
-        assert state_by_root[str(source_root)]['blockers'] == [
-            '.staging',
-            'old_run',
-        ]
+        assert state_by_root[str(source_root)]['blockers'] == ['old_run']
         assert state_by_root[str(source_root)]['extras'] == ['.cache']
+        assert state_by_root[str(source_root)]['managed_entries'] == ['.staging']
         assert state_by_root[str(destination_root)]['blockers'] == [
-            '.staging',
             'flow_one',
         ]
         assert state_by_root[str(destination_root)]['extras'] == ['archived_run']
+        assert state_by_root[str(destination_root)]['managed_entries'] == [
+            '.staging'
+        ]
+
+    def test_summarize_test_with_data_existing_state_reports_managed_staging(self):
+        """Endpoint summaries should make safe managed staging roots visible."""
+        summary = cdr.summarize_test_with_data_existing_state([
+            {
+                'display': '/tmp/final_root',
+                'blockers': [],
+                'extras': ['archived_run'],
+                'managed_entries': ['.staging'],
+            },
+        ])
+
+        assert "managed: .staging" in summary
+        assert "extras: archived_run" in summary
+
+    def test_build_test_with_data_existing_state_reports_stale_staging_contents(
+        self, tmp_path
+    ):
+        """Non-empty staging roots should remain visible blockers."""
+        destination_root = tmp_path / 'destination_root'
+        destination_root.mkdir()
+        (destination_root / '.staging' / 'stale_run').mkdir(parents=True)
+
+        test_plan = {
+            'all_sources': [],
+            'all_destinations': [
+                {'value': str(destination_root) + '/', 'port': ''},
+            ],
+        }
+
+        existing_state = cdr.build_test_with_data_existing_state(
+            test_plan,
+            ['flow_one'],
+        )
+        summary = cdr.summarize_test_with_data_existing_state(existing_state)
+
+        assert existing_state[0]['blockers'] == ['.staging']
+        assert "blockers: .staging (non-empty staging root)" in summary
+
+    def test_build_test_with_data_existing_state_blocks_staging_file(
+        self, tmp_path
+    ):
+        """A staging path that is not a directory should fail closed."""
+        destination_root = tmp_path / 'destination_root'
+        destination_root.mkdir()
+        (destination_root / '.staging').write_text('not a directory')
+
+        test_plan = {
+            'all_sources': [],
+            'all_destinations': [
+                {'value': str(destination_root) + '/', 'port': ''},
+            ],
+        }
+
+        existing_state = cdr.build_test_with_data_existing_state(
+            test_plan,
+            ['flow_one'],
+        )
+        summary = cdr.summarize_test_with_data_existing_state(existing_state)
+
+        assert existing_state[0]['blockers'] == ['.staging']
+        assert "blockers: .staging (not a usable directory)" in summary
+
+    def test_remote_empty_staging_root_is_managed_state(self, monkeypatch):
+        """Remote empty staging inspection should match local endpoint behavior."""
+        def fake_run_remote_shell(user, host, command, port=''):
+            if '-exec basename' in command:
+                return 0, '.staging\n', ''
+            return 0, 'empty-directory\n', ''
+
+        monkeypatch.setattr(cdr, 'run_remote_shell', fake_run_remote_shell)
+        test_plan = {
+            'all_sources': [],
+            'all_destinations': [
+                {'value': 'runner@example.org:/srv/final/', 'port': '2222'},
+            ],
+        }
+
+        existing_state = cdr.build_test_with_data_existing_state(
+            test_plan,
+            ['flow_one'],
+        )
+
+        assert existing_state[0]['blockers'] == []
+        assert existing_state[0]['managed_entries'] == ['.staging']
+
+    def test_remote_non_empty_staging_root_is_blocking(self, monkeypatch):
+        """Remote stale staging inspection should match local endpoint behavior."""
+        def fake_run_remote_shell(user, host, command, port=''):
+            if '-exec basename' in command:
+                return 0, '.staging\n', ''
+            return 0, 'non-empty-directory\n', ''
+
+        monkeypatch.setattr(cdr, 'run_remote_shell', fake_run_remote_shell)
+        test_plan = {
+            'all_sources': [],
+            'all_destinations': [
+                {'value': 'runner@example.org:/srv/final/', 'port': '2222'},
+            ],
+        }
+
+        existing_state = cdr.build_test_with_data_existing_state(
+            test_plan,
+            ['flow_one'],
+        )
+        summary = cdr.summarize_test_with_data_existing_state(existing_state)
+
+        assert existing_state[0]['blockers'] == ['.staging']
+        assert "blockers: .staging (non-empty staging root)" in summary
+
+    def test_remote_inaccessible_staging_root_is_blocking(self, monkeypatch):
+        """Remote inspection failures should not be treated as safe staging."""
+        def fake_run_remote_shell(user, host, command, port=''):
+            if '-exec basename' in command:
+                return 0, '.staging\n', ''
+            return 1, '', 'permission denied'
+
+        monkeypatch.setattr(cdr, 'run_remote_shell', fake_run_remote_shell)
+        test_plan = {
+            'all_sources': [],
+            'all_destinations': [
+                {'value': 'runner@example.org:/srv/final/', 'port': '2222'},
+            ],
+        }
+
+        existing_state = cdr.build_test_with_data_existing_state(
+            test_plan,
+            ['flow_one'],
+        )
+        summary = cdr.summarize_test_with_data_existing_state(existing_state)
+
+        assert existing_state[0]['blockers'] == ['.staging']
+        assert "blockers: .staging (cannot inspect staging root)" in summary
 
     def test_load_test_with_data_transfers_preserves_env_var_paths(self, tmp_path):
         """test-with-data should keep env-var based paths unchanged."""

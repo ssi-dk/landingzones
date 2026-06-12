@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """Shared readiness, preflight, and deployment helpers."""
 
+from dataclasses import dataclass
 import errno
 from io import StringIO
 import os
@@ -573,16 +574,207 @@ def print_cron_fragment_list(title, fragments, status="INFO"):
     print_status(title, status, details)
 
 
-def print_cron_activation_preview(
+@dataclass
+class CronActivationPlan:
+    """Operator-visible cron fragment activation buckets."""
+
+    cron_scope: str
+    active_files: list
+    activated_runtime_fragments: list
+    preserved_runtime_fragments: list
+    preserved_unidentified_fragments: list
+    foreign_runtime_fragments: list
+    unresolved_runtime_fragments: list
+    excluded_runtime_fragments: list
+    applied_exclusions: list
+    missing_exclusions: list
+
+
+def normalize_cron_scope(cron_scope):
+    """Return the canonical cron scope name."""
+    if cron_scope == 'selected':
+        return 'replace-selected'
+    return cron_scope or 'execution-context'
+
+
+def normalize_cron_fragment_exclusions(values):
+    """Normalize exact staged cron filename exclusions."""
+    normalized = []
+    for value in values or []:
+        text = str(value).strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def runtime_context_map_from_transfers(transfers_df):
+    """Map runtime_id values to the execution contexts in the Transfer Catalog."""
+    contexts = {}
+    if transfers_df is None:
+        return contexts
+    for _, row in transfers_df.iterrows():
+        runtime_id = str(row.get('runtime_id', '') or '').strip()
+        system = str(row.get('system', '') or '').strip()
+        user = str(row.get('users', '') or '').strip()
+        if not runtime_id:
+            continue
+        contexts.setdefault(runtime_id, set()).add((system, user))
+    return contexts
+
+
+def load_runtime_context_map():
+    """Load Transfer Catalog runtime contexts for cron activation planning."""
+    try:
+        transfers_df = load_runtime_transfers(transfers_file=config.transfers_file)
+    except Exception as exc:
+        print_status(
+            "Transfer Catalog",
+            "WARN",
+            "Cannot classify staged runtime cron fragments: {0}".format(exc),
+        )
+        return {}
+    return runtime_context_map_from_transfers(transfers_df)
+
+
+def fragment_matches_execution_context(fragment, runtime_contexts, system, user):
+    """Return whether a runtime fragment belongs to the current Execution Context."""
+    contexts = runtime_contexts.get(fragment['runtime_id'])
+    if not contexts:
+        return False
+    return (str(system), str(user)) in contexts
+
+
+def build_cron_activation_plan(
     cron_scope,
-    activated_runtime_fragments,
-    preserved_unidentified_fragments,
-    excluded_runtime_fragments,
+    runtime_ids,
+    crontab_dir,
+    current_system,
+    current_user,
+    runtime_contexts=None,
+    cron_fragment_exclusions=None,
+):
+    """Compute a Cron Activation Plan without writing the active crontab."""
+    canonical_scope = normalize_cron_scope(cron_scope)
+    cron_files = staged_cron_fragments(crontab_dir)
+    identified, unidentified = classify_cron_fragments(cron_files)
+    selected_runtime_ids = set(runtime_ids or [])
+    runtime_contexts = runtime_contexts or {}
+    exclusion_names = normalize_cron_fragment_exclusions(cron_fragment_exclusions)
+    staged_by_name = {
+        os.path.basename(path): path
+        for path in cron_files
+    }
+    missing_exclusions = [
+        {'filename': filename}
+        for filename in exclusion_names
+        if filename not in staged_by_name
+    ]
+
+    active_fragments = []
+    activated_runtime = []
+    preserved_runtime = []
+    preserved_unidentified = []
+    foreign_runtime = []
+    unresolved_runtime = []
+    excluded_runtime = []
+    applied_exclusions = []
+
+    def is_excluded(fragment):
+        if fragment['filename'] not in exclusion_names:
+            return False
+        applied_exclusions.append(fragment)
+        return True
+
+    if canonical_scope == 'staged':
+        for fragment in identified + unidentified:
+            if is_excluded(fragment):
+                if 'runtime_id' in fragment:
+                    excluded_runtime.append(fragment)
+                continue
+            active_fragments.append(fragment)
+            if 'runtime_id' in fragment:
+                activated_runtime.append(fragment)
+            else:
+                preserved_unidentified.append(fragment)
+    elif canonical_scope in ('replace-selected', 'expected', 'execution-context'):
+        for fragment in identified:
+            if is_excluded(fragment):
+                excluded_runtime.append(fragment)
+                continue
+            runtime_id = fragment['runtime_id']
+            if runtime_id in selected_runtime_ids:
+                if canonical_scope == 'expected':
+                    if fragment_matches_execution_context(
+                        fragment,
+                        runtime_contexts,
+                        current_system,
+                        current_user,
+                    ):
+                        activated_runtime.append(fragment)
+                        active_fragments.append(fragment)
+                    elif runtime_id in runtime_contexts:
+                        foreign_runtime.append(fragment)
+                        excluded_runtime.append(fragment)
+                    else:
+                        unresolved_runtime.append(fragment)
+                        excluded_runtime.append(fragment)
+                    continue
+                activated_runtime.append(fragment)
+                active_fragments.append(fragment)
+                continue
+            if canonical_scope == 'replace-selected':
+                excluded_runtime.append(fragment)
+                continue
+            if fragment_matches_execution_context(
+                fragment,
+                runtime_contexts,
+                current_system,
+                current_user,
+            ):
+                preserved_runtime.append(fragment)
+                active_fragments.append(fragment)
+            elif runtime_id in runtime_contexts:
+                foreign_runtime.append(fragment)
+                excluded_runtime.append(fragment)
+            else:
+                unresolved_runtime.append(fragment)
+                excluded_runtime.append(fragment)
+
+        for fragment in unidentified:
+            if is_excluded(fragment):
+                continue
+            preserved_unidentified.append(fragment)
+            active_fragments.append(fragment)
+    else:
+        raise ValueError("Unsupported cron scope: {0}".format(cron_scope))
+
+    return CronActivationPlan(
+        cron_scope=canonical_scope,
+        active_files=[fragment['path'] for fragment in active_fragments],
+        activated_runtime_fragments=activated_runtime,
+        preserved_runtime_fragments=preserved_runtime,
+        preserved_unidentified_fragments=preserved_unidentified,
+        foreign_runtime_fragments=foreign_runtime,
+        unresolved_runtime_fragments=unresolved_runtime,
+        excluded_runtime_fragments=excluded_runtime,
+        applied_exclusions=applied_exclusions,
+        missing_exclusions=missing_exclusions,
+    )
+
+
+def print_cron_activation_preview(
+    plan,
 ):
     """Show the operator exactly which staged cron fragments will be activated."""
     print_header("Cron Activation Preview")
-    print_status("Cron activation scope", "INFO", cron_scope)
-    if cron_scope == 'staged':
+    print_status("Cron activation scope", "INFO", plan.cron_scope)
+    if plan.cron_scope == 'replace-selected':
+        print_status(
+            "Replacement cron activation",
+            "WARN",
+            "Non-selected runtime cron fragments will be excluded.",
+        )
+    if plan.cron_scope == 'staged':
         print_status(
             "Staged cron activation",
             "WARN",
@@ -590,16 +782,38 @@ def print_cron_activation_preview(
         )
     print_cron_fragment_list(
         "Activated runtime fragments",
-        activated_runtime_fragments,
-        "OK" if activated_runtime_fragments else "WARN",
+        plan.activated_runtime_fragments,
+        "OK" if plan.activated_runtime_fragments else "WARN",
+    )
+    print_cron_fragment_list(
+        "Preserved runtime cron fragments",
+        plan.preserved_runtime_fragments,
     )
     print_cron_fragment_list(
         "Preserved Unidentified Cron Fragments",
-        preserved_unidentified_fragments,
+        plan.preserved_unidentified_fragments,
+    )
+    print_cron_fragment_list(
+        "Foreign runtime cron fragments",
+        plan.foreign_runtime_fragments,
+    )
+    print_cron_fragment_list(
+        "Unresolved runtime cron fragments",
+        plan.unresolved_runtime_fragments,
+        "WARN" if plan.unresolved_runtime_fragments else "INFO",
     )
     print_cron_fragment_list(
         "Excluded runtime cron fragments",
-        excluded_runtime_fragments,
+        plan.excluded_runtime_fragments,
+    )
+    print_cron_fragment_list(
+        "Applied cron fragment exclusions",
+        plan.applied_exclusions,
+    )
+    print_cron_fragment_list(
+        "Missing cron fragment exclusions",
+        plan.missing_exclusions,
+        "WARN" if plan.missing_exclusions else "INFO",
     )
 
 
@@ -792,31 +1006,27 @@ def resolve_expected_runtime_ids():
 
 def select_cron_fragments_for_activation(cron_scope, runtime_ids, crontab_dir):
     """Select staged cron fragments according to the requested activation scope."""
-    cron_files = staged_cron_fragments(crontab_dir)
-    identified, unidentified = classify_cron_fragments(cron_files)
-    runtime_id_set = set(runtime_ids or [])
-    if cron_scope in ('selected', 'expected'):
-        activated_runtime = [
-            fragment for fragment in identified
-            if fragment['runtime_id'] in runtime_id_set
-        ]
-        excluded_runtime = [
-            fragment for fragment in identified
-            if fragment['runtime_id'] not in runtime_id_set
-        ]
-        active_files = [
-            fragment['path']
-            for fragment in activated_runtime + unidentified
-        ]
-        return active_files, activated_runtime, unidentified, excluded_runtime
-    return cron_files, identified, unidentified, []
+    plan = build_cron_activation_plan(
+        cron_scope,
+        runtime_ids,
+        crontab_dir,
+        current_system='',
+        current_user='',
+    )
+    return (
+        plan.active_files,
+        plan.activated_runtime_fragments,
+        plan.preserved_unidentified_fragments,
+        plan.excluded_runtime_fragments,
+    )
 
 
 def deploy_cron_files(
     current_system,
     current_user=None,
     runtime_ids=None,
-    cron_scope='selected',
+    cron_scope='execution-context',
+    cron_fragment_exclusions=None,
     confirm_activation=False,
     prompt_confirmation=None,
 ):
@@ -826,6 +1036,18 @@ def deploy_cron_files(
     runtime_ids = normalize_runtime_id_args(runtime_ids)
     if current_user is None:
         current_user = os.environ.get('USER', os.environ.get('USERNAME', ''))
+    requested_cron_scope = cron_scope
+    cron_scope = normalize_cron_scope(cron_scope)
+    if requested_cron_scope == 'selected':
+        print_status(
+            "Cron activation scope",
+            "WARN",
+            "`selected` is deprecated; use `replace-selected` for replacement behavior.",
+        )
+    cron_fragment_exclusions = normalize_cron_fragment_exclusions(
+        config.cron_fragment_exclusions
+        + normalize_cron_fragment_exclusions(cron_fragment_exclusions)
+    )
 
     print_header("Automatic Cron Deployment")
     print_status("Deploying for", "INFO", "{0}@{1}".format(current_user, current_system))
@@ -847,8 +1069,8 @@ def deploy_cron_files(
         print_status("Cron file generation", "OK", gen_msg)
 
     crontab_dir = staged_crontab_directory()
-    if cron_scope in ('selected', 'expected') and not runtime_ids:
-        scope_label = "selected" if cron_scope == 'selected' else "expected"
+    if cron_scope in ('replace-selected', 'expected') and not runtime_ids:
+        scope_label = "replace-selected" if cron_scope == 'replace-selected' else "expected"
         print_status(
             "Cron file discovery",
             "ERROR",
@@ -877,22 +1099,24 @@ def deploy_cron_files(
         )
         return False
 
-    active_files, activated_runtime, unidentified, excluded_runtime = (
-        select_cron_fragments_for_activation(cron_scope, runtime_ids, crontab_dir)
+    runtime_contexts = load_runtime_context_map()
+    plan = build_cron_activation_plan(
+        cron_scope,
+        runtime_ids,
+        crontab_dir,
+        current_system,
+        current_user,
+        runtime_contexts=runtime_contexts,
+        cron_fragment_exclusions=cron_fragment_exclusions,
     )
-    if not active_files:
+    if not plan.active_files:
         print_status(
             "Cron file discovery",
             "ERROR",
             "No staged cron fragments selected for activation.",
         )
         return False
-    print_cron_activation_preview(
-        cron_scope,
-        activated_runtime,
-        unidentified,
-        excluded_runtime,
-    )
+    print_cron_activation_preview(plan)
     if not cron_activation_confirmed(
         cron_scope,
         confirm_activation=confirm_activation,
@@ -906,7 +1130,7 @@ def deploy_cron_files(
         return False
 
     try:
-        return activate_cron_fragments(active_files)
+        return activate_cron_fragments(plan.active_files)
     except Exception as exc:
         print_status("Crontab activation", "ERROR", "Error: {0}".format(str(exc)))
         return False

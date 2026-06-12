@@ -401,6 +401,15 @@ What it does:
 - Executes the scripts in transfer order
 - Validates that the seeded top-level directories reached the terminal destinations
 
+Before seeding, integration validation summarizes pre-existing endpoint entries.
+Expected toy-data directories and visible source entries are blockers because a
+new run would mix old and new test data. Unrelated destination leftovers are
+reported as extras. An empty `.staging` directory is reported as managed
+persistent staging state and does not block reruns, because successful Landing
+Zone Runtime transfers preserve that group-writable staging root. A `.staging`
+path still blocks when it is non-empty, not a usable directory, or cannot be
+inspected.
+
 After a successful run it asks whether you want cleanup. Answer `y` to remove the propagated test directories plus generated log and lock artifacts so the next run starts from the initial state. Answer `n` to inspect the final tree and logs.
 
 ## Deployment
@@ -415,8 +424,45 @@ After a successful run it asks whether you want cleanup. Answer `y` to remove th
 
 Or use automated deployment:
 ```bash
-landingzones validate deployment
+landingzones deploy cron
 ```
+
+`landingzones deploy cron` defaults to `--cron-scope execution-context`. This
+scope replaces the active crontab with a previewed **Cron Activation Plan** for
+the current system/user **Execution Context**: selected runtime cron fragments
+are activated, same-context staged runtime cron fragments are preserved,
+unidentified staged `.cron` files are preserved, and foreign or unresolved
+runtime fragments are excluded unless you choose a broader scope.
+
+Cron scopes:
+
+- `execution-context`: safe default for shared managed hosts.
+- `expected`: uses Generated Runtime Metadata, while staying bounded by the
+  current Execution Context.
+- `replace-selected`: activates only the selected Runtime Selection plus
+  unidentified staged `.cron` files; this is the explicit replacement path for
+  older selected-runtime behavior.
+- `staged`: activates every staged `*.cron` file after preview.
+
+Exact staged filenames can be omitted with repeated CLI flags or config:
+
+```bash
+landingzones deploy cron \
+  --exclude-cron-fragment old-runtime.Landing_Zone.cron
+```
+
+```yaml
+cron_fragment_exclusions:
+  - old-runtime.Landing_Zone.cron
+```
+
+Missing exclusion filenames are shown in the preview and do not block
+activation. Non-interactive cron activation still requires
+`--confirm-cron-activation`.
+
+Upgrade note: the older selected-runtime default is now the explicit
+`replace-selected` scope. The compatibility name `selected` still works, but it
+prints a warning and maps to `replace-selected`.
 
 ## Development
 
