@@ -11,6 +11,7 @@ from landingzones.transfer_catalog import (
     load_reporting_transfer_definitions,
     load_reporting_transfer_catalog,
     load_runtime_transfer_catalog,
+    load_runtime_transfer_definitions,
 )
 
 
@@ -212,6 +213,216 @@ def test_runtime_catalog_keeps_runtime_file_validation_distinct_from_reporting(t
         gcf.config.restore_state(snapshot)
 
     assert list(reporting_catalog["identifiers"]) == ["report_transfer"]
+
+
+def test_runtime_catalog_defaults_entry_point_readiness_policy_to_direct(tmp_path):
+    """Existing entry-point transfers keep direct readiness unless configured."""
+    transfers_file = tmp_path / "transfers.tsv"
+    config_file = tmp_path / "config.yaml"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\tlog_file\tflock_file\tis_entry_point",
+                "entry_transfer\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\t/source/\t/destination/\ttransfer.log\ttransfer.lock\tTRUE",
+            ]
+        )
+    )
+    config_file.write_text(
+        "transfers_file: {0}\n"
+        "runtime_ids:\n"
+        "  - local_dev.local\n"
+        "rit_managed_locations:\n"
+        "  local_dev: {1}\n"
+        "rit_managed_folder_structure:\n"
+        "  log: log\n"
+        "  flock: flock\n".format(transfers_file, tmp_path / "managed")
+    )
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        catalog = load_runtime_transfer_catalog(config_file=str(config_file))
+        definitions = load_runtime_transfer_definitions(config_file=str(config_file))
+    finally:
+        gcf.config.restore_state(snapshot)
+
+    row = catalog.iloc[0]
+    assert row["readiness_policy"] == "direct"
+    assert row["readiness_stable_observations"] == "1"
+    assert row["readiness_quiet_seconds"] == "0"
+    assert row["readiness_fingerprint_mode"] == "path_size_mtime"
+
+    definition = definitions[0]
+    assert definition.readiness_policy == "direct"
+    assert definition.readiness_stable_observations == 1
+    assert definition.readiness_quiet_seconds == 0
+    assert definition.readiness_fingerprint_mode == "path_size_mtime"
+
+
+def test_runtime_catalog_normalizes_configured_stable_snapshot_readiness(tmp_path):
+    """Stable-snapshot readiness settings are exposed as canonical transfer facts."""
+    transfers_file = tmp_path / "transfers.tsv"
+    config_file = tmp_path / "config.yaml"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\tlog_file\tflock_file\tis_entry_point\treadiness_policy\treadiness_stable_observations\treadiness_quiet_seconds\treadiness_fingerprint_mode",
+                "entry_transfer\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\t/source/\t/destination/\ttransfer.log\ttransfer.lock\tTRUE\tstable-snapshot\t3\t600\tPATH-SIZE-MTIME",
+            ]
+        )
+    )
+    config_file.write_text(
+        "transfers_file: {0}\n"
+        "runtime_ids:\n"
+        "  - local_dev.local\n"
+        "rit_managed_locations:\n"
+        "  local_dev: {1}\n"
+        "rit_managed_folder_structure:\n"
+        "  log: log\n"
+        "  flock: flock\n".format(transfers_file, tmp_path / "managed")
+    )
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        catalog = load_runtime_transfer_catalog(config_file=str(config_file))
+        definitions = load_runtime_transfer_definitions(config_file=str(config_file))
+    finally:
+        gcf.config.restore_state(snapshot)
+
+    row = catalog.iloc[0]
+    assert row["readiness_policy"] == "stable_snapshot"
+    assert row["readiness_stable_observations"] == "3"
+    assert row["readiness_quiet_seconds"] == "600"
+    assert row["readiness_fingerprint_mode"] == "path_size_mtime"
+
+    definition = definitions[0]
+    assert definition.readiness_policy == "stable_snapshot"
+    assert definition.readiness_stable_observations == 3
+    assert definition.readiness_quiet_seconds == 600
+    assert definition.readiness_fingerprint_mode == "path_size_mtime"
+
+
+def test_runtime_catalog_rejects_unknown_readiness_policy(tmp_path):
+    """Readiness policy names should fail during catalog loading."""
+    transfers_file = tmp_path / "transfers.tsv"
+    config_file = tmp_path / "config.yaml"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\tlog_file\tflock_file\tis_entry_point\treadiness_policy",
+                "entry_transfer\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\t/source/\t/destination/\ttransfer.log\ttransfer.lock\tTRUE\toptimistic",
+            ]
+        )
+    )
+    config_file.write_text(
+        "transfers_file: {0}\n"
+        "runtime_ids:\n"
+        "  - local_dev.local\n"
+        "rit_managed_locations:\n"
+        "  local_dev: {1}\n"
+        "rit_managed_folder_structure:\n"
+        "  log: log\n"
+        "  flock: flock\n".format(transfers_file, tmp_path / "managed")
+    )
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        with pytest.raises(ValueError, match="readiness_policy"):
+            load_runtime_transfer_catalog(config_file=str(config_file))
+    finally:
+        gcf.config.restore_state(snapshot)
+
+
+def test_runtime_catalog_rejects_non_positive_readiness_observations(tmp_path):
+    """Stable observation thresholds should be positive integers."""
+    transfers_file = tmp_path / "transfers.tsv"
+    config_file = tmp_path / "config.yaml"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\tlog_file\tflock_file\tis_entry_point\treadiness_policy\treadiness_stable_observations",
+                "entry_transfer\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\t/source/\t/destination/\ttransfer.log\ttransfer.lock\tTRUE\tstable_snapshot\t0",
+            ]
+        )
+    )
+    config_file.write_text(
+        "transfers_file: {0}\n"
+        "runtime_ids:\n"
+        "  - local_dev.local\n"
+        "rit_managed_locations:\n"
+        "  local_dev: {1}\n"
+        "rit_managed_folder_structure:\n"
+        "  log: log\n"
+        "  flock: flock\n".format(transfers_file, tmp_path / "managed")
+    )
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        with pytest.raises(ValueError, match="readiness_stable_observations"):
+            load_runtime_transfer_catalog(config_file=str(config_file))
+    finally:
+        gcf.config.restore_state(snapshot)
+
+
+def test_runtime_catalog_rejects_negative_readiness_quiet_seconds(tmp_path):
+    """Readiness quiet periods should be non-negative durations."""
+    transfers_file = tmp_path / "transfers.tsv"
+    config_file = tmp_path / "config.yaml"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\tlog_file\tflock_file\tis_entry_point\treadiness_policy\treadiness_quiet_seconds",
+                "entry_transfer\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\t/source/\t/destination/\ttransfer.log\ttransfer.lock\tTRUE\tstable_snapshot\t-1",
+            ]
+        )
+    )
+    config_file.write_text(
+        "transfers_file: {0}\n"
+        "runtime_ids:\n"
+        "  - local_dev.local\n"
+        "rit_managed_locations:\n"
+        "  local_dev: {1}\n"
+        "rit_managed_folder_structure:\n"
+        "  log: log\n"
+        "  flock: flock\n".format(transfers_file, tmp_path / "managed")
+    )
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        with pytest.raises(ValueError, match="readiness_quiet_seconds"):
+            load_runtime_transfer_catalog(config_file=str(config_file))
+    finally:
+        gcf.config.restore_state(snapshot)
+
+
+def test_runtime_catalog_rejects_remote_stable_snapshot_sources(tmp_path):
+    """Stable-snapshot readiness is explicit about local-source support."""
+    transfers_file = tmp_path / "transfers.tsv"
+    config_file = tmp_path / "config.yaml"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\tlog_file\tflock_file\tis_entry_point\treadiness_policy",
+                "entry_transfer\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\tproducer:/source/\t/destination/\ttransfer.log\ttransfer.lock\tTRUE\tstable_snapshot",
+            ]
+        )
+    )
+    config_file.write_text(
+        "transfers_file: {0}\n"
+        "runtime_ids:\n"
+        "  - local_dev.local\n"
+        "rit_managed_locations:\n"
+        "  local_dev: {1}\n"
+        "rit_managed_folder_structure:\n"
+        "  log: log\n"
+        "  flock: flock\n".format(transfers_file, tmp_path / "managed")
+    )
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        with pytest.raises(ValueError, match="local sources"):
+            load_runtime_transfer_catalog(config_file=str(config_file))
+    finally:
+        gcf.config.restore_state(snapshot)
 
 
 def test_reporting_catalog_exposes_normalized_definitions_and_keeps_dataframe_compatibility(tmp_path):

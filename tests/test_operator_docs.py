@@ -41,6 +41,21 @@ def test_readme_documents_transfer_catalog_loading_modes():
     assert "reporting analysis can omit runtime-only `log_file` and `flock_file` columns" in normalized_readme_text
 
 
+def test_readme_documents_entry_point_readiness_staging():
+    """README should describe readiness staging as a mitigation."""
+    readme_path = os.path.join(APP_ROOT, "README.md")
+    readme_text = open(readme_path, "r").read()
+    normalized_readme_text = " ".join(readme_text.split())
+
+    assert "Entry-Point Readiness Policies" in readme_text
+    assert "`readiness_policy`" in readme_text
+    assert "`direct`" in readme_text
+    assert "`stable_snapshot`" in readme_text
+    assert "mitigation, not a guarantee" in normalized_readme_text
+    assert "producer-controlled atomic publish" in normalized_readme_text
+    assert "`.landing_zones_readiness`" in readme_text
+
+
 def test_context_names_transfer_catalog_as_invariant_owner():
     """Domain language should point future transfer-loading changes at catalog first."""
     context_path = os.path.join(APP_ROOT, "CONTEXT.md")

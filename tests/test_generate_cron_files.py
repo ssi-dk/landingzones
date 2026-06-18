@@ -2046,6 +2046,102 @@ class TestGenerateRsyncCommand:
         assert second_notification[7] == ''
 
     @pytest.mark.skipif(
+        not HAS_FLOCK,
+        reason="requires flock",
+    )
+    def test_stable_snapshot_entry_point_waits_without_touching_source(self, tmp_path):
+        """First stable-snapshot observation should skip transfer non-destructively."""
+        source_root = tmp_path / "source"
+        destination_root = tmp_path / "destination"
+        run_dir = source_root / "RunWaiting"
+        source_root.mkdir()
+        destination_root.mkdir()
+        run_dir.mkdir()
+        (run_dir / "payload.txt").write_text("payload")
+
+        transfer = {
+            'identifiers': 'stable_snapshot_entry',
+            'system': 'server1',
+            'source': str(source_root / '*'),
+            'source_port': '',
+            'destination': str(destination_root) + '/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': str(tmp_path / 'stable_snapshot_entry.log'),
+            'flock_file': str(tmp_path / 'stable_snapshot_entry.lock'),
+            'frequency': '',
+            'flow_group': 'readiness_flow',
+            'is_entry_point': 'TRUE',
+            'readiness_policy': 'stable_snapshot',
+            'readiness_stable_observations': '2',
+            'readiness_quiet_seconds': '0',
+            'readiness_fingerprint_mode': 'path_size_mtime',
+        }
+
+        proc, _ = self._run_generated_transfer_script(tmp_path, transfer)
+
+        assert proc.returncode == 0, proc.stderr
+        assert run_dir.exists()
+        assert (run_dir / "payload.txt").read_text() == "payload"
+        assert not (run_dir / ".landing_zones").exists()
+        assert not (destination_root / "RunWaiting").exists()
+        assert (source_root / ".landing_zones_readiness" / "RunWaiting.json").exists()
+
+    @pytest.mark.skipif(
+        not (HAS_RSYNC and HAS_FLOCK and HAS_TAR),
+        reason="requires rsync, flock, and tar",
+    )
+    def test_stable_snapshot_entry_point_archives_snapshot_and_keeps_source(self, tmp_path):
+        """Eligible stable-snapshot runs should archive from a private copy."""
+        source_root = tmp_path / "source"
+        destination_root = tmp_path / "destination"
+        run_dir = source_root / "RunReady"
+        source_root.mkdir()
+        destination_root.mkdir()
+        run_dir.mkdir()
+        (run_dir / "payload.txt").write_text("payload")
+
+        transfer = {
+            'identifiers': 'stable_snapshot_entry',
+            'system': 'server1',
+            'source': str(source_root / '*'),
+            'source_port': '',
+            'destination': str(destination_root) + '/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': str(tmp_path / 'stable_snapshot_entry.log'),
+            'flock_file': str(tmp_path / 'stable_snapshot_entry.lock'),
+            'frequency': '',
+            'flow_group': 'readiness_flow',
+            'is_entry_point': 'TRUE',
+            'readiness_policy': 'stable_snapshot',
+            'readiness_stable_observations': '2',
+            'readiness_quiet_seconds': '0',
+            'readiness_fingerprint_mode': 'path_size_mtime',
+        }
+
+        first_proc, _ = self._run_generated_transfer_script(tmp_path, transfer)
+        second_proc, _ = self._run_generated_transfer_script(tmp_path, transfer)
+
+        destination_run = destination_root / "RunReady"
+        archive_path = (
+            destination_run
+            / ".landing_zones"
+            / "landingzone-run-archive.tar"
+        )
+
+        assert first_proc.returncode == 0, first_proc.stderr
+        assert second_proc.returncode == 0, second_proc.stderr
+        assert run_dir.exists()
+        assert (run_dir / "payload.txt").read_text() == "payload"
+        assert not (run_dir / ".landing_zones").exists()
+        assert destination_run.exists()
+        assert archive_path.exists()
+        assert not (destination_run / "payload.txt").exists()
+
+    @pytest.mark.skipif(
         not (HAS_RSYNC and HAS_FLOCK and HAS_TAR),
         reason="requires rsync, flock, and tar",
     )

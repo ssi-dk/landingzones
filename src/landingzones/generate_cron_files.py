@@ -27,6 +27,12 @@ VALIDATION_TEMPLATE_NAME = 'lz_run_validation.sh'
 OWNER_MARKER_PREFIX = '# landingzones-owner:'
 RUNTIME_FILTER_METADATA = 'runtime_ids.txt'
 PATH_VARIABLE_PATTERN = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}')
+DEFAULT_READINESS_POLICY = 'direct'
+DEFAULT_READINESS_STABLE_OBSERVATIONS = '1'
+DEFAULT_READINESS_QUIET_SECONDS = '0'
+DEFAULT_READINESS_FINGERPRINT_MODE = 'path_size_mtime'
+VALID_READINESS_POLICIES = ('direct', 'stable_snapshot')
+VALID_READINESS_FINGERPRINT_MODES = ('path_size_mtime',)
 
 
 def normalize_bool_text(value):
@@ -39,6 +45,90 @@ def normalize_bool_text(value):
     if text in ('FALSE', 'F', 'NO', 'N', '0'):
         return 'FALSE'
     raise ValueError("Unsupported boolean value: {0}".format(value))
+
+
+def normalize_readiness_policy(value, identifier):
+    """Normalize and validate an entry-point readiness policy name."""
+    policy = (
+        clean_tsv_value(value, default=DEFAULT_READINESS_POLICY)
+        or DEFAULT_READINESS_POLICY
+    )
+    policy = policy.lower().replace('-', '_')
+    if policy not in VALID_READINESS_POLICIES:
+        raise ValueError(
+            "Unsupported readiness_policy for transfer '{0}': {1}. Expected one of: {2}".format(
+                identifier,
+                value,
+                ', '.join(VALID_READINESS_POLICIES),
+            )
+        )
+    return policy
+
+
+def normalize_readiness_fingerprint_mode(value, identifier):
+    """Normalize and validate a readiness fingerprint mode name."""
+    mode = (
+        clean_tsv_value(value, default=DEFAULT_READINESS_FINGERPRINT_MODE)
+        or DEFAULT_READINESS_FINGERPRINT_MODE
+    )
+    mode = mode.lower().replace('-', '_')
+    if mode not in VALID_READINESS_FINGERPRINT_MODES:
+        raise ValueError(
+            "Unsupported readiness_fingerprint_mode for transfer '{0}': {1}. Expected one of: {2}".format(
+                identifier,
+                value,
+                ', '.join(VALID_READINESS_FINGERPRINT_MODES),
+            )
+        )
+    return mode
+
+
+def normalize_positive_int_text(value, default, field_name, identifier):
+    """Normalize a TSV integer field that must be at least one."""
+    text = clean_tsv_value(value, default=default) or default
+    try:
+        parsed = int(text)
+    except ValueError:
+        raise ValueError(
+            "{0} for transfer '{1}' must be a positive integer: {2}".format(
+                field_name,
+                identifier,
+                value,
+            )
+        )
+    if parsed < 1:
+        raise ValueError(
+            "{0} for transfer '{1}' must be a positive integer: {2}".format(
+                field_name,
+                identifier,
+                value,
+            )
+        )
+    return str(parsed)
+
+
+def normalize_non_negative_int_text(value, default, field_name, identifier):
+    """Normalize a TSV integer field that must be zero or greater."""
+    text = clean_tsv_value(value, default=default) or default
+    try:
+        parsed = int(text)
+    except ValueError:
+        raise ValueError(
+            "{0} for transfer '{1}' must be a non-negative integer: {2}".format(
+                field_name,
+                identifier,
+                value,
+            )
+        )
+    if parsed < 0:
+        raise ValueError(
+            "{0} for transfer '{1}' must be a non-negative integer: {2}".format(
+                field_name,
+                identifier,
+                value,
+            )
+        )
+    return str(parsed)
 
 
 def ensure_text_column(df, column_name, default=''):
@@ -198,6 +288,10 @@ def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None,
         'tags',
         'destination_port',
         'source_port',
+        'readiness_policy',
+        'readiness_stable_observations',
+        'readiness_quiet_seconds',
+        'readiness_fingerprint_mode',
     )
     for column in text_columns:
         if column not in columns:
@@ -206,6 +300,26 @@ def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None,
             row[column] = clean_tsv_value(row.get(column, ''))
 
     for row in rows:
+        row['readiness_policy'] = normalize_readiness_policy(
+            row.get('readiness_policy', ''),
+            row.get('identifiers', ''),
+        )
+        row['readiness_stable_observations'] = normalize_positive_int_text(
+            row.get('readiness_stable_observations', ''),
+            DEFAULT_READINESS_STABLE_OBSERVATIONS,
+            'readiness_stable_observations',
+            row.get('identifiers', ''),
+        )
+        row['readiness_quiet_seconds'] = normalize_non_negative_int_text(
+            row.get('readiness_quiet_seconds', ''),
+            DEFAULT_READINESS_QUIET_SECONDS,
+            'readiness_quiet_seconds',
+            row.get('identifiers', ''),
+        )
+        row['readiness_fingerprint_mode'] = normalize_readiness_fingerprint_mode(
+            row.get('readiness_fingerprint_mode', ''),
+            row.get('identifiers', ''),
+        )
         for field_name in ('source', 'destination'):
             row[field_name] = expand_transfer_endpoint(
                 row.get(field_name, ''),
@@ -262,6 +376,7 @@ def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None,
     df = TransferTable(rows, columns=columns)
     validate_transfer_endpoints(df)
     validate_flow_metadata(df)
+    validate_readiness_settings(df)
     df = resolve_transfer_file_paths(df)
     df.attrs['shared_file_pair_warnings'] = audit_shared_file_pairs(df)
     df.attrs['shared_main_lock_groups'] = audit_shared_main_locks(df)
@@ -543,6 +658,25 @@ def validate_flow_metadata(df):
                 "Transfer '{0}' uses portable .landing_zones metadata but rsync_options excludes hidden "
                 "root-level entries via --exclude='/.*'; portable .landing_zones metadata "
                 "would not transfer".format(identifier)
+            )
+
+    if errors:
+        raise ValueError("\n".join(errors))
+
+
+def validate_readiness_settings(df):
+    """Reject readiness settings that cannot be honored by generated scripts."""
+    errors = []
+    for _, row in df.iterrows():
+        identifier = row.get('identifiers', '')
+        readiness_policy = str(row.get('readiness_policy', '') or '')
+        source = str(row.get('source', '') or '')
+        source_remote, _ = split_remote_path(source)
+        if readiness_policy == 'stable_snapshot' and source_remote:
+            errors.append(
+                "Transfer '{0}' uses readiness_policy=stable_snapshot, which currently supports local sources only".format(
+                    identifier
+                )
             )
 
     if errors:
@@ -1183,12 +1317,35 @@ def generate_iterative_script_content(transfer):
     transfer_tags = normalize_tags_text(transfer.get('tags', ''))
     is_entry_point = str(transfer.get('is_entry_point', 'FALSE') or 'FALSE').strip().upper()
     is_end_point = str(transfer.get('is_end_point', 'FALSE') or 'FALSE').strip().upper()
+    readiness_policy = str(
+        transfer.get('readiness_policy', DEFAULT_READINESS_POLICY)
+        or DEFAULT_READINESS_POLICY
+    ).strip()
+    readiness_stable_observations = str(
+        transfer.get(
+            'readiness_stable_observations',
+            DEFAULT_READINESS_STABLE_OBSERVATIONS,
+        )
+        or DEFAULT_READINESS_STABLE_OBSERVATIONS
+    ).strip()
+    readiness_quiet_seconds = str(
+        transfer.get('readiness_quiet_seconds', DEFAULT_READINESS_QUIET_SECONDS)
+        or DEFAULT_READINESS_QUIET_SECONDS
+    ).strip()
+    readiness_fingerprint_mode = str(
+        transfer.get(
+            'readiness_fingerprint_mode',
+            DEFAULT_READINESS_FINGERPRINT_MODE,
+        )
+        or DEFAULT_READINESS_FINGERPRINT_MODE
+    ).strip()
     notify_on_success = str(transfer.get('notify_on_success', 'FALSE') or 'FALSE').strip().upper()
     notify_on_error = str(transfer.get('notify_on_error', 'FALSE') or 'FALSE').strip().upper()
     portable_metadata_enabled = '1' if transfer_uses_portable_metadata(transfer) else '0'
     source_remote_target = source_remote or ''
     destination_remote_target = destination_remote or ''
     destination_root_runtime = runtime_destination_root
+    source_root_runtime = source_root
 
     return """#!/bin/sh
 set -eu
@@ -1213,10 +1370,15 @@ transfer_tags="{transfer_tags}"
 portable_metadata_enabled="{portable_metadata_enabled}"
 is_entry_point="{is_entry_point}"
 is_end_point="{is_end_point}"
+readiness_policy="{readiness_policy}"
+readiness_stable_observations="{readiness_stable_observations}"
+readiness_quiet_seconds="{readiness_quiet_seconds}"
+readiness_fingerprint_mode="{readiness_fingerprint_mode}"
 notify_on_success="{notify_on_success}"
 notify_on_error="{notify_on_error}"
 source_remote_target="{source_remote_target}"
 source_remote_port="{source_remote_port}"
+source_root_runtime="{source_root_runtime}"
 destination_remote_target="{destination_remote_target}"
 destination_remote_port="{destination_remote_port}"
 destination_root_runtime="{destination_root_runtime}"
@@ -1224,6 +1386,7 @@ portable_metadata_dir_name=".landing_zones"
 portable_metadata_file_name="landingzone-run-metadata.tsv"
 portable_events_file_name="landingzone-transfer-events.tsv"
 portable_archive_file_name="landingzone-run-archive.tar"
+readiness_state_dir_name=".landing_zones_readiness"
 run_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.rsync.XXXXXX")"
 cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.cleanup.XXXXXX")"
 promote_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.promote.XXXXXX")"
@@ -1841,6 +2004,81 @@ append_common_status() {{
     notify_transfer_event "$event_timestamp" "$event_status" "$event_directory" "$event_source" "$event_destination" "$event_message" || debug "notification delivery failed"
 }}
 
+check_entry_point_readiness() {{
+    [ "$is_entry_point" = "TRUE" ] || return 0
+    [ "$readiness_policy" = "stable_snapshot" ] || return 0
+    if [ -n "$source_remote_target" ]; then
+        readiness_message="stable_snapshot readiness is not yet supported for remote sources"
+        log_status "$dir_name error"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$readiness_message"
+        debug "$dir_name $readiness_message"
+        return 1
+    fi
+
+    readiness_python="${{LANDINGZONES_PYTHON:-python}}"
+    readiness_state_root="$source_root_runtime/$readiness_state_dir_name"
+    if ! readiness_output="$("$readiness_python" -m landingzones.entrypoint_readiness observe --run-dir "$source_dir" --state-root "$readiness_state_root" --stable-observations "$readiness_stable_observations" --quiet-seconds "$readiness_quiet_seconds" --fingerprint-mode "$readiness_fingerprint_mode" 2>"$preflight_stderr_log")"; then
+        readiness_message="readiness observation failed: $(summarize_log "$preflight_stderr_log")"
+        log_status "$dir_name error"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$readiness_message"
+        debug "$dir_name $readiness_message"
+        return 1
+    fi
+
+    readiness_status="$(printf '%s\\n' "$readiness_output" | awk -F '\\t' '$1 == "status" {{ print $2; exit }}')"
+    readiness_seen="$(printf '%s\\n' "$readiness_output" | awk -F '\\t' '$1 == "stable_observations" {{ print $2; exit }}')"
+    [ -n "$readiness_status" ] || readiness_status="waiting_for_stability"
+    [ -n "$readiness_seen" ] || readiness_seen="0"
+    if [ "$readiness_status" = "eligible" ]; then
+        return 0
+    fi
+
+    readiness_message="entry-point readiness $readiness_status (stable_observations=$readiness_seen)"
+    log_status "$dir_name $readiness_status"
+    append_common_status "$readiness_status" "$dir_name" "$current_run_source" "$current_run_destination" "$readiness_message"
+    debug "$dir_name $readiness_message"
+    return 1
+}}
+
+prepare_entry_point_snapshot() {{
+    [ "$is_entry_point" = "TRUE" ] || return 0
+    [ "$readiness_policy" = "stable_snapshot" ] || return 0
+    snapshot_root="$source_root_runtime/$readiness_state_dir_name/staging"
+    snapshot_dir="$snapshot_root/$dir_name"
+    rm -rf "$snapshot_dir"
+    mkdir -p "$snapshot_dir"
+
+    if ! rsync -a --delete --exclude="/$portable_metadata_dir_name" --exclude="/$readiness_state_dir_name" --exclude="/.staging" "$source_dir/" "$snapshot_dir/" >>"$preflight_log" 2>"$preflight_stderr_log"; then
+        snapshot_message="readiness snapshot copy failed: $(summarize_log "$preflight_stderr_log")"
+        log_status "$dir_name error"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$snapshot_message"
+        debug "$dir_name $snapshot_message"
+        rm -rf "$snapshot_dir"
+        return 1
+    fi
+
+    : >"$preflight_log"
+    if ! rsync -ani --delete --exclude="/$portable_metadata_dir_name" --exclude="/$readiness_state_dir_name" --exclude="/.staging" "$source_dir/" "$snapshot_dir/" >"$preflight_log" 2>"$preflight_stderr_log"; then
+        snapshot_message="readiness snapshot confirmation failed: $(summarize_log "$preflight_stderr_log")"
+        log_status "$dir_name error"
+        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$snapshot_message"
+        debug "$dir_name $snapshot_message"
+        rm -rf "$snapshot_dir"
+        return 1
+    fi
+    if sed '/^sending incremental file list$/d; /^sent .* bytes .*$/d; /^total size is .*$/d; /^$/d' "$preflight_log" | grep -q .; then
+        snapshot_message="readiness source changed during snapshot"
+        log_status "$dir_name waiting_for_stability"
+        append_common_status "waiting_for_stability" "$dir_name" "$current_run_source" "$current_run_destination" "$snapshot_message"
+        debug "$dir_name $snapshot_message"
+        rm -rf "$snapshot_dir"
+        return 1
+    fi
+
+    source_dir="$snapshot_dir"
+    return 0
+}}
+
 debug() {{
     if debug_enabled; then
         printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$1" >&2
@@ -1957,6 +2195,14 @@ fi
     current_entry_transfer_identifier=""
     current_created_at_utc=""
     current_run_completed=0
+    if ! check_entry_point_readiness; then
+        reset_current_run_context
+        continue
+    fi
+    if ! prepare_entry_point_snapshot; then
+        reset_current_run_context
+        continue
+    fi
     ensure_source_run_bundle || continue
     log_status "$dir_name initiated"
     append_source_portable_event "initiated"
@@ -2091,10 +2337,15 @@ fi
         portable_metadata_enabled=portable_metadata_enabled,
         is_entry_point=is_entry_point,
         is_end_point=is_end_point,
+        readiness_policy=readiness_policy.replace('"', '\\"'),
+        readiness_stable_observations=readiness_stable_observations.replace('"', '\\"'),
+        readiness_quiet_seconds=readiness_quiet_seconds.replace('"', '\\"'),
+        readiness_fingerprint_mode=readiness_fingerprint_mode.replace('"', '\\"'),
         notify_on_success=notify_on_success,
         notify_on_error=notify_on_error,
         source_remote_target=source_remote_target.replace('"', '\\"'),
         source_remote_port=source_port.replace('"', '\\"'),
+        source_root_runtime=str(source_root_runtime).replace('"', '\\"'),
         destination_remote_target=destination_remote_target.replace('"', '\\"'),
         destination_remote_port=destination_port.replace('"', '\\"'),
         destination_root_runtime=escape_local_shell_vars(

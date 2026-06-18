@@ -1,4 +1,4 @@
-identifiers	enabled	system	notes	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file	frequency	flow_group	is_entry_point	is_end_point	notify_on_success	notify_on_error	test_fixture_names	tags
+identifiers	enabled	system	notes	users	source	source_port	destination	destination_port	rsync_options	io_nice	log_file	flock_file	frequency	flow_group	is_entry_point	is_end_point	readiness_policy	readiness_stable_observations	readiness_quiet_seconds	readiness_fingerprint_mode	notify_on_success	notify_on_error	test_fixture_names	tags
 # Example transfer configurations
 # Uncomment and modify the lines below, or add your own
 #
@@ -20,6 +20,10 @@ identifiers	enabled	system	notes	users	source	source_port	destination	destinatio
 #   flow_group        - Optional flow identifier for portable run tracking and validation wrappers
 #   is_entry_point    - TRUE when this transfer is the first hop that creates flow metadata
 #   is_end_point      - TRUE when this transfer is a terminal hop in a tracked flow
+#   readiness_policy  - Entry-point readiness policy: direct (default) or stable_snapshot
+#   readiness_stable_observations - Identical observations required for stable_snapshot (default 1)
+#   readiness_quiet_seconds - Minimum seconds since last observed change for stable_snapshot (default 0)
+#   readiness_fingerprint_mode - Source inventory fingerprint mode (default path_size_mtime)
 #   notify_on_success - TRUE to send a notification when this transfer completes, if notifications.endpoint is configured
 #   notify_on_error   - TRUE to send a notification when this transfer errors, if notifications.endpoint is configured
 #   test_fixture_names - Optional comma-separated fixture directories used by integration validation
@@ -33,7 +37,7 @@ identifiers	enabled	system	notes	users	source	source_port	destination	destinatio
 #   0 */6 * * *   - every 6 hours
 #
 # Local transfer example (uncomment to use):
-transfer_001	TRUE	localhost	''	testuser	input/*		output/				transfers.log	landingzones.lock	*/15 * * * *		FALSE	FALSE	FALSE	TRUE		example,local
+transfer_001	TRUE	localhost	''	testuser	input/*		output/				transfers.log	landingzones.lock	*/15 * * * *		FALSE	FALSE					FALSE	TRUE		example,local
 #
 # Remote transfer example (enable and modify):
-transfer_002	FALSE	myserver	''	datauser	/srv/data/outgoing/*		remoteuser@remote.host:/srv/data/incoming/	22			remote_transfer.log	remote_transfer.lock	*/15 * * * *		FALSE	FALSE	FALSE	TRUE		remote
+transfer_002	FALSE	myserver	''	datauser	/srv/data/outgoing/*		remoteuser@remote.host:/srv/data/incoming/	22			remote_transfer.log	remote_transfer.lock	*/15 * * * *		FALSE	FALSE					FALSE	TRUE		remote
