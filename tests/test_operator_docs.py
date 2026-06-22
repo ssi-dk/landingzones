@@ -54,6 +54,8 @@ def test_readme_documents_entry_point_readiness_staging():
     assert "mitigation, not a guarantee" in normalized_readme_text
     assert "producer-controlled atomic publish" in normalized_readme_text
     assert "`.landing_zones_readiness`" in readme_text
+    assert "interpreter that ran `landingzones build`" in normalized_readme_text
+    assert "`LANDINGZONES_PYTHON`" in readme_text
 
 
 def test_context_names_transfer_catalog_as_invariant_owner():

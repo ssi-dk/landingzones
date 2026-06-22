@@ -1339,6 +1339,7 @@ def generate_iterative_script_content(transfer):
         )
         or DEFAULT_READINESS_FINGERPRINT_MODE
     ).strip()
+    readiness_python_default = sys.executable or 'python'
     notify_on_success = str(transfer.get('notify_on_success', 'FALSE') or 'FALSE').strip().upper()
     notify_on_error = str(transfer.get('notify_on_error', 'FALSE') or 'FALSE').strip().upper()
     portable_metadata_enabled = '1' if transfer_uses_portable_metadata(transfer) else '0'
@@ -1374,6 +1375,7 @@ readiness_policy="{readiness_policy}"
 readiness_stable_observations="{readiness_stable_observations}"
 readiness_quiet_seconds="{readiness_quiet_seconds}"
 readiness_fingerprint_mode="{readiness_fingerprint_mode}"
+readiness_python_default={readiness_python_default}
 notify_on_success="{notify_on_success}"
 notify_on_error="{notify_on_error}"
 source_remote_target="{source_remote_target}"
@@ -2015,7 +2017,10 @@ check_entry_point_readiness() {{
         return 1
     fi
 
-    readiness_python="${{LANDINGZONES_PYTHON:-python}}"
+    readiness_python="$readiness_python_default"
+    if [ -n "${{LANDINGZONES_PYTHON:-}}" ]; then
+        readiness_python="$LANDINGZONES_PYTHON"
+    fi
     readiness_state_root="$source_root_runtime/$readiness_state_dir_name"
     if ! readiness_output="$("$readiness_python" -m landingzones.entrypoint_readiness observe --run-dir "$source_dir" --state-root "$readiness_state_root" --stable-observations "$readiness_stable_observations" --quiet-seconds "$readiness_quiet_seconds" --fingerprint-mode "$readiness_fingerprint_mode" 2>"$preflight_stderr_log")"; then
         readiness_message="readiness observation failed: $(summarize_log "$preflight_stderr_log")"
@@ -2341,6 +2346,7 @@ fi
         readiness_stable_observations=readiness_stable_observations.replace('"', '\\"'),
         readiness_quiet_seconds=readiness_quiet_seconds.replace('"', '\\"'),
         readiness_fingerprint_mode=readiness_fingerprint_mode.replace('"', '\\"'),
+        readiness_python_default=shell_assignment_value(readiness_python_default),
         notify_on_success=notify_on_success,
         notify_on_error=notify_on_error,
         source_remote_target=source_remote_target.replace('"', '\\"'),

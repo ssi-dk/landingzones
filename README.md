@@ -162,6 +162,9 @@ same path/size/mtime fingerprint has been seen for
 Landing Zones-owned private snapshot, confirms that the source still matches
 the snapshot, and archives from that private copy. The original producer-visible
 run is left in place for separate retention or explicit operator cleanup.
+Generated stable-snapshot scripts use the Python interpreter that ran
+`landingzones build` for the readiness helper; set `LANDINGZONES_PYTHON` in the
+runtime environment only when that interpreter must be overridden.
 
 ### Shared Main Transfer Locks
 

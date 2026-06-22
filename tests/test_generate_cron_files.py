@@ -599,7 +599,13 @@ promote_server1\tTRUE\ttest_local\tlocal\t/flow/stage/\t/flow/final/
 class TestGenerateRsyncCommand:
     """Test the generate_rsync_command function"""
 
-    def _run_generated_transfer_script(self, tmp_path, transfer, notifications=None):
+    def _run_generated_transfer_script(
+        self,
+        tmp_path,
+        transfer,
+        notifications=None,
+        env_overrides=None,
+    ):
         """Write and execute a generated transfer script under test-local config."""
         managed_root = tmp_path / "managed"
         snapshot = gcf.config.snapshot_state()
@@ -627,6 +633,7 @@ class TestGenerateRsyncCommand:
         script_path.chmod(0o755)
 
         env = dict(os.environ)
+        env.pop("LANDINGZONES_PYTHON", None)
         if HAS_RSYNC or HAS_FLOCK:
             path_parts = []
             rsync_path = shutil.which("rsync")
@@ -637,6 +644,8 @@ class TestGenerateRsyncCommand:
                 path_parts.append(os.path.dirname(flock_path))
             path_parts.append(env.get("PATH", ""))
             env["PATH"] = os.pathsep.join([part for part in path_parts if part])
+        if env_overrides:
+            env.update(env_overrides)
 
         proc = subprocess.run(
             [str(script_path)],
@@ -2086,6 +2095,61 @@ class TestGenerateRsyncCommand:
         assert (run_dir / "payload.txt").read_text() == "payload"
         assert not (run_dir / ".landing_zones").exists()
         assert not (destination_root / "RunWaiting").exists()
+        assert (source_root / ".landing_zones_readiness" / "RunWaiting.json").exists()
+
+    @pytest.mark.skipif(
+        not HAS_FLOCK,
+        reason="requires flock",
+    )
+    def test_stable_snapshot_entry_point_uses_build_python_when_path_python_differs(self, tmp_path):
+        """Stable-snapshot readiness should not depend on PATH's first python."""
+        source_root = tmp_path / "source"
+        destination_root = tmp_path / "destination"
+        run_dir = source_root / "RunWaiting"
+        fake_bin = tmp_path / "fake-bin"
+        source_root.mkdir()
+        destination_root.mkdir()
+        run_dir.mkdir()
+        fake_bin.mkdir()
+        (run_dir / "payload.txt").write_text("payload")
+        fake_python = fake_bin / "python"
+        fake_python.write_text("#!/bin/sh\necho shadow-python >&2\nexit 7\n")
+        fake_python.chmod(0o755)
+
+        transfer = {
+            'identifiers': 'stable_snapshot_entry',
+            'system': 'server1',
+            'source': str(source_root / '*'),
+            'source_port': '',
+            'destination': str(destination_root) + '/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': str(tmp_path / 'stable_snapshot_entry.log'),
+            'flock_file': str(tmp_path / 'stable_snapshot_entry.lock'),
+            'frequency': '',
+            'flow_group': 'readiness_flow',
+            'is_entry_point': 'TRUE',
+            'readiness_policy': 'stable_snapshot',
+            'readiness_stable_observations': '2',
+            'readiness_quiet_seconds': '0',
+            'readiness_fingerprint_mode': 'path_size_mtime',
+        }
+        path_parts = [str(fake_bin)]
+        for tool_name in ("rsync", "flock"):
+            tool_path = shutil.which(tool_name)
+            if tool_path:
+                path_parts.append(os.path.dirname(tool_path))
+        path_parts.append(os.environ.get("PATH", ""))
+
+        proc, _ = self._run_generated_transfer_script(
+            tmp_path,
+            transfer,
+            env_overrides={"PATH": os.pathsep.join(path_parts)},
+        )
+
+        assert proc.returncode == 0, proc.stderr
+        assert "shadow-python" not in proc.stderr
         assert (source_root / ".landing_zones_readiness" / "RunWaiting.json").exists()
 
     @pytest.mark.skipif(
