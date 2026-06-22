@@ -77,6 +77,10 @@ class TransferDefinition:
     script_name: str = ""
     runtime_id: str = ""
     system_user: str = ""
+    readiness_policy: str = "direct"
+    readiness_stable_observations: int = 1
+    readiness_quiet_seconds: int = 0
+    readiness_fingerprint_mode: str = "path_size_mtime"
 
     @classmethod
     def from_row(cls, row):
@@ -103,6 +107,15 @@ class TransferDefinition:
             script_name=str(row.get("script_name", "") or ""),
             runtime_id=str(row.get("runtime_id", "") or ""),
             system_user=str(row.get("system_user", row.get("runtime_id", "")) or ""),
+            readiness_policy=str(row.get("readiness_policy", "direct") or "direct"),
+            readiness_stable_observations=int(
+                row.get("readiness_stable_observations", 1) or 1
+            ),
+            readiness_quiet_seconds=int(row.get("readiness_quiet_seconds", 0) or 0),
+            readiness_fingerprint_mode=str(
+                row.get("readiness_fingerprint_mode", "path_size_mtime")
+                or "path_size_mtime"
+            ),
         )
 
 

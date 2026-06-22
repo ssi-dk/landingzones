@@ -66,6 +66,10 @@ The system is configured via a tab-separated `transfers.tsv` file:
 | `flow_group` | Optional logical flow label shared by multi-hop transfers | `labnet_to_seqdata` |
 | `is_entry_point` | Optional `TRUE` marker for the first hop of a logical flow | `TRUE` |
 | `is_end_point` | Optional `TRUE` marker for the final hop of a logical flow | `TRUE` |
+| `readiness_policy` | Entry-point readiness policy; defaults to current direct behavior | `direct`, `stable_snapshot` |
+| `readiness_stable_observations` | Number of identical source inventories required before `stable_snapshot` is eligible | `2` |
+| `readiness_quiet_seconds` | Minimum seconds since the last observed source change before `stable_snapshot` is eligible | `300` |
+| `readiness_fingerprint_mode` | Source inventory fingerprint mode | `path_size_mtime` |
 
 Future todo: add an optional second, per-remote-host lock for cross-server
 transfers. The existing `flock_file` prevents one transfer from overlapping
@@ -134,6 +138,30 @@ Command boundaries:
 - `landingzones validate integration` uses the runtime catalog.
 - `landingzones validate separation` uses the reporting catalog.
 - `landingzones report transfers` uses the reporting catalog.
+
+### Entry-Point Readiness Policies
+
+Entry-point readiness checks protect flows where the upstream producer writes
+directly into a visible source tree. They are a mitigation, not a guarantee:
+only producer-controlled atomic publish or a producer completion marker can
+prove that a run is complete.
+
+`readiness_policy=direct` keeps the existing behavior. When a row has
+`is_entry_point=TRUE`, the generated script mints portable metadata, archives
+the visible run directory, and removes the unpacked source contents from that
+hop before transfer. Use this for producers that publish atomically, or where
+the operator accepts the current direct-archive contract.
+
+`readiness_policy=stable_snapshot` is the consumer-side mitigation for local
+entry-point sources. The generated script observes each top-level run without
+modifying producer-visible contents, records durable state under the
+entry-root `.landing_zones_readiness` sidecar directory, and waits until the
+same path/size/mtime fingerprint has been seen for
+`readiness_stable_observations` observations and the configured
+`readiness_quiet_seconds` has elapsed. Once eligible, it copies the run into a
+Landing Zones-owned private snapshot, confirms that the source still matches
+the snapshot, and archives from that private copy. The original producer-visible
+run is left in place for separate retention or explicit operator cleanup.
 
 ### Shared Main Transfer Locks
 
@@ -301,11 +329,13 @@ Use `landingzones validate integration --slow` when you want the harness to prin
 
 Generated transfer scripts create portable `.landing_zones` sidecars for every enabled transfer. `flow_group` is optional sidecar metadata: when a transfer mints a new sidecar the value may be blank, and downstream transfers preserve the value already stored in the sidecar.
 
-When a row has `is_entry_point=TRUE`, the generated script archives each
-top-level run directory into `.landing_zones/landingzone-run-archive.tar` before
-transfer and removes the original unpacked contents from that hop. Intermediate
-hops then move the archive plus the `.landing_zones` metadata instead of
-thousands of individual payload files. When a later row has
+When a row has `is_entry_point=TRUE`, the generated script archives top-level
+run directories into `.landing_zones/landingzone-run-archive.tar` before
+transfer. The default `readiness_policy=direct` archives from the visible source
+and removes unpacked contents from that hop. The `stable_snapshot` policy
+archives from a Landing Zones-owned private snapshot and leaves the original
+producer-visible run in place. Intermediate hops then move the archive plus the
+`.landing_zones` metadata instead of thousands of individual payload files. When a later row has
 `is_end_point=TRUE`, the generated script extracts the archive after staging
 promotion and removes the archive from the final destination. Archive extraction
 validates that tar entries are relative paths before unpacking.
