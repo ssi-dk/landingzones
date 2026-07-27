@@ -8,6 +8,7 @@ from landingzones import generate_cron_files as gcf
 from landingzones import transfer_catalog
 from landingzones.table import TransferTable
 from landingzones.transfer_catalog import (
+    load_monitoring_transfer_definitions,
     load_reporting_transfer_definitions,
     load_reporting_transfer_catalog,
     load_runtime_transfer_catalog,
@@ -482,3 +483,69 @@ def test_reporting_catalog_exposes_normalized_definitions_and_keeps_dataframe_co
     assert catalog.iloc[0]["notify_on_error"] == "FALSE"
     assert catalog.iloc[0]["tags"] == "heartbeat,lab"
     assert catalog.iloc[0]["destination_port"] == "2200"
+
+
+def test_monitoring_catalog_can_include_disabled_transfer_definitions(tmp_path):
+    """Definition synchronization should retain configured enabled state."""
+    transfers_file = tmp_path / "transfers.tsv"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination",
+                "active\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\t/source/active/*\t/destination/active/",
+                "paused\tlocal_dev.local\tFALSE\tlocal_dev\tlocal\t/source/paused/*\t/destination/paused/",
+            ]
+        )
+    )
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        definitions = load_monitoring_transfer_definitions(
+            transfers_file=str(transfers_file),
+        )
+        removed_runtime_definitions = load_monitoring_transfer_definitions(
+            transfers_file=str(transfers_file),
+            runtime_ids=["removed.runtime"],
+        )
+    finally:
+        gcf.config.restore_state(snapshot)
+
+    assert [(item.identifier, item.enabled) for item in definitions] == [
+        ("active", True),
+        ("paused", False),
+    ]
+    assert removed_runtime_definitions == []
+
+
+def test_monitoring_catalog_filters_runtime_scope_before_expanding_endpoints(
+    tmp_path,
+    monkeypatch,
+):
+    """Scoped monitoring loads must ignore unresolved endpoints in other runtimes."""
+    unresolved_name = "LZ_TEST_UNRESOLVED_OTHER_RUNTIME_ROOT"
+    monkeypatch.delenv(unresolved_name, raising=False)
+
+    transfers_file = tmp_path / "transfers.tsv"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination",
+                "selected\tselected.runtime\tTRUE\tselected\tuser\t/source/selected\t/destination/selected",
+                "other\tother.runtime\tTRUE\tother\tuser\t${{{0}}}/source\t/destination/other".format(unresolved_name),
+            ]
+        )
+    )
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("")
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        definitions = load_monitoring_transfer_definitions(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+            runtime_ids=["selected.runtime"],
+        )
+    finally:
+        gcf.config.restore_state(snapshot)
+
+    assert [definition.identifier for definition in definitions] == ["selected"]

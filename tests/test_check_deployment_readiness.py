@@ -1833,8 +1833,24 @@ class TestTestWithData:
         assert metadata_fields['run_id']
         assert metadata_fields['flow_group'] == ''
         assert metadata_fields['entry_transfer_identifier'] == 'step1'
-        assert '\tstep1\ttestbox\tinitiated\t' in events.read_text()
-        assert '\tstep2\ttestbox\tcompleted\t' in events.read_text()
+        event_lines = events.read_text().splitlines()
+        event_columns = event_lines[0].split('\t')
+        event_rows = [
+            dict(zip(event_columns, line.split('\t')))
+            for line in event_lines[1:]
+        ]
+        assert any(
+            row['transfer_identifier'] == 'step1'
+            and row['status'] == 'started'
+            and row['phase'] == 'transfer'
+            for row in event_rows
+        )
+        assert any(
+            row['transfer_identifier'] == 'step2'
+            and row['status'] == 'completed'
+            and row['phase'] == 'cleanup'
+            for row in event_rows
+        )
         assert (runtime_root / 'scripts' / 'step1.sh').exists()
         assert (runtime_root / 'scripts' / 'step2.sh').exists()
         assert (runtime_root / 'validation_scripts' / 'lz_run_validation.sh').exists()

@@ -1,6 +1,6 @@
 [workspace]
 name = "landingzones"
-version = "1.1.13"
+version = "1.1.14"
 description = "Automated data transfer system using rsync and cron"
 channels = ["conda-forge"]
 platforms = ["osx-arm64", "osx-64", "linux-64"]
@@ -11,6 +11,7 @@ pip = "*"
 pandas = ">=1.0.0"
 pyyaml = ">=5.0.0"
 pytest = ">=7.0.0"
+sqlalchemy = ">=2.0,<3"
 
 [pypi-dependencies]
 landingzones = { path = ".", editable = true }

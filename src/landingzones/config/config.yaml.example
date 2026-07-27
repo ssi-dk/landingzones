@@ -12,6 +12,10 @@
 # Path to the transfers.tsv file
 transfers_file: config/transfers.tsv
 
+# Host-local SQLite database used by separately invoked monitoring processes.
+# Keep the live SQLite file off network filesystems.
+monitoring_database_url: sqlite:///output/landingzones-monitoring.sqlite
+
 # Directory for log files
 log_dir: log
 

@@ -19,6 +19,7 @@ from landingzones.transfer_definitions import (
     definitions_from_dataframe,
     normalize_tags_text,
 )
+from landingzones.transfer_events import EVENT_COLUMNS, EVENT_HEADER
 
 
 VALIDATION_HELPER_NAME = 'lz_run_validation.sh'
@@ -199,7 +200,14 @@ def validate_runtime_ids(rows):
         )
 
 
-def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None, systems=None):
+def parse_transfers_file(
+    filename,
+    require_runtime_files=True,
+    runtime_ids=None,
+    systems=None,
+    include_disabled=False,
+    allow_missing_runtime_ids=False,
+):
     """Parse the transfers.tsv file and return normalized transfer records.
 
     Args:
@@ -211,6 +219,11 @@ def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None,
             path validation and artifact generation.
         systems: Optional exact system values to include before endpoint
             expansion.
+        include_disabled: Retain disabled definitions for configuration
+            synchronization. Runtime generation keeps the default enabled-only
+            behavior.
+        allow_missing_runtime_ids: Return rows for matching runtime IDs without
+            rejecting requested IDs that have no rows.
     """
     with open(filename, 'r', newline='') as handle:
         reader = csv.DictReader(handle, delimiter='\t')
@@ -225,15 +238,20 @@ def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None,
 
     rows = [
         row for row in rows
-        if not clean_tsv_value(row.get('runtime_id', '')).startswith('#')
+        if not clean_tsv_value(row.get('identifiers', '')).startswith('#')
+        and not clean_tsv_value(row.get('runtime_id', '')).startswith('#')
         and not clean_tsv_value(row.get('system', '')).startswith('#')
     ]
 
     if 'enabled' in columns:
-        rows = [
-            row for row in rows
-            if clean_tsv_value(row.get('enabled', '')).upper() == 'TRUE'
-        ]
+        for row in rows:
+            row['enabled'] = normalize_bool_text(row.get('enabled', 'FALSE'))
+        if not include_disabled:
+            rows = [row for row in rows if row['enabled'] == 'TRUE']
+    else:
+        columns.append('enabled')
+        for row in rows:
+            row['enabled'] = 'TRUE'
 
     if 'identifiers' not in columns:
         columns.insert(0, 'identifiers')
@@ -247,7 +265,7 @@ def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None,
     if requested_runtime_ids:
         available = set(row.get('runtime_id', '') for row in rows)
         missing = sorted(set(requested_runtime_ids) - available)
-        if missing:
+        if missing and not allow_missing_runtime_ids:
             raise ValueError(
                 "runtime_id filter matched no transfer rows for: {0}".format(
                     ', '.join(missing)
@@ -257,7 +275,7 @@ def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None,
             row for row in rows
             if row.get('runtime_id', '') in requested_runtime_ids
         ]
-        if not rows:
+        if not rows and not allow_missing_runtime_ids:
             raise ValueError("runtime_id filter produced no transfer rows")
 
     requested_systems = normalize_system_filters(systems)
@@ -330,6 +348,7 @@ def parse_transfers_file(filename, require_runtime_files=True, runtime_ids=None,
         row['system_user'] = row.get('runtime_id', '')
         row['tags'] = normalize_tags_text(row.get('tags', ''))
         for bool_column in (
+            'enabled',
             'is_entry_point',
             'is_end_point',
             'notify_on_success',
@@ -901,6 +920,9 @@ def resolve_transfer_file_paths(df):
 
 def get_common_status_log_file(system):
     """Return the shared per-system TSV status log path."""
+    configured_path = config.report_transfer_log_file
+    if configured_path:
+        return configured_path
     safe_system = sanitize_identifier(system) or 'system'
     filename = "Landing_Zone_{0}.transfers.tsv".format(safe_system)
     return config.resolve_managed_file_path(system, filename, 'log')
@@ -908,6 +930,9 @@ def get_common_status_log_file(system):
 
 def get_common_status_lock_file(system):
     """Return the shared per-system lock path used for TSV appends."""
+    configured_path = config.report_transfer_log_file
+    if configured_path:
+        return "{0}.lock".format(configured_path)
     safe_system = sanitize_identifier(system) or 'system'
     filename = "Landing_Zone_{0}.transfers.lock".format(safe_system)
     return config.resolve_managed_file_path(system, filename, 'flock')
@@ -1035,7 +1060,8 @@ def build_transfer_commands(transfer):
     if io_nice == 'nan':
         io_nice = ''
     
-    # Base rsync options
+    # The backward-compatible composite command still performs cleanup through
+    # rsync; generated runtimes use an explicit post-delivery cleanup phase.
     base_options = "-av --remove-source-files"
     staging_paths = build_staging_paths(destination, identifier)
     
@@ -1315,6 +1341,11 @@ def generate_iterative_script_content(transfer):
 
     flow_group = str(transfer.get('flow_group', '') or '').strip()
     transfer_tags = normalize_tags_text(transfer.get('tags', ''))
+    transfer_runtime_id = str(
+        transfer.get('runtime_id', transfer.get('system_user', ''))
+        or transfer.get('system', '')
+    ).strip()
+    transfer_execution_user = str(transfer.get('users', '') or '').strip()
     is_entry_point = str(transfer.get('is_entry_point', 'FALSE') or 'FALSE').strip().upper()
     is_end_point = str(transfer.get('is_end_point', 'FALSE') or 'FALSE').strip().upper()
     readiness_policy = str(
@@ -1366,8 +1397,20 @@ notification_status_log_file="{notification_status_log_file}"
 notification_status_lock_file="{notification_status_lock_file}"
 transfer_identifier="{transfer_identifier}"
 transfer_system="{transfer_system}"
+transfer_runtime_id="{transfer_runtime_id}"
+transfer_execution_user="{transfer_execution_user}"
 flow_group="{flow_group}"
 transfer_tags="{transfer_tags}"
+event_header={event_header}
+event_transfer_identifier_field="{event_transfer_identifier_field}"
+event_runtime_id_field="{event_runtime_id_field}"
+event_execution_user_field="{event_execution_user_field}"
+event_run_id_field="{event_run_id_field}"
+event_directory_field="{event_directory_field}"
+event_status_field="{event_status_field}"
+event_phase_field="{event_phase_field}"
+event_reason_code_field="{event_reason_code_field}"
+event_message_field="{event_message_field}"
 portable_metadata_enabled="{portable_metadata_enabled}"
 is_entry_point="{is_entry_point}"
 is_end_point="{is_end_point}"
@@ -1396,6 +1439,7 @@ preflight_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.preflight.
 preflight_stderr_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.preflight-stderr.XXXXXX")"
 current_run=""
 current_run_id=""
+current_attempt_id=""
 current_run_name=""
 current_flow_group=""
 current_origin_system=""
@@ -1404,6 +1448,14 @@ current_created_at_utc=""
 current_run_source=""
 current_run_destination=""
 current_run_completed=0
+event_id=""
+event_timestamp=""
+event_status=""
+event_phase=""
+event_reason_code=""
+event_exit_code=""
+event_message=""
+event_row=""
 
 cleanup() {{
     rm -f "$run_log" "$cleanup_log" "$promote_log" "$preflight_log" "$preflight_stderr_log"
@@ -1418,6 +1470,10 @@ log_status() {{
 
 sanitize_tsv_field() {{
     printf '%s' "$1" | tr '\\t\\r\\n' '   '
+}}
+
+new_uuid() {{
+    uuidgen | tr '[:upper:]' '[:lower:]'
 }}
 
 portable_metadata_dir_for_run() {{
@@ -1594,7 +1650,10 @@ ensure_portable_events_file_local() {{
     mkdir -p "$metadata_dir"
     set_portable_metadata_permissions_local "$metadata_dir"
     if [ ! -s "$events_file" ]; then
-        printf 'event_time_utc\\trun_id\\tflow_group\\ttransfer_identifier\\tsystem\\tstatus\\tsource_path\\tdestination_path\\tmessage\\n' >> "$events_file"
+        printf '%s\\n' "$event_header" >> "$events_file"
+    elif [ "$(sed -n '1p' "$events_file")" != "$event_header" ]; then
+        printf '%s\\n' "portable event history has an unsupported header: $events_file" >&2
+        return 1
     fi
     set_portable_metadata_permissions_local "$metadata_dir" "$events_file"
 }}
@@ -1610,9 +1669,12 @@ ensure_portable_events_file_remote() {{
         chmod g+rwx "$1" 2>/dev/null || true
         if [ ! -s "$2" ]; then
             printf "%s\\n" "$3" >> "$2"
+        elif [ "$(sed -n "1p" "$2")" != "$3" ]; then
+            printf "%s\\n" "portable event history has an unsupported header: $2" >&2
+            exit 1
         fi
         chmod g+rw "$2" 2>/dev/null || true
-    ' sh "$metadata_dir" "$events_file" 'event_time_utc	run_id	flow_group	transfer_identifier	system	status	source_path	destination_path	message'
+    ' sh "$metadata_dir" "$events_file" "$event_header"
 }}
 
 read_run_id_local() {{
@@ -1649,7 +1711,8 @@ write_run_metadata_local() {{
     run_dir="$1"
     metadata_dir="$(portable_metadata_dir_for_run "$run_dir")"
     metadata_file="$(portable_metadata_file_for_run "$run_dir")"
-    created_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    created_at_utc="$current_created_at_utc"
+    [ -n "$created_at_utc" ] || created_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     mkdir -p "$metadata_dir"
     set_portable_metadata_permissions_local "$metadata_dir"
     {{
@@ -1671,7 +1734,8 @@ write_run_metadata_remote() {{
     run_dir="$3"
     metadata_dir="$(portable_metadata_dir_for_run "$run_dir")"
     metadata_file="$(portable_metadata_file_for_run "$run_dir")"
-    created_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    created_at_utc="$current_created_at_utc"
+    [ -n "$created_at_utc" ] || created_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     remote_ssh "$remote_target" "$remote_port" sh -c '
         set -e
         mkdir -p "$1"
@@ -1694,38 +1758,22 @@ write_run_metadata_remote() {{
 
 append_portable_event_local() {{
     run_dir="$1"
-    event_status="$2"
-    event_message="${{3:-}}"
     metadata_dir="$(portable_metadata_dir_for_run "$run_dir")"
     events_file="$(portable_events_file_for_run "$run_dir")"
-    event_time_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     ensure_portable_events_file_local "$metadata_dir" "$events_file"
-    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
-        "$(sanitize_tsv_field "$event_time_utc")" \
-        "$(sanitize_tsv_field "$current_run_id")" \
-        "$(sanitize_tsv_field "$current_flow_group")" \
-        "$(sanitize_tsv_field "$transfer_identifier")" \
-        "$(sanitize_tsv_field "$transfer_system")" \
-        "$(sanitize_tsv_field "$event_status")" \
-        "$(sanitize_tsv_field "$current_run_source")" \
-        "$(sanitize_tsv_field "$current_run_destination")" \
-        "$(sanitize_tsv_field "$event_message")" >> "$events_file"
+    printf '%s\\n' "$event_row" >> "$events_file"
 }}
 
 append_portable_event_remote() {{
     remote_target="$1"
     remote_port="$2"
     run_dir="$3"
-    event_status="$4"
-    event_message="${{5:-}}"
     metadata_dir="$(portable_metadata_dir_for_run "$run_dir")"
     events_file="$(portable_events_file_for_run "$run_dir")"
-    event_time_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     ensure_portable_events_file_remote "$remote_target" "$remote_port" "$metadata_dir" "$events_file"
     remote_ssh "$remote_target" "$remote_port" sh -c '
         printf "%s\\n" "$2" >> "$1"
-    ' sh "$events_file" \
-        "$(sanitize_tsv_field "$event_time_utc")	$(sanitize_tsv_field "$current_run_id")	$(sanitize_tsv_field "$current_flow_group")	$(sanitize_tsv_field "$transfer_identifier")	$(sanitize_tsv_field "$transfer_system")	$(sanitize_tsv_field "$event_status")	$(sanitize_tsv_field "$current_run_source")	$(sanitize_tsv_field "$current_run_destination")	$(sanitize_tsv_field "$event_message")"
+    ' sh "$events_file" "$event_row"
 }}
 
 source_metadata_exists() {{
@@ -1766,7 +1814,9 @@ ensure_source_run_bundle() {{
         [ -n "$current_run_name" ] || current_run_name="$current_run"
         if [ -z "$current_run_id" ]; then
             log_status "$dir_name metadata missing run_id"
-            append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination"
+            if ! route_observation_unchanged "failed" "discovery" "metadata_invalid" "$dir_name"; then
+                emit_transfer_event "failed" "discovery" "none" "$dir_name" "$current_run_source" "$current_run_destination" "portable metadata missing run_id" "metadata_invalid"
+            fi
             debug "$dir_name metadata missing run_id"
             return 1
         fi
@@ -1775,12 +1825,11 @@ ensure_source_run_bundle() {{
 
     if ! command -v uuidgen >/dev/null 2>&1; then
         log_status "$dir_name missing uuidgen"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination"
         debug "$dir_name missing uuidgen"
         return 1
     fi
 
-    current_run_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+    current_run_id="$(new_uuid)"
     current_run_name="$current_run"
     current_flow_group="$flow_group"
     current_origin_system="$transfer_system"
@@ -1794,14 +1843,19 @@ ensure_source_run_bundle() {{
 }}
 
 append_source_portable_event() {{
-    event_status="$1"
-    event_message="${{2:-}}"
     [ "$portable_metadata_enabled" = "1" ] || return 0
     [ -n "$current_run_id" ] || return 0
+    if ! source_metadata_exists; then
+        if [ -n "$source_remote_target" ]; then
+            write_run_metadata_remote "$source_remote_target" "$source_remote_port" "$source_dir"
+        else
+            write_run_metadata_local "$source_dir"
+        fi
+    fi
     if [ -n "$source_remote_target" ]; then
-        append_portable_event_remote "$source_remote_target" "$source_remote_port" "$source_dir" "$event_status" "$event_message"
+        append_portable_event_remote "$source_remote_target" "$source_remote_port" "$source_dir"
     else
-        append_portable_event_local "$source_dir" "$event_status" "$event_message"
+        append_portable_event_local "$source_dir"
     fi
 }}
 
@@ -1815,28 +1869,89 @@ destination_run_exists() {{
 }}
 
 append_destination_portable_event() {{
-    event_status="$1"
-    event_message="${{2:-}}"
     destination_run_dir="$destination_root_runtime/$dir_name"
     [ "$portable_metadata_enabled" = "1" ] || return 0
     [ -n "$current_run_id" ] || return 0
     destination_run_exists || return 0
     if [ -n "$destination_remote_target" ]; then
-        append_portable_event_remote "$destination_remote_target" "$destination_remote_port" "$destination_run_dir" "$event_status" "$event_message"
+        append_portable_event_remote "$destination_remote_target" "$destination_remote_port" "$destination_run_dir"
     else
-        append_portable_event_local "$destination_run_dir" "$event_status" "$event_message"
+        append_portable_event_local "$destination_run_dir"
     fi
 }}
 
-append_best_effort_portable_error() {{
-    event_message="${{1:-script_error}}"
-    [ "$portable_metadata_enabled" = "1" ] || return 0
-    [ -n "$current_run_id" ] || return 0
-    if source_metadata_exists; then
-        append_source_portable_event "error" "$event_message"
-        return 0
+read_source_event_field() {{
+    field_number="$1"
+    events_file="$(portable_events_file_for_run "$source_dir")"
+    if [ -n "$source_remote_target" ]; then
+        remote_ssh "$source_remote_target" "$source_remote_port" awk -F '\\t' -v field="$field_number" 'NR > 1 {{ value = $field }} END {{ print value }}' "$events_file" 2>/dev/null || true
+    elif [ -f "$events_file" ]; then
+        awk -F '\\t' -v field="$field_number" 'NR > 1 {{ value = $field }} END {{ print value }}' "$events_file"
     fi
-    append_destination_portable_event "error" "$event_message"
+}}
+
+source_event_history_contains_status() {{
+    expected_status="$1"
+    events_file="$(portable_events_file_for_run "$source_dir")"
+    if [ -n "$source_remote_target" ]; then
+        remote_ssh "$source_remote_target" "$source_remote_port" awk -F '\\t' \
+            -v field="$event_status_field" \
+            -v expected="$expected_status" \
+            'NR > 1 && $field == expected {{ found = 1 }} END {{ exit found ? 0 : 1 }}' \
+            "$events_file" 2>/dev/null
+    elif [ -f "$events_file" ]; then
+        awk -F '\\t' \
+            -v field="$event_status_field" \
+            -v expected="$expected_status" \
+            'NR > 1 && $field == expected {{ found = 1 }} END {{ exit found ? 0 : 1 }}' \
+            "$events_file"
+    else
+        return 1
+    fi
+}}
+
+source_event_unchanged() {{
+    expected_status="$1"
+    expected_phase="$2"
+    expected_reason="$3"
+    expected_message="$4"
+    [ "$(read_source_event_field "$event_status_field")" = "$expected_status" ] &&
+        [ "$(read_source_event_field "$event_phase_field")" = "$expected_phase" ] &&
+        [ "$(read_source_event_field "$event_reason_code_field")" = "$expected_reason" ] &&
+        [ "$(read_source_event_field "$event_message_field")" = "$expected_message" ]
+}}
+
+route_observation_unchanged() {{
+    expected_status="$1"
+    expected_phase="$2"
+    expected_reason="$3"
+    expected_directory="${{4:-}}"
+    [ -s "$common_status_log_file" ] || return 1
+    awk -F '\\t' \
+        -v transfer_identifier_field="$event_transfer_identifier_field" \
+        -v runtime_id_field="$event_runtime_id_field" \
+        -v execution_user_field="$event_execution_user_field" \
+        -v run_id_field="$event_run_id_field" \
+        -v directory_field="$event_directory_field" \
+        -v status_field="$event_status_field" \
+        -v phase_field="$event_phase_field" \
+        -v reason_code_field="$event_reason_code_field" \
+        -v identifier="$transfer_identifier" \
+        -v runtime="$transfer_runtime_id" \
+        -v execution_user="$transfer_execution_user" \
+        -v expected_status="$expected_status" \
+        -v expected_phase="$expected_phase" \
+        -v expected_reason="$expected_reason" \
+        -v expected_directory="$expected_directory" '
+            NR > 1 && $transfer_identifier_field == identifier && $runtime_id_field == runtime && $execution_user_field == execution_user && $run_id_field == "" && $directory_field == expected_directory {{
+                status = $status_field
+                phase = $phase_field
+                reason = $reason_code_field
+            }}
+            END {{
+                exit (status == expected_status && phase == expected_phase && reason == expected_reason) ? 0 : 1
+            }}
+        ' "$common_status_log_file"
 }}
 
 notification_enabled_for_status() {{
@@ -1844,7 +1959,7 @@ notification_enabled_for_status() {{
     if [ "$event_status" = "completed" ] && [ "$notify_on_success" = "TRUE" ]; then
         return 0
     fi
-    if [ "$event_status" = "error" ] && [ "$notify_on_error" = "TRUE" ]; then
+    if [ "$event_status" = "failed" ] && [ "$notify_on_error" = "TRUE" ]; then
         return 0
     fi
     return 1
@@ -1973,37 +2088,80 @@ notify_transfer_event() {{
     return 0
 }}
 
-append_common_status() {{
-    event_status="$1"
-    event_directory="${{2:-}}"
-    event_source="${{3:-}}"
-    event_destination="${{4:-}}"
-    event_message="${{5:-}}"
-    event_timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+append_event_spool() {{
     (
         exec 8>>"$common_status_lock_file"
         {flock_command} 8
         if [ ! -s "$common_status_log_file" ]; then
-            printf 'event_time_utc\\ttransfer_identifier\\tsystem\\trun_id\\trun_name\\tflow_group\\ttags\\torigin_system\\tentry_transfer_identifier\\tcreated_at_utc\\tdirectory\\tsource_path\\tdestination_path\\tstatus\\tmessage\\n' >> "$common_status_log_file"
+            printf '%s\\n' "$event_header" >> "$common_status_log_file"
+        elif [ "$(sed -n '1p' "$common_status_log_file")" != "$event_header" ]; then
+            printf '%s\\n' "Event Spool has an unsupported header: $common_status_log_file" >&2
+            exit 1
         fi
-        printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \\
-            "$(sanitize_tsv_field "$event_timestamp")" \\
-            "$(sanitize_tsv_field "$transfer_identifier")" \\
-            "$(sanitize_tsv_field "$transfer_system")" \\
-            "$(sanitize_tsv_field "$current_run_id")" \\
-            "$(sanitize_tsv_field "$current_run_name")" \\
-            "$(sanitize_tsv_field "$current_flow_group")" \\
-            "$(sanitize_tsv_field "$transfer_tags")" \\
-            "$(sanitize_tsv_field "$current_origin_system")" \\
-            "$(sanitize_tsv_field "$current_entry_transfer_identifier")" \\
-            "$(sanitize_tsv_field "$current_created_at_utc")" \\
-            "$(sanitize_tsv_field "$event_directory")" \\
-            "$(sanitize_tsv_field "$event_source")" \\
-            "$(sanitize_tsv_field "$event_destination")" \\
-            "$(sanitize_tsv_field "$event_status")" \\
-            "$(sanitize_tsv_field "$event_message")" >> "$common_status_log_file"
-    ) || debug "unable to append common status row"
+        printf '%s\\n' "$event_row" >> "$common_status_log_file"
+    ) || {{
+        log_status "event spool append failed: $common_status_log_file"
+        debug "unable to append Transfer Event to Event Spool"
+    }}
     notify_transfer_event "$event_timestamp" "$event_status" "$event_directory" "$event_source" "$event_destination" "$event_message" || debug "notification delivery failed"
+}}
+
+serialize_transfer_event() {{
+    printf '1\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s' \
+        "$(sanitize_tsv_field "$event_id")" \
+        "$(sanitize_tsv_field "$event_timestamp")" \
+        "$(sanitize_tsv_field "$transfer_identifier")" \
+        "$(sanitize_tsv_field "$transfer_system")" \
+        "$(sanitize_tsv_field "$transfer_runtime_id")" \
+        "$(sanitize_tsv_field "$transfer_execution_user")" \
+        "$(sanitize_tsv_field "$current_run_id")" \
+        "$(sanitize_tsv_field "$current_attempt_id")" \
+        "$(sanitize_tsv_field "$current_run_name")" \
+        "$(sanitize_tsv_field "$current_flow_group")" \
+        "$(sanitize_tsv_field "$transfer_tags")" \
+        "$(sanitize_tsv_field "$current_origin_system")" \
+        "$(sanitize_tsv_field "$current_entry_transfer_identifier")" \
+        "$(sanitize_tsv_field "$current_created_at_utc")" \
+        "$(sanitize_tsv_field "$event_directory")" \
+        "$(sanitize_tsv_field "$event_source")" \
+        "$(sanitize_tsv_field "$event_destination")" \
+        "$(sanitize_tsv_field "$event_status")" \
+        "$(sanitize_tsv_field "$event_phase")" \
+        "$(sanitize_tsv_field "$event_reason_code")" \
+        "$(sanitize_tsv_field "$event_exit_code")" \
+        "$(sanitize_tsv_field "$event_message")"
+}}
+
+emit_transfer_event() {{
+    event_status="$1"
+    event_phase="$2"
+    portable_target="${{3:-none}}"
+    event_directory="${{4:-}}"
+    event_source="${{5:-}}"
+    event_destination="${{6:-}}"
+    event_message="${{7:-}}"
+    event_reason_code="${{8:-}}"
+    event_exit_code="${{9:-}}"
+    if ! event_id="$(new_uuid)"; then
+        log_status "unable to generate Transfer Event identity"
+        debug "unable to generate Transfer Event identity"
+        return 0
+    fi
+    event_timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    event_row="$(serialize_transfer_event)"
+    append_event_spool
+    case "$portable_target" in
+        source)
+            append_source_portable_event || debug "unable to append source portable Transfer Event"
+            ;;
+        destination)
+            append_destination_portable_event || debug "unable to append destination portable Transfer Event"
+            ;;
+        both)
+            append_source_portable_event || debug "unable to append source portable Transfer Event"
+            append_destination_portable_event || debug "unable to append destination portable Transfer Event"
+            ;;
+    esac
 }}
 
 check_entry_point_readiness() {{
@@ -2012,7 +2170,9 @@ check_entry_point_readiness() {{
     if [ -n "$source_remote_target" ]; then
         readiness_message="stable_snapshot readiness is not yet supported for remote sources"
         log_status "$dir_name error"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$readiness_message"
+        if ! source_event_unchanged "failed" "readiness" "" "$readiness_message"; then
+            emit_transfer_event "failed" "readiness" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$readiness_message"
+        fi
         debug "$dir_name $readiness_message"
         return 1
     fi
@@ -2025,7 +2185,9 @@ check_entry_point_readiness() {{
     if ! readiness_output="$("$readiness_python" -m landingzones.entrypoint_readiness observe --run-dir "$source_dir" --state-root "$readiness_state_root" --stable-observations "$readiness_stable_observations" --quiet-seconds "$readiness_quiet_seconds" --fingerprint-mode "$readiness_fingerprint_mode" 2>"$preflight_stderr_log")"; then
         readiness_message="readiness observation failed: $(summarize_log "$preflight_stderr_log")"
         log_status "$dir_name error"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$readiness_message"
+        if ! source_event_unchanged "failed" "readiness" "" "$readiness_message"; then
+            emit_transfer_event "failed" "readiness" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$readiness_message"
+        fi
         debug "$dir_name $readiness_message"
         return 1
     fi
@@ -2040,7 +2202,14 @@ check_entry_point_readiness() {{
 
     readiness_message="entry-point readiness $readiness_status (stable_observations=$readiness_seen)"
     log_status "$dir_name $readiness_status"
-    append_common_status "$readiness_status" "$dir_name" "$current_run_source" "$current_run_destination" "$readiness_message"
+    previous_readiness_state=""
+    if [ "$(read_source_event_field "$event_status_field")" = "waiting" ] && [ "$(read_source_event_field "$event_phase_field")" = "readiness" ]; then
+        previous_readiness_message="$(read_source_event_field "$event_message_field")"
+        previous_readiness_state="$(printf '%s\\n' "$previous_readiness_message" | awk '{{ print $3 }}')"
+    fi
+    if [ "$previous_readiness_state" != "$readiness_status" ]; then
+        emit_transfer_event "waiting" "readiness" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$readiness_message"
+    fi
     debug "$dir_name $readiness_message"
     return 1
 }}
@@ -2053,20 +2222,24 @@ prepare_entry_point_snapshot() {{
     rm -rf "$snapshot_dir"
     mkdir -p "$snapshot_dir"
 
-    if ! rsync -a --delete --exclude="/$portable_metadata_dir_name" --exclude="/$readiness_state_dir_name" --exclude="/.staging" "$source_dir/" "$snapshot_dir/" >>"$preflight_log" 2>"$preflight_stderr_log"; then
+    if ! rsync -a --delete --exclude="/$readiness_state_dir_name" --exclude="/.staging" "$source_dir/" "$snapshot_dir/" >>"$preflight_log" 2>"$preflight_stderr_log"; then
         snapshot_message="readiness snapshot copy failed: $(summarize_log "$preflight_stderr_log")"
         log_status "$dir_name error"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$snapshot_message"
+        if ! source_event_unchanged "failed" "readiness" "" "$snapshot_message"; then
+            emit_transfer_event "failed" "readiness" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$snapshot_message"
+        fi
         debug "$dir_name $snapshot_message"
         rm -rf "$snapshot_dir"
         return 1
     fi
 
     : >"$preflight_log"
-    if ! rsync -ani --delete --exclude="/$portable_metadata_dir_name" --exclude="/$readiness_state_dir_name" --exclude="/.staging" "$source_dir/" "$snapshot_dir/" >"$preflight_log" 2>"$preflight_stderr_log"; then
+    if ! rsync -ani --delete --exclude="/$readiness_state_dir_name" --exclude="/.staging" "$source_dir/" "$snapshot_dir/" >"$preflight_log" 2>"$preflight_stderr_log"; then
         snapshot_message="readiness snapshot confirmation failed: $(summarize_log "$preflight_stderr_log")"
         log_status "$dir_name error"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$snapshot_message"
+        if ! source_event_unchanged "failed" "readiness" "" "$snapshot_message"; then
+            emit_transfer_event "failed" "readiness" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$snapshot_message"
+        fi
         debug "$dir_name $snapshot_message"
         rm -rf "$snapshot_dir"
         return 1
@@ -2074,7 +2247,9 @@ prepare_entry_point_snapshot() {{
     if sed '/^sending incremental file list$/d; /^sent .* bytes .*$/d; /^total size is .*$/d; /^$/d' "$preflight_log" | grep -q .; then
         snapshot_message="readiness source changed during snapshot"
         log_status "$dir_name waiting_for_stability"
-        append_common_status "waiting_for_stability" "$dir_name" "$current_run_source" "$current_run_destination" "$snapshot_message"
+        if ! source_event_unchanged "waiting" "readiness" "" "$snapshot_message"; then
+            emit_transfer_event "waiting" "readiness" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$snapshot_message"
+        fi
         debug "$dir_name $snapshot_message"
         rm -rf "$snapshot_dir"
         return 1
@@ -2124,6 +2299,7 @@ dump_debug_log() {{
 reset_current_run_context() {{
     current_run=""
     current_run_id=""
+    current_attempt_id=""
     current_run_name=""
     current_flow_group=""
     current_origin_system=""
@@ -2132,6 +2308,74 @@ reset_current_run_context() {{
     current_run_source=""
     current_run_destination=""
     current_run_completed=0
+}}
+
+cleanup_current_source() {{
+    cleanup_reason_code=""
+    source_parent="$(dirname "$source_dir")"
+    if [ -n "$source_remote_target" ]; then
+        if ! remote_ssh "$source_remote_target" "$source_remote_port" sh -c '
+            [ -w "$1" ] && [ -x "$1" ]
+        ' sh "$source_parent"; then
+            cleanup_reason_code="permission_denied"
+            printf '%s\\n' "source parent is not writable: $source_parent"
+            return 1
+        fi
+    elif [ ! -w "$source_parent" ] || [ ! -x "$source_parent" ]; then
+        cleanup_reason_code="permission_denied"
+        printf '%s\\n' "source parent is not writable: $source_parent"
+        return 1
+    fi
+    if [ -n "$source_remote_target" ]; then
+        remote_ssh "$source_remote_target" "$source_remote_port" sh -c '
+            run_dir="$1"
+            metadata_dir_name="$2"
+            [ ! -e "$run_dir/$metadata_dir_name" ] || rm -rf "$run_dir/$metadata_dir_name"
+            [ ! -d "$run_dir" ] || find "$run_dir" -depth -type d -empty -delete
+        ' sh "$source_dir" "$portable_metadata_dir_name"
+    else
+        if [ -e "$source_dir/$portable_metadata_dir_name" ]; then
+            rm -rf "$source_dir/$portable_metadata_dir_name"
+        fi
+        if [ -d "$source_dir" ]; then
+            find "$source_dir" -depth -type d -empty -delete
+        fi
+    fi
+}}
+
+source_requires_cleanup_recovery() {{
+    last_status="$(read_source_event_field "$event_status_field")"
+    last_phase="$(read_source_event_field "$event_phase_field")"
+    if [ "$last_status" = "delivered" ]; then
+        return 0
+    fi
+    if [ "$last_status" != "failed" ] || [ "$last_phase" != "cleanup" ]; then
+        return 1
+    fi
+    source_event_history_contains_status "delivered"
+}}
+
+recover_source_cleanup() {{
+    if ! current_attempt_id="$(new_uuid)"; then
+        log_status "$dir_name unable to generate cleanup Transfer Attempt identity"
+        return 1
+    fi
+    log_status "$dir_name cleanup recovery started"
+    emit_transfer_event "started" "cleanup" "both" "$dir_name" "$current_run_source" "$current_run_destination"
+    if cleanup_current_source >"$cleanup_log" 2>&1; then
+        :
+    else
+        cleanup_exit_code=$?
+        cleanup_message="source cleanup failed: $(summarize_log "$cleanup_log")"
+        log_status "$dir_name cleanup failed"
+        emit_transfer_event "failed" "cleanup" "both" "$dir_name" "$current_run_source" "$current_run_destination" "$cleanup_message" "$cleanup_reason_code" "$cleanup_exit_code"
+        debug "$dir_name $cleanup_message"
+        return 1
+    fi
+    log_status "$dir_name completed"
+    emit_transfer_event "completed" "cleanup" "destination" "$dir_name" "$current_run_source" "$current_run_destination"
+    current_run_completed=1
+    return 0
 }}
 
 summarize_log() {{
@@ -2147,11 +2391,14 @@ on_exit() {{
     status=$?
     if [ "$status" -ne 0 ]; then
         if [ -n "$current_run" ] && [ "$current_run_completed" -eq 0 ]; then
-            append_best_effort_portable_error "script_error"
             log_status "$current_run error"
-            append_common_status "error" "$current_run" "$current_run_source" "$current_run_destination"
+            if [ -n "$current_attempt_id" ]; then
+                emit_transfer_event "failed" "transfer" "source" "$current_run" "$current_run_source" "$current_run_destination" "generated runtime exited unexpectedly" "" "$status"
+            else
+                emit_transfer_event "failed" "discovery" "source" "$current_run" "$current_run_source" "$current_run_destination" "generated runtime exited unexpectedly" "" "$status"
+            fi
         else
-            append_common_status "error" "" "{transfer_source_label}" "{transfer_destination_label}"
+            emit_transfer_event "failed" "discovery" "none" "" "{transfer_source_label}" "{transfer_destination_label}" "generated runtime exited unexpectedly" "" "$status"
         fi
         debug "script failed with exit code $status"
         dump_debug_log "run log" "$run_log"
@@ -2166,6 +2413,7 @@ on_exit() {{
 trap on_exit EXIT HUP INT TERM
 
 mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")" "$(dirname "$common_status_log_file")" "$(dirname "$common_status_lock_file")" "$(dirname "$notification_status_log_file")" "$(dirname "$notification_status_lock_file")"
+[ -n "$transfer_execution_user" ] || transfer_execution_user="$(id -un 2>/dev/null || printf unknown)"
 if [ -n "$source_remote_target" ] || [ -n "$destination_remote_target" ]; then
     random_start_delay 60
 fi
@@ -2179,7 +2427,9 @@ fi
 
 if ! {source_exists_cmd}; then
     log_status "{missing_source_message}"
-    append_common_status "error" "" "{transfer_source_label}" "{transfer_destination_label}"
+    if ! route_observation_unchanged "failed" "discovery" "source_missing"; then
+        emit_transfer_event "failed" "discovery" "none" "" "{transfer_source_label}" "{transfer_destination_label}" "{missing_source_message}" "source_missing"
+    fi
     printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "{missing_source_message}" >> "$log_file"
     debug "{missing_source_message}"
     exit 0
@@ -2194,12 +2444,19 @@ fi
     current_run_source={run_source_expr}
     current_run_destination={run_destination_expr}
     current_run_id=""
+    current_attempt_id=""
     current_run_name="$dir_name"
     current_flow_group=""
     current_origin_system=""
     current_entry_transfer_identifier=""
     current_created_at_utc=""
     current_run_completed=0
+    ensure_source_run_bundle || continue
+    if source_requires_cleanup_recovery; then
+        recover_source_cleanup || true
+        reset_current_run_context
+        continue
+    fi
     if ! check_entry_point_readiness; then
         reset_current_run_context
         continue
@@ -2208,16 +2465,19 @@ fi
         reset_current_run_context
         continue
     fi
-    ensure_source_run_bundle || continue
-    log_status "$dir_name initiated"
-    append_source_portable_event "initiated"
-    append_common_status "initiated" "$dir_name" "$current_run_source" "$current_run_destination"
-    debug "$dir_name initiated"
+    if ! current_attempt_id="$(new_uuid)"; then
+        log_status "$dir_name unable to generate Transfer Attempt identity"
+        debug "$dir_name unable to generate Transfer Attempt identity"
+        reset_current_run_context
+        continue
+    fi
+    log_status "$dir_name started"
+    emit_transfer_event "started" "transfer" "source" "$dir_name" "$current_run_source" "$current_run_destination"
+    debug "$dir_name started"
     if ! ensure_archived_source_bundle >"$preflight_log" 2>"$preflight_stderr_log"; then
         archive_message="archive creation failed: $(summarize_log "$preflight_stderr_log")"
         log_status "$dir_name error"
-        append_source_portable_event "error" "$archive_message"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$archive_message"
+        emit_transfer_event "failed" "transfer" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$archive_message"
         debug "$dir_name $archive_message"
         reset_current_run_context
         continue
@@ -2227,8 +2487,7 @@ fi
     if ! {source_cleanup_preflight_cmd} >"$preflight_log" 2>"$preflight_stderr_log"; then
         preflight_message="source cleanup preflight command failed: $(summarize_log "$preflight_stderr_log")"
         log_status "$dir_name error"
-        append_source_portable_event "error" "$preflight_message"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$preflight_message"
+        emit_transfer_event "failed" "cleanup" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$preflight_message"
         debug "$dir_name $preflight_message"
         reset_current_run_context
         continue
@@ -2236,54 +2495,74 @@ fi
     if [ -s "$preflight_log" ]; then
         preflight_message="source cleanup preflight failed: $(summarize_log "$preflight_log")"
         log_status "$dir_name error"
-        append_source_portable_event "error" "$preflight_message"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$preflight_message"
+        emit_transfer_event "failed" "cleanup" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$preflight_message" "permission_denied"
         debug "$dir_name $preflight_message"
         reset_current_run_context
         continue
     fi
     {mkdir_cmd} </dev/null >>"$promote_log" 2>&1
-    if ! {dry_run_rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$preflight_log" 2>&1; then
+    if {dry_run_rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$preflight_log" 2>&1; then
+        :
+    else
+        preflight_exit_code=$?
         preflight_message="rsync dry-run failed: $(summarize_log "$preflight_log")"
         {cleanup_staging_cmd} </dev/null >>"$preflight_log" 2>&1
         log_status "$dir_name error"
-        append_source_portable_event "error" "$preflight_message"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$preflight_message"
+        emit_transfer_event "failed" "transfer" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$preflight_message" "rsync_failed" "$preflight_exit_code"
         debug "$dir_name $preflight_message"
         reset_current_run_context
         continue
     fi
     : >"$preflight_log"
-    if ! {rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$run_log" 2>&1; then
+    if {rsync_cmd} {rsync_source} {rsync_destination} </dev/null >>"$run_log" 2>&1; then
+        :
+    else
+        rsync_exit_code=$?
         rsync_message="rsync failed: $(summarize_log "$run_log")"
         log_status "$dir_name error"
-        append_source_portable_event "error" "$rsync_message"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$rsync_message"
+        emit_transfer_event "failed" "transfer" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$rsync_message" "rsync_failed" "$rsync_exit_code"
         debug "$dir_name $rsync_message"
         reset_current_run_context
         continue
     fi
-    if ! ( {promote_cmd} ) </dev/null >>"$promote_log" 2>&1; then
+    if ( {promote_cmd} ) </dev/null >>"$promote_log" 2>&1; then
+        :
+    else
+        promote_exit_code=$?
         promote_message="staging promote failed: see promote log"
         log_status "$dir_name error"
-        append_source_portable_event "error" "$promote_message"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$promote_message"
+        emit_transfer_event "failed" "promotion" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$promote_message" "" "$promote_exit_code"
         debug "$dir_name $promote_message"
         reset_current_run_context
         continue
     fi
-    if ! extract_archived_destination_bundle </dev/null >>"$promote_log" 2>&1; then
+    if extract_archived_destination_bundle </dev/null >>"$promote_log" 2>&1; then
+        :
+    else
+        extract_exit_code=$?
         promote_message="archive extraction failed: see promote log"
         log_status "$dir_name error"
-        append_destination_portable_event "error" "$promote_message"
-        append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$promote_message"
+        emit_transfer_event "failed" "promotion" "both" "$dir_name" "$current_run_source" "$current_run_destination" "$promote_message" "" "$extract_exit_code"
         debug "$dir_name $promote_message"
+        reset_current_run_context
+        continue
+    fi
+    log_status "$dir_name delivered"
+    emit_transfer_event "delivered" "promotion" "both" "$dir_name" "$current_run_source" "$current_run_destination"
+    debug "$dir_name delivered"
+    if cleanup_current_source >"$cleanup_log" 2>&1; then
+        :
+    else
+        cleanup_exit_code=$?
+        cleanup_message="source cleanup failed: $(summarize_log "$cleanup_log")"
+        log_status "$dir_name cleanup failed"
+        emit_transfer_event "failed" "cleanup" "both" "$dir_name" "$current_run_source" "$current_run_destination" "$cleanup_message" "$cleanup_reason_code" "$cleanup_exit_code"
+        debug "$dir_name $cleanup_message"
         reset_current_run_context
         continue
     fi
     log_status "$dir_name completed"
-    append_destination_portable_event "completed"
-    append_common_status "completed" "$dir_name" "$current_run_source" "$current_run_destination"
+    emit_transfer_event "completed" "cleanup" "destination" "$dir_name" "$current_run_source" "$current_run_destination"
     debug "$dir_name completed"
     current_run_completed=1
     reset_current_run_context
@@ -2337,8 +2616,20 @@ fi
         notification_status_lock_file=commands['notification_status_lock_file'],
         transfer_identifier=identifier.replace('"', '\\"'),
         transfer_system=str(transfer.get('system', '') or '').replace('"', '\\"'),
+        transfer_runtime_id=transfer_runtime_id.replace('"', '\\"'),
+        transfer_execution_user=transfer_execution_user.replace('"', '\\"'),
         flow_group=flow_group.replace('"', '\\"'),
         transfer_tags=transfer_tags.replace('"', '\\"'),
+        event_header=shell_assignment_value(EVENT_HEADER),
+        event_transfer_identifier_field=EVENT_COLUMNS.index("transfer_identifier") + 1,
+        event_runtime_id_field=EVENT_COLUMNS.index("runtime_id") + 1,
+        event_execution_user_field=EVENT_COLUMNS.index("execution_user") + 1,
+        event_run_id_field=EVENT_COLUMNS.index("run_id") + 1,
+        event_directory_field=EVENT_COLUMNS.index("directory") + 1,
+        event_status_field=EVENT_COLUMNS.index("status") + 1,
+        event_phase_field=EVENT_COLUMNS.index("phase") + 1,
+        event_reason_code_field=EVENT_COLUMNS.index("reason_code") + 1,
+        event_message_field=EVENT_COLUMNS.index("message") + 1,
         portable_metadata_enabled=portable_metadata_enabled,
         is_entry_point=is_entry_point,
         is_end_point=is_end_point,

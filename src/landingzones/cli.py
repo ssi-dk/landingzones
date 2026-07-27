@@ -11,7 +11,10 @@ from landingzones import __version__
 from landingzones.config import config
 from landingzones import check_deployment_readiness as cdr
 from landingzones import generate_cron_files as gcf
+from landingzones import monitoring
+from landingzones import monitoring_service
 from landingzones import plot_transfer_status as pts
+from landingzones import transfer_catalog
 from landingzones import validate_separation as vsep
 
 
@@ -254,6 +257,47 @@ def build_cli_parser():
     )
     report_transfers_parser.set_defaults(handler=handle_report_transfers)
 
+    monitor_parser = subparsers.add_parser(
+        'monitor',
+        help='Ingest Transfer Events and serve live database-backed monitoring',
+    )
+    monitor_subparsers = monitor_parser.add_subparsers(
+        dest='monitor_command',
+        required=True,
+    )
+
+    monitor_ingest_parser = monitor_subparsers.add_parser(
+        'ingest',
+        help='Ingest one or more schema-version-1 Event Spools',
+    )
+    monitor_ingest_parser.add_argument('spools', nargs='+')
+    monitor_ingest_parser.add_argument('--database-url', default=None)
+    monitor_ingest_parser.add_argument('--spool-id', default=None)
+    monitor_ingest_parser.add_argument('--config', '-c', default=None)
+    monitor_ingest_parser.set_defaults(handler=handle_monitor_ingest)
+
+    monitor_sync_parser = monitor_subparsers.add_parser(
+        'sync-definitions',
+        help='Synchronize current Transfer Definitions into monitoring',
+    )
+    monitor_sync_parser.add_argument('--database-url', default=None)
+    monitor_sync_parser.add_argument('--config', '-c', default=None)
+    monitor_sync_parser.add_argument('--transfers', '-t', default=None)
+    monitor_sync_parser.add_argument('--runtime-id', action='append', default=None)
+    monitor_sync_parser.set_defaults(handler=handle_monitor_sync_definitions)
+
+    monitor_serve_parser = monitor_subparsers.add_parser(
+        'serve',
+        help='Serve live HTML and JSON monitoring views',
+    )
+    monitor_serve_parser.add_argument('--database-url', default=None)
+    monitor_serve_parser.add_argument('--config', '-c', default=None)
+    monitor_serve_parser.add_argument('--transfers', '-t', default=None)
+    monitor_serve_parser.add_argument('--runtime-id', action='append', default=None)
+    monitor_serve_parser.add_argument('--host', default='127.0.0.1')
+    monitor_serve_parser.add_argument('--port', type=int, default=8080)
+    monitor_serve_parser.set_defaults(handler=handle_monitor_serve)
+
     return parser
 
 
@@ -463,6 +507,84 @@ def handle_report_transfers(args, extra_args):
     for tag in args.tag:
         append_option(argv, '--tag', tag)
     return normalize_exit_code(pts.main(argv))
+
+
+def _monitor_database_url(args):
+    config.load_config(config_file=resolve_cli_config(args))
+    return args.database_url or config.monitoring_database_url
+
+
+def handle_monitor_ingest(args, extra_args):
+    """Ingest configured Event Spools without coupling transfer execution to SQL."""
+    if extra_args:
+        raise SystemExit("unrecognized arguments: {0}".format(' '.join(extra_args)))
+    if args.spool_id and len(args.spools) != 1:
+        raise SystemExit("--spool-id may be used only when ingesting one Event Spool")
+    database_url = _monitor_database_url(args)
+    for spool_path in args.spools:
+        result = monitoring.ingest_event_spool(
+            database_url,
+            spool_path,
+            spool_id=args.spool_id,
+        )
+        print(
+            "{0}: inserted={1} duplicates={2} checkpoint={3} deferred_bytes={4}".format(
+                spool_path,
+                result.inserted,
+                result.duplicates,
+                result.checkpoint_offset,
+                result.deferred_bytes,
+            )
+        )
+    return 0
+
+
+def handle_monitor_sync_definitions(args, extra_args):
+    """Synchronize current reporting-mode Transfer Definitions."""
+    if extra_args:
+        raise SystemExit("unrecognized arguments: {0}".format(' '.join(extra_args)))
+    database_url = _monitor_database_url(args)
+    synchronized = _sync_monitoring_definitions(database_url, args)
+    print("Synchronized {0} Transfer Definitions.".format(synchronized))
+    return 0
+
+
+def _sync_monitoring_definitions(database_url, args):
+    """Load current configuration and upsert its Transfer Definitions."""
+    runtime_ids = effective_runtime_ids(args) or config.runtime_ids or None
+    definitions = transfer_catalog.load_monitoring_transfer_definitions(
+        config_file=resolve_cli_config(args),
+        transfers_file=args.transfers,
+        runtime_ids=runtime_ids,
+    )
+    synchronized = monitoring.sync_transfer_definitions(
+        database_url,
+        definitions,
+        scope_runtime_ids=runtime_ids,
+    )
+    return synchronized
+
+
+def handle_monitor_serve(args, extra_args):
+    """Run the live database-backed monitoring service."""
+    if extra_args:
+        raise SystemExit("unrecognized arguments: {0}".format(' '.join(extra_args)))
+    database_url = _monitor_database_url(args)
+    synchronized = _sync_monitoring_definitions(database_url, args)
+    print(
+        "Synchronized {0} Transfer Definitions; serving Landing Zones monitoring "
+        "on http://{1}:{2}".format(
+            synchronized,
+            args.host,
+            args.port,
+        )
+    )
+    monitoring_service.serve_monitoring(
+        database_url,
+        host=args.host,
+        port=args.port,
+    )
+    return 0
 
 
 def main(argv=None):

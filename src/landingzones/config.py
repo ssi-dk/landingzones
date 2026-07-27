@@ -177,6 +177,7 @@ class Config:
         - LZ_ARTIFACT_OWNER_ID: Owner marker for generated artifacts
         - LZ_ARTIFACT_PREFIX: Filename prefix for generated artifacts
         - LZ_REPORT_TRANSFER_LOG_FILE: Path to the default transfer TSV used for reporting
+        - LZ_MONITORING_DATABASE_URL: SQLAlchemy URL for the monitoring SQLite database
         - LZ_LOCK_FILE: Path to default lock file
         - LZ_LOG_DIR: Default log directory
         - LZ_OUTPUT_DIR: Default output directory
@@ -314,6 +315,15 @@ class Config:
     def transfer_log_file(self):
         """Backward-compatible alias for older callers."""
         return self.report_transfer_log_file
+
+    @property
+    def monitoring_database_url(self):
+        """SQLAlchemy URL used by separately invoked monitoring processes."""
+        return self._get_value(
+            'monitoring_database_url',
+            'LZ_MONITORING_DATABASE_URL',
+            'sqlite:///output/landingzones-monitoring.sqlite',
+        )
     
     @property
     def default_lock_file(self):
@@ -536,6 +546,7 @@ class Config:
             'config_file': self.config_file,
             'transfers_file': self.transfers_file,
             'report_transfer_log_file': self.report_transfer_log_file,
+            'monitoring_database_url': self.monitoring_database_url,
             'test_data': self.test_data,
             'default_lock_file': self.default_lock_file,
             'log_dir': self.log_dir,

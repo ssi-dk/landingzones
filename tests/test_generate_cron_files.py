@@ -183,6 +183,23 @@ localhost_main\tlocalhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.l
         
         assert len(df) == 2
         assert 'commented' not in df['system'].values
+
+    def test_parse_filters_comment_heading_rows_when_retaining_disabled(self, tmp_path):
+        """Comment headings must not become runtime IDs for monitoring inventories."""
+        tsv_content = """identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\tlog_file\tflock_file
+#\tAalborg to\t\t\t\t\t\t
+server1_main\tserver1.user1\tTRUE\tserver1\tuser1\t/src/\t/dest/\t/tmp/log.txt\t/tmp/lock.txt
+disabled_route\tserver2.user2\tFALSE\tserver2\tuser2\t/src2/\t/dest2/\t/tmp/log2.txt\t/tmp/lock2.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        df = gcf.parse_transfers_file(str(test_file), include_disabled=True)
+
+        assert len(df) == 2
+        assert 'Aalborg to' not in df['runtime_id'].values
+        assert 'server1.user1' in df['runtime_id'].values
+        assert 'server2.user2' in df['runtime_id'].values
     
     def test_parse_filters_disabled_rows(self, tmp_path):
         """Test that rows with enabled != TRUE are filtered out"""
@@ -683,6 +700,18 @@ class TestGenerateRsyncCommand:
         assert 'chmod g+rwx /dest/path/.staging /dest/path/.staging/transfer' in cmd
         assert 'rmdir /dest/path/.staging ' not in cmd
         assert '/tmp/test.log' in cmd
+
+    def test_configured_common_status_path_is_reused_as_the_event_spool(self, tmp_path):
+        """Cutover should keep the explicitly configured common-status path."""
+        spool_path = tmp_path / "shared" / "transfers.tsv"
+        snapshot = gcf.config.snapshot_state()
+        gcf.config.load_config(report_transfer_log_file=str(spool_path))
+        try:
+            resolved = gcf.get_common_status_log_file("server1")
+        finally:
+            gcf.config.restore_state(snapshot)
+
+        assert resolved == str(spool_path)
     
     def test_rsync_with_ssh_port(self):
         """Test rsync command with SSH port"""
@@ -1116,10 +1145,10 @@ class TestGenerateRsyncCommand:
         assert 'preflight_stderr_log="$(mktemp "${TMPDIR:-/tmp}/landingzones.sample.preflight-stderr.XXXXXX")"' in script
         assert 'if ! find "$source_dir" -type d -print | while IFS= read -r dir_path; do [ -w "$dir_path" ] && [ -x "$dir_path" ] || printf "%s\\n" "$dir_path"; done >"$preflight_log" 2>"$preflight_stderr_log"; then' in script
         assert 'rsync --dry-run -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$preflight_log" 2>&1' in script
-        assert 'if ! rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1; then' in script
+        assert 'if rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1; then' in script
         assert 'rsync_message="rsync failed: $(summarize_log "$run_log")"' in script
         assert 'mkdir -p "/dest/.staging/$dir_name" && (chmod g+rwx "/dest/.staging" "/dest/.staging/$dir_name" 2>/dev/null || true)' in script
-        assert 'if ! ( if [ -d "/dest/$dir_name" ]; then rsync -a --remove-source-files "/dest/.staging/$dir_name/" "/dest/$dir_name/" && find "/dest/.staging/$dir_name" -mindepth 1 -depth -type d -empty -delete && rmdir "/dest/.staging/$dir_name"; else mv "/dest/.staging/$dir_name" "/dest/$dir_name"; fi ) </dev/null >>"$promote_log" 2>&1; then' in script
+        assert 'if ( if [ -d "/dest/$dir_name" ]; then rsync -a --remove-source-files "/dest/.staging/$dir_name/" "/dest/$dir_name/" && find "/dest/.staging/$dir_name" -mindepth 1 -depth -type d -empty -delete && rmdir "/dest/.staging/$dir_name"; else mv "/dest/.staging/$dir_name" "/dest/$dir_name"; fi ) </dev/null >>"$promote_log" 2>&1; then' in script
         assert 'rmdir "/dest/.staging" 2>/dev/null || true' not in script
         assert 'preflight_message="source cleanup preflight command failed: $(summarize_log "$preflight_stderr_log")"' in script
         assert 'preflight_message="source cleanup preflight failed: $(summarize_log "$preflight_log")"' in script
@@ -1141,10 +1170,11 @@ class TestGenerateRsyncCommand:
         assert 'flow_group=""' in script
         assert 'current_flow_group="$flow_group"' in script
         assert 'missing portable metadata' not in script
-        assert "printf 'event_time_utc\\ttransfer_identifier\\tsystem\\trun_id\\trun_name\\tflow_group\\ttags\\torigin_system\\tentry_transfer_identifier\\tcreated_at_utc\\tdirectory\\tsource_path\\tdestination_path\\tstatus\\tmessage\\n'" in script
-        assert 'append_common_status "initiated" "$dir_name" "$current_run_source" "$current_run_destination"' in script
-        assert 'append_common_status "completed" "$dir_name" "$current_run_source" "$current_run_destination"' in script
-        assert 'append_common_status "error" "$current_run" "$current_run_source" "$current_run_destination"' in script
+        assert "event_header=" in script
+        assert "schema_version\tevent_id\tevent_time_utc" in script
+        assert 'emit_transfer_event "started" "transfer" "source"' in script
+        assert 'emit_transfer_event "delivered" "promotion" "both"' in script
+        assert 'emit_transfer_event "completed" "cleanup" "destination"' in script
         assert 'mkdir -p "$(dirname "$log_file")" "$(dirname "$latest_log_file")" "$(dirname "$mini_log_file")" "$(dirname "$flock_file")"' in script
         assert 'dump_debug_log "run log" "$run_log"' in script
         assert 'dump_debug_log "promote log" "$promote_log"' in script
@@ -1152,19 +1182,19 @@ class TestGenerateRsyncCommand:
         assert 'dump_debug_log "preflight log" "$preflight_log"' in script
         assert 'dump_debug_log "preflight stderr log" "$preflight_stderr_log"' in script
         assert 'debug "script failed with exit code $status"' in script
-        assert 'debug "$dir_name initiated"' in script
+        assert 'debug "$dir_name started"' in script
         assert 'debug "$dir_name completed"' in script
         assert 'random_start_delay() {' in script
         assert 'od -An -N4 -tu4 /dev/urandom' in script
         assert 'print $1 % max' in script
         assert 'random_start_delay 60' in script
         assert script.index('random_start_delay 60') < script.index('/opt/bin/flock -n 9')
-        assert 'log_status "$dir_name initiated"' in script
+        assert 'log_status "$dir_name started"' in script
         assert 'log_status "$dir_name completed"' in script
         assert 'if ! [ -d "/source" ]; then' in script
         assert script.index('random_start_delay 60') < script.index('if ! [ -d "/source" ]; then')
         assert 'source directory missing: /source' in script
-        assert 'append_common_status "error" "" "/source" "/dest"' in script
+        assert 'emit_transfer_event "failed" "discovery" "none" "" "/source" "/dest" "source directory missing: /source" "source_missing"' in script
         assert 'latest_log_file="/tmp/test.log.latest"' in script
         assert 'cat "$run_log" > "$latest_log_file"' in script
 
@@ -1203,7 +1233,7 @@ class TestGenerateRsyncCommand:
         assert 'chmod g+rwx "$metadata_dir" 2>/dev/null || true' in script
         assert 'chmod g+rw "$metadata_path" 2>/dev/null || true' in script
         assert 'chmod g+rw "$2" 2>/dev/null || true' in script
-        assert 'current_run_id="$(uuidgen | tr ' in script
+        assert 'current_run_id="$(new_uuid)"' in script
         assert 'current_run_name="$dir_name"' in script
         assert 'current_flow_group="$flow_group"' in script
         assert 'current_flow_group="$(read_metadata_field_local "$(portable_metadata_file_for_run "$source_dir")" "flow_group")"' in script
@@ -1211,19 +1241,26 @@ class TestGenerateRsyncCommand:
         assert 'current_entry_transfer_identifier="$transfer_identifier"' in script
         assert '"$(sanitize_tsv_field "$current_flow_group")"' in script
         assert 'ensure_source_run_bundle || continue' in script
-        assert 'append_source_portable_event "initiated"' in script
-        assert 'append_destination_portable_event "completed"' in script
+        assert 'emit_transfer_event "started" "transfer" "source"' in script
+        assert 'emit_transfer_event "delivered" "promotion" "both"' in script
+        assert 'emit_transfer_event "completed" "cleanup" "destination"' in script
 
         ensure_index = script.index('ensure_source_run_bundle || continue')
-        initiated_portable_index = script.index('append_source_portable_event "initiated"')
-        initiated_common_index = script.index('append_common_status "initiated" "$dir_name" "$current_run_source" "$current_run_destination"')
+        started_index = script.index(
+            'emit_transfer_event "started" "transfer" "source" "$dir_name"'
+        )
         rsync_index = script.index('rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1')
         promote_index = script.index('if [ -d "/dest/$dir_name" ]; then ')
-        completed_portable_index = script.index('append_destination_portable_event "completed"')
-        completed_common_index = script.index('append_common_status "completed" "$dir_name" "$current_run_source" "$current_run_destination"')
+        delivered_index = script.index(
+            'emit_transfer_event "delivered" "promotion" "both" "$dir_name"'
+        )
+        completed_index = script.index(
+            'emit_transfer_event "completed" "cleanup" "destination" "$dir_name"',
+            delivered_index,
+        )
 
-        assert ensure_index < initiated_portable_index < initiated_common_index < rsync_index
-        assert promote_index < completed_portable_index < completed_common_index
+        assert ensure_index < started_index < rsync_index
+        assert promote_index < delivered_index < completed_index
 
     def test_generate_script_content_with_portable_metadata_remote_destination(self):
         """Completed portable events should support remote destination appends."""
@@ -1256,7 +1293,7 @@ class TestGenerateRsyncCommand:
         assert 'ssh -p "$remote_port" "$remote_target" "$remote_command"' in script
         assert 'grep "^run_id" "$1" | head -n 1 | cut -f2-' in script
         assert 'cut -f2-' in script
-        assert 'append_portable_event_remote "$destination_remote_target" "$destination_remote_port" "$destination_run_dir" "$event_status" "$event_message"' in script
+        assert 'append_portable_event_remote "$destination_remote_target" "$destination_remote_port" "$destination_run_dir"' in script
 
     def test_remote_transfer_delays_before_main_lock(self):
         """Remote endpoint wrappers should jitter before trying the main lock."""
@@ -1631,8 +1668,8 @@ class TestGenerateRsyncCommand:
             gcf.config._runtime_config = original_runtime_config
 
         assert ': >"$run_log"' in script
-        assert 'if ! rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1; then' in script
-        assert 'append_common_status "error" "$dir_name" "$current_run_source" "$current_run_destination" "$rsync_message"' in script
+        assert 'if rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1; then' in script
+        assert 'emit_transfer_event "failed" "transfer" "source" "$dir_name" "$current_run_source" "$current_run_destination" "$rsync_message" "rsync_failed" "$rsync_exit_code"' in script
         assert 'dump_debug_log "run log" "$run_log"' in script
         assert 'debug "script failed with exit code $status"' in script
 
@@ -1667,7 +1704,7 @@ class TestGenerateRsyncCommand:
         assert 'rmdir "output/.staging" 2>/dev/null || true' not in script
         assert 'current_run_source="$source_dir"' in script
         assert 'current_run_destination="output/$dir_name"' in script
-        assert 'log_status "$dir_name initiated"' in script
+        assert 'log_status "$dir_name started"' in script
         assert 'log_status "$dir_name completed"' in script
         assert 'find "input" -mindepth 1 -type d -empty -delete >"$cleanup_log" 2>&1' in script
         assert 'if ! [ -d "input" ]; then' in script
@@ -1883,8 +1920,8 @@ class TestGenerateRsyncCommand:
         assert not (destination_root / "Run1").exists()
         assert common_status_log.exists()
         status_text = common_status_log.read_text()
-        assert "initiated" in status_text
-        assert "error" in status_text
+        assert "started" in status_text
+        assert "failed" in status_text
         assert "source cleanup preflight failed" in status_text
         assert ".cache" in status_text
 
@@ -2093,7 +2130,7 @@ class TestGenerateRsyncCommand:
         assert proc.returncode == 0, proc.stderr
         assert run_dir.exists()
         assert (run_dir / "payload.txt").read_text() == "payload"
-        assert not (run_dir / ".landing_zones").exists()
+        assert (run_dir / ".landing_zones").exists()
         assert not (destination_root / "RunWaiting").exists()
         assert (source_root / ".landing_zones_readiness" / "RunWaiting.json").exists()
 
@@ -2200,7 +2237,7 @@ class TestGenerateRsyncCommand:
         assert second_proc.returncode == 0, second_proc.stderr
         assert run_dir.exists()
         assert (run_dir / "payload.txt").read_text() == "payload"
-        assert not (run_dir / ".landing_zones").exists()
+        assert (run_dir / ".landing_zones").exists()
         assert destination_run.exists()
         assert archive_path.exists()
         assert not (destination_run / "payload.txt").exists()
