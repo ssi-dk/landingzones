@@ -61,6 +61,7 @@ class TransferDefinition:
     user: str
     source: str
     destination: str
+    enabled: bool = True
     source_port: str = ""
     destination_port: str = ""
     rsync_options: str = ""
@@ -91,6 +92,7 @@ class TransferDefinition:
             user=str(row.get("users", row.get("user", "")) or ""),
             source=str(row.get("source", "") or ""),
             destination=str(row.get("destination", "") or ""),
+            enabled=str(row.get("enabled", "TRUE") or "TRUE").upper() == "TRUE",
             source_port=str(row.get("source_port", "") or ""),
             destination_port=str(row.get("destination_port", "") or ""),
             rsync_options=str(row.get("rsync_options", "") or ""),

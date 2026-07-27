@@ -8,6 +8,7 @@ from landingzones import generate_cron_files as gcf
 from landingzones import transfer_catalog
 from landingzones.table import TransferTable
 from landingzones.transfer_catalog import (
+    load_monitoring_transfer_definitions,
     load_reporting_transfer_definitions,
     load_reporting_transfer_catalog,
     load_runtime_transfer_catalog,
@@ -482,3 +483,35 @@ def test_reporting_catalog_exposes_normalized_definitions_and_keeps_dataframe_co
     assert catalog.iloc[0]["notify_on_error"] == "FALSE"
     assert catalog.iloc[0]["tags"] == "heartbeat,lab"
     assert catalog.iloc[0]["destination_port"] == "2200"
+
+
+def test_monitoring_catalog_can_include_disabled_transfer_definitions(tmp_path):
+    """Definition synchronization should retain configured enabled state."""
+    transfers_file = tmp_path / "transfers.tsv"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination",
+                "active\tlocal_dev.local\tTRUE\tlocal_dev\tlocal\t/source/active/*\t/destination/active/",
+                "paused\tlocal_dev.local\tFALSE\tlocal_dev\tlocal\t/source/paused/*\t/destination/paused/",
+            ]
+        )
+    )
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        definitions = load_monitoring_transfer_definitions(
+            transfers_file=str(transfers_file),
+        )
+        removed_runtime_definitions = load_monitoring_transfer_definitions(
+            transfers_file=str(transfers_file),
+            runtime_ids=["removed.runtime"],
+        )
+    finally:
+        gcf.config.restore_state(snapshot)
+
+    assert [(item.identifier, item.enabled) for item in definitions] == [
+        ("active", True),
+        ("paused", False),
+    ]
+    assert removed_runtime_definitions == []

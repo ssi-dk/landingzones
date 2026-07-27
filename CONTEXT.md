@@ -48,6 +48,26 @@ _Avoid_: Transfer inventory, runtime scan
 The owner of transfer loading invariants for normalized transfer rows.
 _Avoid_: Per-command transfer parsing, report-only parser
 
+**Transfer Definition**:
+A durable configured route in the **Transfer Catalog**.
+_Avoid_: Transfer event, route event
+
+**Transfer Run**:
+One discovered unit of data movement followed across the routes in its flow.
+_Avoid_: Transfer job, cron run
+
+**Transfer Attempt**:
+One actual route execution try for a **Transfer Run**; polling, readiness observation, and lock contention are not attempts.
+_Avoid_: Poll, cron invocation
+
+**Transfer Event**:
+An immutable operational fact about a configured route and, when identified, a **Transfer Run** and **Transfer Attempt**.
+_Avoid_: Status row, log entry
+
+**Event Spool**:
+An append-only local sequence of **Transfer Events** awaiting independent monitoring ingestion.
+_Avoid_: Monitoring database, status report
+
 **Build/Runtime Catalog Loading**:
 The transfer catalog mode used by build and runtime validation commands. It
 requires runnable-script fields such as `log_file` and `flock_file`.
@@ -104,6 +124,12 @@ _Avoid_: Runtime identity, deploy boundary
 - An **Unresolved Runtime Cron Fragment** requires operator attention because it may be an old, moved, or missing runtime.
 - **Generated Runtime Metadata** describes the **Runtime IDs** represented by generated runtime artifacts.
 - The **Transfer Catalog** owns transfer loading invariants before command code consumes rows.
+- A **Transfer Definition** describes expected configuration; a **Transfer Event** records operational history.
+- A **Transfer Run** keeps one identity as it moves between **Landing Zone Runtimes** in a flow.
+- A **Transfer Attempt** belongs to one **Transfer Run** on one **Transfer Definition**.
+- Each actual route retry creates a new **Transfer Attempt** without replacing earlier **Transfer Events**.
+- An **Event Spool** can remain available while monitoring ingestion is unavailable.
+- Multiple **Event Spools** can contribute **Transfer Events** to one monitoring view.
 - **Build/Runtime Catalog Loading** validates runnable transfer artifacts for `build`, deployment validation, and integration validation.
 - **Reporting Catalog Loading** preserves normalized transfer facts for dashboard analysis without requiring runtime-only file columns.
 - An **Unidentified Cron Fragment** can be activated during default execution-context activation without being treated as a **Landing Zone Runtime**.

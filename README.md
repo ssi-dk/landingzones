@@ -104,7 +104,69 @@ landingzones validate integration
 
 # Generate an HTML health dashboard from a shared transfer TSV log
 landingzones report transfers output/log/Landing_Zone_server1_prod.user1.transfers.tsv
+
+# Synchronize expected routes, ingest one or more Event Spools, and serve live monitoring
+landingzones monitor sync-definitions
+landingzones monitor ingest output/log/Landing_Zone_server1.transfers.tsv
+landingzones monitor serve
 ```
+
+### Database-Backed Transfer Event Monitoring
+
+Generated runtimes write schema-version-1 Transfer Events to the existing
+per-system common-status path. The file is now an append-only Event Spool with
+immutable `event_id` values and separate `run_id` and `attempt_id` identities.
+The same event identity is retained in applicable portable per-run history.
+Runtime scripts never connect to the monitoring database, so database or
+ingestor availability cannot block transfer execution.
+
+Configure the separately invoked monitoring processes with a synchronous
+SQLite SQLAlchemy URL:
+
+```yaml
+monitoring_database_url: sqlite:///output/landingzones-monitoring.sqlite
+```
+
+The same value can be supplied with `--database-url` or
+`LZ_MONITORING_DATABASE_URL`. Keep the SQLite file on a host-local filesystem;
+schema version 1 does not claim support for other database backends.
+
+Synchronize current Transfer Definitions separately from operational events,
+then ingest one or more independently produced spools:
+
+```bash
+landingzones monitor sync-definitions \
+  --config config/config.yaml \
+  --runtime-id server1_prod.user1
+
+landingzones monitor ingest \
+  output/log/Landing_Zone_server1.transfers.tsv \
+  --spool-id server1-prod
+```
+
+Ingestion consumes only complete newline-terminated rows, checkpoints each
+spool, and safely ignores replayed `event_id` values. It rejects unversioned or
+unsupported headers rather than guessing their layout. During cutover, stop
+old writers, archive the old common-status TSV if desired, and create a fresh
+file (or let the first schema-v1 runtime create it); never append v1 rows below
+the old unversioned header.
+
+Start the live service with:
+
+```bash
+landingzones monitor serve --host 127.0.0.1 --port 8080
+```
+
+Service startup loads the configured transfer file and synchronizes Transfer
+Definitions before accepting requests; use `--transfers` and repeatable
+`--runtime-id` options to override the configured inventory or selection.
+Every HTML page load and JSON request queries the current database. The JSON
+API is available at `/api/runs` and `/api/runs/<run_id>`. Repeatable query
+parameters include `runtime_id`, `system`, `execution_user`,
+`transfer_identifier`, `tag`, `state`, and `reason_code`. The existing
+`landingzones report transfers` command remains a legacy static schema-0
+reporting surface; it is not the operational reader for schema-version-1
+Event Spools.
 
 ### Generated Cron Format
 
@@ -513,5 +575,6 @@ landingzones --help
 - Python >= 3.8
 - PyYAML >= 5.0.0
 - pandas >= 1.0.0 only for `landingzones report transfers` / `landingzones[report]`
+- SQLAlchemy >= 2.0,<3 for schema-version-1 SQLite monitoring
 - System: rsync, ssh, flock
 - System for archived entry/end-point flows: tar

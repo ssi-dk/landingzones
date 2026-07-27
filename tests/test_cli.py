@@ -493,6 +493,130 @@ class TestOperatorCli:
             '--tag', 'lab',
         ]
 
+    def test_monitor_commands_route_ingestion_definition_sync_and_service(self, monkeypatch):
+        """Monitoring processes should receive resolved operator configuration."""
+        captured = {
+            "ingest": [],
+            "load_definitions": [],
+            "sync": [],
+            "serve": [],
+        }
+
+        def fake_ingest(database_url, spool_path, spool_id=None):
+            captured["ingest"].append((database_url, spool_path, spool_id))
+            return type(
+                "Result",
+                (),
+                {
+                    "inserted": 2,
+                    "duplicates": 0,
+                    "checkpoint_offset": 42,
+                    "deferred_bytes": 0,
+                },
+            )()
+
+        def fake_load_definitions(**kwargs):
+            captured["load_definitions"].append(kwargs)
+            return ["definition"]
+
+        def fake_sync(database_url, definitions, scope_runtime_ids=None):
+            captured["sync"].append(
+                (database_url, definitions, scope_runtime_ids)
+            )
+            return len(definitions)
+
+        def fake_serve(database_url, host, port):
+            captured["serve"].append((database_url, host, port))
+
+        monkeypatch.setattr(cli.monitoring, "ingest_event_spool", fake_ingest)
+        monkeypatch.setattr(
+            cli.transfer_catalog,
+            "load_monitoring_transfer_definitions",
+            fake_load_definitions,
+        )
+        monkeypatch.setattr(
+            cli.monitoring,
+            "sync_transfer_definitions",
+            fake_sync,
+        )
+        monkeypatch.setattr(
+            cli.monitoring_service,
+            "serve_monitoring",
+            fake_serve,
+        )
+
+        ingest_rc = cli.main([
+            "monitor",
+            "ingest",
+            "events-a.tsv",
+            "events-b.tsv",
+            "--database-url",
+            "sqlite:///monitoring.sqlite",
+        ])
+        sync_rc = cli.main([
+            "monitor",
+            "sync-definitions",
+            "--database-url",
+            "sqlite:///monitoring.sqlite",
+            "--config",
+            "config.yaml",
+            "--transfers",
+            "transfers.tsv",
+            "--runtime-id",
+            "server1_prod.user1",
+        ])
+        serve_rc = cli.main([
+            "monitor",
+            "serve",
+            "--database-url",
+            "sqlite:///monitoring.sqlite",
+            "--config",
+            "config.yaml",
+            "--transfers",
+            "transfers.tsv",
+            "--runtime-id",
+            "server1_prod.user1",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9000",
+        ])
+
+        assert ingest_rc == 0
+        assert sync_rc == 0
+        assert serve_rc == 0
+        assert captured["ingest"] == [
+            ("sqlite:///monitoring.sqlite", "events-a.tsv", None),
+            ("sqlite:///monitoring.sqlite", "events-b.tsv", None),
+        ]
+        assert captured["load_definitions"] == [
+            {
+                "config_file": "config.yaml",
+                "transfers_file": "transfers.tsv",
+                "runtime_ids": ["server1_prod.user1"],
+            },
+            {
+                "config_file": "config.yaml",
+                "transfers_file": "transfers.tsv",
+                "runtime_ids": ["server1_prod.user1"],
+            },
+        ]
+        assert captured["sync"] == [
+            (
+                "sqlite:///monitoring.sqlite",
+                ["definition"],
+                ["server1_prod.user1"],
+            ),
+            (
+                "sqlite:///monitoring.sqlite",
+                ["definition"],
+                ["server1_prod.user1"],
+            ),
+        ]
+        assert captured["serve"] == [
+            ("sqlite:///monitoring.sqlite", "127.0.0.1", 9000),
+        ]
+
     def test_validate_hop_executes_discovered_wrapper(self, tmp_path):
         """`landingzones validate hop` should find and execute the wrapper for a flow."""
         validation_dir = tmp_path / 'validation_scripts'
