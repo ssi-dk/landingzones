@@ -206,6 +206,7 @@ def parse_transfers_file(
     runtime_ids=None,
     systems=None,
     include_disabled=False,
+    allow_missing_runtime_ids=False,
 ):
     """Parse the transfers.tsv file and return normalized transfer records.
 
@@ -221,6 +222,8 @@ def parse_transfers_file(
         include_disabled: Retain disabled definitions for configuration
             synchronization. Runtime generation keeps the default enabled-only
             behavior.
+        allow_missing_runtime_ids: Return rows for matching runtime IDs without
+            rejecting requested IDs that have no rows.
     """
     with open(filename, 'r', newline='') as handle:
         reader = csv.DictReader(handle, delimiter='\t')
@@ -235,7 +238,8 @@ def parse_transfers_file(
 
     rows = [
         row for row in rows
-        if not clean_tsv_value(row.get('runtime_id', '')).startswith('#')
+        if not clean_tsv_value(row.get('identifiers', '')).startswith('#')
+        and not clean_tsv_value(row.get('runtime_id', '')).startswith('#')
         and not clean_tsv_value(row.get('system', '')).startswith('#')
     ]
 
@@ -261,7 +265,7 @@ def parse_transfers_file(
     if requested_runtime_ids:
         available = set(row.get('runtime_id', '') for row in rows)
         missing = sorted(set(requested_runtime_ids) - available)
-        if missing:
+        if missing and not allow_missing_runtime_ids:
             raise ValueError(
                 "runtime_id filter matched no transfer rows for: {0}".format(
                     ', '.join(missing)
@@ -271,7 +275,7 @@ def parse_transfers_file(
             row for row in rows
             if row.get('runtime_id', '') in requested_runtime_ids
         ]
-        if not rows:
+        if not rows and not allow_missing_runtime_ids:
             raise ValueError("runtime_id filter produced no transfer rows")
 
     requested_systems = normalize_system_filters(systems)

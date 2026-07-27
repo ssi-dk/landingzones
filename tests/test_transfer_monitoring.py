@@ -175,6 +175,7 @@ def test_monitoring_keeps_definitions_separate_and_derives_current_run_state(tmp
             tags="lab,heartbeat",
             reason_code="permission_denied",
             message="source cleanup failed",
+            directory="/source/alpha",
         ),
     ]
     spool_path.write_text(
@@ -224,6 +225,9 @@ def test_monitoring_keeps_definitions_separate_and_derives_current_run_state(tmp
     assert summaries[0]["run_id"] == run_id
     assert summaries[0]["state"] == "delivered with cleanup failed"
     assert summaries[0]["attempt_count"] == 1
+    assert summaries[0]["directory"] == "/source/alpha"
+    assert summaries[0]["current_status"] == "failed"
+    assert summaries[0]["current_phase"] == "cleanup"
     assert summaries[0]["latest_failure_phase"] == "cleanup"
     assert summaries[0]["reason_code"] == "permission_denied"
     assert summaries[0]["message"] == "source cleanup failed"
@@ -234,7 +238,59 @@ def test_monitoring_keeps_definitions_separate_and_derives_current_run_state(tmp
     assert all_summaries[1]["frequency"] == "*/15 * * * *"
     assert all_summaries[1]["enabled"] is False
     assert html_status == 200
+    assert "<th>Directory</th>" in html_body
+    assert "<th>Progress / step</th>" in html_body
+    assert "/source/alpha" in html_body
+    assert "delivered with cleanup failed at cleanup" in html_body
+    assert "cleanup: permission_denied" in html_body
     assert "source cleanup failed" in html_body
+
+
+def test_run_summaries_default_to_most_recent_last_event(tmp_path):
+    """The monitoring list should show the most recently active run first."""
+    database_url = "sqlite:///{0}".format(tmp_path / "monitoring.sqlite")
+    spool_path = tmp_path / "events.tsv"
+    older_run_id = str(uuid.uuid4())
+    newer_run_id = str(uuid.uuid4())
+    events = [
+        create_transfer_event(
+            transfer_identifier="stage_lab",
+            system="server1",
+            runtime_id="server1_prod.user1",
+            execution_user="user1",
+            status="started",
+            phase="transfer",
+            run_id=older_run_id,
+            attempt_id=str(uuid.uuid4()),
+            event_time_utc="2026-07-27T09:00:00Z",
+        ),
+        create_transfer_event(
+            transfer_identifier="stage_lab",
+            system="server1",
+            runtime_id="server1_prod.user1",
+            execution_user="user1",
+            status="started",
+            phase="transfer",
+            run_id=newer_run_id,
+            attempt_id=str(uuid.uuid4()),
+            event_time_utc="2026-07-27T11:00:00Z",
+        ),
+    ]
+    spool_path.write_text(
+        EVENT_HEADER
+        + "\n"
+        + "\n".join(event_to_tsv_row(event) for event in events)
+        + "\n"
+    )
+
+    ingest_event_spool(database_url, str(spool_path))
+
+    summaries = query_run_summaries(database_url)
+
+    assert [summary["run_id"] for summary in summaries] == [
+        newer_run_id,
+        older_run_id,
+    ]
 
 
 def test_run_state_uses_route_delivery_flow_position_and_run_creation_age(tmp_path):

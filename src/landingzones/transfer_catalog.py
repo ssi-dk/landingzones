@@ -19,6 +19,7 @@ def load_transfer_catalog(
     system=None,
     systems=None,
     include_disabled=False,
+    allow_missing_runtime_ids=False,
 ):
     """Load normalized transfers after resolving config defaults."""
     from landingzones import generate_cron_files as gcf
@@ -37,6 +38,8 @@ def load_transfer_catalog(
     }
     if include_disabled:
         parse_options["include_disabled"] = True
+    if allow_missing_runtime_ids:
+        parse_options["allow_missing_runtime_ids"] = True
     return gcf.parse_transfers_file(config.transfers_file, **parse_options)
 
 
@@ -48,6 +51,7 @@ def load_transfer_definitions(
     system=None,
     systems=None,
     include_disabled=False,
+    allow_missing_runtime_ids=False,
 ):
     """Load normalized transfer definitions after resolving config defaults."""
     return definitions_from_dataframe(
@@ -59,6 +63,7 @@ def load_transfer_definitions(
             system=system,
             systems=systems,
             include_disabled=include_disabled,
+            allow_missing_runtime_ids=allow_missing_runtime_ids,
         )
     )
 
@@ -122,13 +127,15 @@ def load_monitoring_transfer_definitions(
     system=None,
 ):
     """Load current monitoring inventory, including disabled definitions."""
+    parse_runtime_ids = [] if runtime_ids is None else runtime_ids
     definitions = load_transfer_definitions(
         config_file=config_file,
         transfers_file=transfers_file,
         require_runtime_files=False,
-        runtime_ids=[],
+        runtime_ids=parse_runtime_ids,
         system=system,
         include_disabled=True,
+        allow_missing_runtime_ids=True,
     )
     if runtime_ids is None:
         return definitions

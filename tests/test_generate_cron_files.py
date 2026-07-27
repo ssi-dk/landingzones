@@ -183,6 +183,23 @@ localhost_main\tlocalhost\ttest\t/src/\t/dest/\t\t\t\t/tmp/test.log\t/tmp/test.l
         
         assert len(df) == 2
         assert 'commented' not in df['system'].values
+
+    def test_parse_filters_comment_heading_rows_when_retaining_disabled(self, tmp_path):
+        """Comment headings must not become runtime IDs for monitoring inventories."""
+        tsv_content = """identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination\tlog_file\tflock_file
+#\tAalborg to\t\t\t\t\t\t
+server1_main\tserver1.user1\tTRUE\tserver1\tuser1\t/src/\t/dest/\t/tmp/log.txt\t/tmp/lock.txt
+disabled_route\tserver2.user2\tFALSE\tserver2\tuser2\t/src2/\t/dest2/\t/tmp/log2.txt\t/tmp/lock2.txt
+"""
+        test_file = tmp_path / "test_transfers.tsv"
+        test_file.write_text(tsv_content)
+
+        df = gcf.parse_transfers_file(str(test_file), include_disabled=True)
+
+        assert len(df) == 2
+        assert 'Aalborg to' not in df['runtime_id'].values
+        assert 'server1.user1' in df['runtime_id'].values
+        assert 'server2.user2' in df['runtime_id'].values
     
     def test_parse_filters_disabled_rows(self, tmp_path):
         """Test that rows with enabled != TRUE are filtered out"""

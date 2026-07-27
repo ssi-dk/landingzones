@@ -515,3 +515,37 @@ def test_monitoring_catalog_can_include_disabled_transfer_definitions(tmp_path):
         ("paused", False),
     ]
     assert removed_runtime_definitions == []
+
+
+def test_monitoring_catalog_filters_runtime_scope_before_expanding_endpoints(
+    tmp_path,
+    monkeypatch,
+):
+    """Scoped monitoring loads must ignore unresolved endpoints in other runtimes."""
+    unresolved_name = "LZ_TEST_UNRESOLVED_OTHER_RUNTIME_ROOT"
+    monkeypatch.delenv(unresolved_name, raising=False)
+
+    transfers_file = tmp_path / "transfers.tsv"
+    transfers_file.write_text(
+        "\n".join(
+            [
+                "identifiers\truntime_id\tenabled\tsystem\tusers\tsource\tdestination",
+                "selected\tselected.runtime\tTRUE\tselected\tuser\t/source/selected\t/destination/selected",
+                "other\tother.runtime\tTRUE\tother\tuser\t${{{0}}}/source\t/destination/other".format(unresolved_name),
+            ]
+        )
+    )
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("")
+
+    snapshot = gcf.config.snapshot_state()
+    try:
+        definitions = load_monitoring_transfer_definitions(
+            config_file=str(config_file),
+            transfers_file=str(transfers_file),
+            runtime_ids=["selected.runtime"],
+        )
+    finally:
+        gcf.config.restore_state(snapshot)
+
+    assert [definition.identifier for definition in definitions] == ["selected"]

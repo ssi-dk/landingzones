@@ -64,22 +64,60 @@ th, td {{ border-bottom: 1px solid #d1d5db; padding: .55rem; text-align: left; v
 th {{ background: #f3f4f6; }}
 code {{ white-space: nowrap; }}
 .muted {{ color: #6b7280; }}
+.progress-complete {{ color: #166534; }}
+.progress-failed {{ color: #b91c1c; }}
+.progress-active {{ color: #92400e; }}
 </style>
 </head>
 <body><h1>{0}</h1>{1}</body>
 </html>""".format(escape(title), content)
 
 
+def _progress_text(run):
+    """Return the operator-facing state and current or failed lifecycle step."""
+    state = run["state"]
+    if state == "completed":
+        return state
+    phase = (
+        run["latest_failure_phase"]
+        if "failed" in state
+        else run["current_phase"]
+    )
+    if phase:
+        if "failed" in state:
+            return "{0} at {1}".format(state, phase)
+        return "{0} ({1})".format(state, phase)
+    return state
+
+
+def _progress_class(state):
+    """Return a stable CSS class for the high-level run state."""
+    if state == "completed":
+        return "progress-complete"
+    if "failed" in state:
+        return "progress-failed"
+    if state in ("in progress", "delivered with cleanup pending", "waiting"):
+        return "progress-active"
+    return ""
+
+
 def _render_runs(runs):
     rows = []
     for run in runs:
         run_id = run["run_id"]
-        run_value = escape(run_id or "—")
+        directory_value = escape(run["directory"] or "—")
         if run_id:
-            run_value = '<a href="/runs/{0}"><code>{0}</code></a>'.format(
-                escape(run_id)
+            directory_value = '<a href="/runs/{0}">{1}</a>'.format(
+                escape(run_id),
+                directory_value,
             )
-        failure = run["reason_code"] or run["latest_failure_phase"] or ""
+        failure = ""
+        if run["latest_failure_phase"]:
+            failure = run["latest_failure_phase"]
+            if run["reason_code"]:
+                failure = "{0}: {1}".format(failure, run["reason_code"])
+        elif run["reason_code"]:
+            failure = run["reason_code"]
         if run["exit_code"] is not None:
             failure = "{0} (exit {1})".format(
                 failure or "failure",
@@ -96,13 +134,16 @@ def _render_runs(runs):
             "<td>{4}</td><td>{5}</td><td>{6}</td><td>{7}</td>"
             "<td>{8}</td><td>{9}</td><td>{10}</td>"
             "</tr>".format(
-                run_value,
+                directory_value,
                 escape(run["runtime_id"]),
                 escape(run["system"]),
                 escape(run["execution_user"]),
                 escape(run["transfer_identifier"]),
                 "yes" if run["enabled"] else ("no" if run["enabled"] is False else ""),
-                escape(run["state"]),
+                '<strong class="{0}">{1}</strong>'.format(
+                    _progress_class(run["state"]),
+                    escape(_progress_text(run)),
+                ),
                 escape(run["last_event_time_utc"] or ""),
                 escape(_format_age(run["age_seconds"])),
                 (
@@ -116,8 +157,8 @@ def _render_runs(runs):
     if not rows:
         rows.append('<tr><td colspan="11" class="muted">No matching runs.</td></tr>')
     table = (
-        "<table><thead><tr><th>Run</th><th>Runtime ID</th><th>System</th>"
-        "<th>Execution user</th><th>Current/latest route</th><th>Enabled</th><th>State</th>"
+        "<table><thead><tr><th>Directory</th><th>Runtime ID</th><th>System</th>"
+        "<th>Execution user</th><th>Route</th><th>Enabled</th><th>Progress / step</th>"
         "<th>Last event</th><th>Age</th><th>Attempts</th><th>Latest failure</th>"
         "</tr></thead><tbody>{0}</tbody></table>"
     ).format("".join(rows))

@@ -483,6 +483,9 @@ def _event_summary(events, definitions_by_key, definitions, now):
         "system": latest["system"],
         "execution_user": latest["execution_user"],
         "transfer_identifier": latest["transfer_identifier"],
+        "directory": latest["directory"],
+        "current_status": latest["status"],
+        "current_phase": latest["phase"],
         "enabled": definition["enabled"] if definition is not None else None,
         "flow_group": latest["flow_group"],
         "tags": list(normalize_tags(tags_value)),
@@ -514,6 +517,9 @@ def _never_observed_summary(definition):
         "system": definition["system"],
         "execution_user": definition["execution_user"],
         "transfer_identifier": definition["transfer_identifier"],
+        "directory": None,
+        "current_status": None,
+        "current_phase": None,
         "enabled": definition["enabled"],
         "flow_group": definition["flow_group"],
         "tags": list(normalize_tags(definition["tags"])),
@@ -635,10 +641,10 @@ def query_run_summaries(
     ]
     summaries.sort(
         key=lambda summary: (
-            summary["state"] == "configured but never observed",
             summary["last_event_time_utc"] or "",
             summary["runtime_id"],
             summary["transfer_identifier"],
-        )
+        ),
+        reverse=True,
     )
     return summaries
