@@ -160,10 +160,12 @@ landingzones monitor serve --host 127.0.0.1 --port 8080
 Service startup loads the configured transfer file and synchronizes Transfer
 Definitions before accepting requests; use `--transfers` and repeatable
 `--runtime-id` options to override the configured inventory or selection.
-Every HTML page load and JSON request queries the current database. The JSON
-API is available at `/api/runs` and `/api/runs/<run_id>`. Repeatable query
-parameters include `runtime_id`, `system`, `execution_user`,
-`transfer_identifier`, `tag`, `state`, and `reason_code`. The existing
+Every HTML page load and JSON request queries the current database, and HTML
+monitoring pages auto-refresh every 60 seconds while preserving the current
+URL and query filters. The JSON API is available at `/api/runs` and
+`/api/runs/<run_id>`. Repeatable query parameters include `runtime_id`,
+`system`, `execution_user`, `transfer_identifier`, `tag`, `state`, and
+`reason_code`. The existing
 `landingzones report transfers` command remains a legacy static schema-0
 reporting surface; it is not the operational reader for schema-version-1
 Event Spools.
