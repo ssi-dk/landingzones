@@ -853,6 +853,8 @@ def test_monitoring_api_queries_current_database_state_on_every_request(tmp_path
     assert html_status == 200
     assert "<th>Last event</th>" in html_body
     assert "<th>Attempts</th>" in html_body
+    assert '<meta http-equiv="refresh" content="60">' in html_body
+    assert "Auto-refreshes every 60 seconds." in html_body
 
 
 def test_live_ingestor_rejects_an_unversioned_spool_without_guessing(tmp_path):

@@ -19,6 +19,7 @@ FILTER_ARGUMENTS = {
     "state": "states",
     "reason_code": "reason_codes",
 }
+AUTO_REFRESH_SECONDS = 60
 
 
 def _query_filters(query_string):
@@ -56,6 +57,7 @@ def _page(title, content):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="{1}">
 <title>{0}</title>
 <style>
 body {{ font-family: system-ui, sans-serif; margin: 2rem; color: #1f2937; }}
@@ -69,8 +71,8 @@ code {{ white-space: nowrap; }}
 .progress-active {{ color: #92400e; }}
 </style>
 </head>
-<body><h1>{0}</h1>{1}</body>
-</html>""".format(escape(title), content)
+<body><h1>{0}</h1><p class="muted">Auto-refreshes every {1} seconds.</p>{2}</body>
+</html>""".format(escape(title), AUTO_REFRESH_SECONDS, content)
 
 
 def _progress_text(run):
