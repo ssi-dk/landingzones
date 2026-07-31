@@ -493,7 +493,7 @@ class TestOperatorCli:
             '--tag', 'lab',
         ]
 
-    def test_monitor_commands_route_ingestion_definition_sync_and_service(self, monkeypatch):
+    def test_monitor_commands_route_ingestion_definition_sync_and_service(self, monkeypatch, capsys):
         """Monitoring processes should receive resolved operator configuration."""
         captured = {
             "ingest": [],
@@ -512,6 +512,8 @@ class TestOperatorCli:
                     "duplicates": 0,
                     "checkpoint_offset": 42,
                     "deferred_bytes": 0,
+                    "skipped": 1,
+                    "warnings": ("skipped malformed Event Spool row at line 3, byte offset 10",),
                 },
             )()
 
@@ -616,6 +618,7 @@ class TestOperatorCli:
         assert captured["serve"] == [
             ("sqlite:///monitoring.sqlite", "127.0.0.1", 9000),
         ]
+        assert "events-a.tsv: warning: skipped malformed Event Spool row" in capsys.readouterr().err
 
     def test_validate_hop_executes_discovered_wrapper(self, tmp_path):
         """`landingzones validate hop` should find and execute the wrapper for a flow."""

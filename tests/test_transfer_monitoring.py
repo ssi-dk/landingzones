@@ -134,6 +134,45 @@ def test_ingestion_defers_partial_rows_and_replays_events_idempotently(tmp_path)
     assert detail["timeline"][0]["exit_code"] is None
 
 
+def test_ingestion_warns_skips_malformed_rows_and_advances_checkpoint(tmp_path):
+    """One malformed row should not prevent later valid events from being ingested."""
+    database_url = "sqlite:///{0}".format(tmp_path / "monitoring.sqlite")
+    spool_path = tmp_path / "events.tsv"
+    valid_event = create_transfer_event(
+        transfer_identifier="stage_lab",
+        system="server1",
+        runtime_id="server1_prod.user1",
+        execution_user="user1",
+        status="started",
+        phase="transfer",
+        run_id=str(uuid.uuid4()),
+        attempt_id=str(uuid.uuid4()),
+    )
+    malformed_row = "\t".join(["legacy"] * 15)
+    spool_path.write_text(
+        EVENT_HEADER
+        + "\n"
+        + event_to_tsv_row(valid_event)
+        + "\n"
+        + malformed_row
+        + "\n"
+        + event_to_tsv_row(valid_event)
+        + "\n"
+    )
+
+    result = ingest_event_spool(database_url, str(spool_path))
+    replay = ingest_event_spool(database_url, str(spool_path))
+
+    assert result.inserted == 1
+    assert result.skipped == 1
+    assert len(result.warnings) == 1
+    assert "line 3" in result.warnings[0]
+    assert "15 columns; expected 23" in result.warnings[0]
+    assert result.checkpoint_offset == spool_path.stat().st_size
+    assert replay.skipped == 0
+    assert replay.warnings == ()
+
+
 def test_monitoring_keeps_definitions_separate_and_derives_current_run_state(tmp_path):
     """Expected routes and operational history should combine only at query time."""
     database_url = "sqlite:///{0}".format(tmp_path / "monitoring.sqlite")
@@ -855,6 +894,54 @@ def test_monitoring_api_queries_current_database_state_on_every_request(tmp_path
     assert "<th>Attempts</th>" in html_body
     assert '<meta http-equiv="refresh" content="60">' in html_body
     assert "Auto-refreshes every 60 seconds." in html_body
+    assert "Last queried:" in html_body
+
+
+def test_monitoring_report_hides_directoryless_errors_until_toggled(tmp_path):
+    """The live report keeps route-only failures available without crowding the default view."""
+    database_url = "sqlite:///{0}".format(tmp_path / "monitoring.sqlite")
+    definition = TransferDefinition(
+        identifier="stage_lab",
+        runtime_id="server1_prod.user1",
+        system="server1",
+        user="user1",
+        source="grid@grid:/source/*",
+        destination="/destination/",
+    )
+    sync_transfer_definitions(database_url, [definition])
+    failure = create_transfer_event(
+        transfer_identifier="stage_lab",
+        system="server1",
+        runtime_id="server1_prod.user1",
+        execution_user="user1",
+        status="failed",
+        phase="discovery",
+        reason_code="ssh_timeout",
+        exit_code=255,
+        message="remote source discovery failed for grid@grid: connection timed out",
+        source_path="grid@grid:/source/",
+        destination_path="/destination/",
+    )
+    spool_path = tmp_path / "events.tsv"
+    spool_path.write_text(EVENT_HEADER + "\n" + event_to_tsv_row(failure) + "\n")
+    ingest_event_spool(database_url, str(spool_path))
+
+    application = MonitoringApplication(database_url)
+    hidden_status, _, hidden_html = application.respond("/", "")
+    shown_status, _, shown_html = application.respond(
+        "/",
+        "runtime_id=server1_prod.user1&show_without_directory=1",
+    )
+
+    assert hidden_status == 200
+    assert "remote source discovery failed" not in hidden_html
+    assert "⚠️ 1 hidden error" in hidden_html
+    assert "Show them" in hidden_html
+    assert shown_status == 200
+    assert "remote source discovery failed" in shown_html
+    assert "ssh_timeout (exit 255)" in shown_html
+    assert "Hide transfers without directories" in shown_html
+    assert "Last queried:" in shown_html
 
 
 def test_live_ingestor_rejects_an_unversioned_spool_without_guessing(tmp_path):
@@ -915,6 +1002,57 @@ def test_route_discovery_failure_is_visible_without_run_or_attempt_identity(tmp_
     assert summary["state"] == "failed before delivery"
     assert summary["latest_failure_phase"] == "discovery"
     assert summary["reason_code"] == "source_missing"
+
+
+@pytest.mark.skipif(
+    not (HAS_FLOCK and HAS_UUIDGEN),
+    reason="requires flock and uuidgen",
+)
+def test_remote_discovery_failure_keeps_ssh_reason_and_diagnostic(tmp_path):
+    """An SSH outage must not be recorded as a missing remote directory."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        "#!/bin/sh\n"
+        "printf 'ssh: connect to host remote port 22: Connection timed out\\n' >&2\n"
+        "exit 255\n"
+    )
+    fake_ssh.chmod(0o755)
+    fake_od = fake_bin / "od"
+    fake_od.write_text("#!/bin/sh\nprintf '0\\n'\n")
+    fake_od.chmod(0o755)
+    transfer = {
+        "identifiers": "stage_remote",
+        "runtime_id": "server1_prod.user1",
+        "system": "server1",
+        "users": "user1",
+        "source": "user@remote:/source/*",
+        "source_port": "",
+        "destination": str(tmp_path / "destination") + "/",
+        "destination_port": "",
+        "rsync_options": "",
+        "io_nice": "",
+        "log_file": str(tmp_path / "stage_remote.log"),
+        "flock_file": str(tmp_path / "stage_remote.lock"),
+    }
+    path = os.pathsep.join((str(fake_bin), os.environ.get("PATH", "")))
+
+    result, managed_root = run_generated_transfer(
+        tmp_path,
+        transfer,
+        env_overrides={"PATH": path},
+    )
+    spool_path = managed_root / "log" / "Landing_Zone_server1.transfers.tsv"
+    with spool_path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+
+    assert result.returncode == 0, result.stderr
+    assert len(rows) == 1
+    assert rows[0]["phase"] == "discovery"
+    assert rows[0]["reason_code"] == "ssh_timeout"
+    assert rows[0]["exit_code"] == "255"
+    assert "Connection timed out" in rows[0]["message"]
 
 
 @pytest.mark.skipif(

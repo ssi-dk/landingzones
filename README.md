@@ -149,7 +149,9 @@ spool, and safely ignores replayed `event_id` values. It rejects unversioned or
 unsupported headers rather than guessing their layout. During cutover, stop
 old writers, archive the old common-status TSV if desired, and create a fresh
 file (or let the first schema-v1 runtime create it); never append v1 rows below
-the old unversioned header.
+the old unversioned header. A malformed row is reported as a warning, skipped,
+and included in the checkpoint so one bad row cannot hold back later valid
+events; header and checkpoint errors remain fatal.
 
 Start the live service with:
 
@@ -161,14 +163,23 @@ Service startup loads the configured transfer file and synchronizes Transfer
 Definitions before accepting requests; use `--transfers` and repeatable
 `--runtime-id` options to override the configured inventory or selection.
 Every HTML page load and JSON request queries the current database, and HTML
-monitoring pages auto-refresh every 60 seconds while preserving the current
-URL and query filters. The JSON API is available at `/api/runs` and
+monitoring pages show their last queried UTC time and auto-refresh every 60
+seconds while preserving the current URL and query filters. The run list
+defaults to transfers with a discovered directory; route-only observations,
+including configured-but-never-observed routes and pre-discovery failures, are
+available through the `Show them` toggle. The JSON API is available at `/api/runs` and
 `/api/runs/<run_id>`. Repeatable query parameters include `runtime_id`,
 `system`, `execution_user`, `transfer_identifier`, `tag`, `state`, and
 `reason_code`. The existing
 `landingzones report transfers` command remains a legacy static schema-0
 reporting surface; it is not the operational reader for schema-version-1
 Event Spools.
+
+Remote source discovery records `source_missing` only when the remote probe
+successfully reports that the directory is absent. SSH failures retain the
+SSH exit code and diagnostic text and use one of `ssh_timeout`,
+`ssh_authentication_failed`, `ssh_host_unreachable`, or `ssh_failed` as the
+stable `reason_code` for downstream use cases.
 
 ### Generated Cron Format
 

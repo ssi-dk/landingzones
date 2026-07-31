@@ -528,14 +528,18 @@ def handle_monitor_ingest(args, extra_args):
             spool_id=args.spool_id,
         )
         print(
-            "{0}: inserted={1} duplicates={2} checkpoint={3} deferred_bytes={4}".format(
+            "{0}: inserted={1} duplicates={2} skipped={3} checkpoint={4} "
+            "deferred_bytes={5}".format(
                 spool_path,
                 result.inserted,
                 result.duplicates,
+                getattr(result, "skipped", 0),
                 result.checkpoint_offset,
                 result.deferred_bytes,
             )
         )
+        for warning in getattr(result, "warnings", ()):
+            print("{0}: warning: {1}".format(spool_path, warning), file=sys.stderr)
     return 0
 
 

@@ -836,6 +836,20 @@ def build_source_exists_command(source, port=''):
     return test_cmd, source_root
 
 
+def build_source_probe_command(source, port=''):
+    """Build a source probe that distinguishes absence from SSH failure."""
+    remote, source_path = split_remote_path(source)
+    source_root = normalize_source_path(source_path if remote else source)
+    if not remote:
+        return '[ -d {0} ]'.format(shell_path(source_root)), source_root
+    probe_cmd = (
+        'if [ -d {0} ]; then '
+        'printf "%s\\n" "LANDINGZONES_SOURCE_EXISTS"; '
+        'else printf "%s\\n" "LANDINGZONES_SOURCE_MISSING"; fi'
+    ).format(shell_path(source_root))
+    return build_remote_shell_command(probe_cmd, remote, port), source_root
+
+
 def build_directory_command(command, path, remote=None, port=''):
     """Build a local or remote directory-management shell command."""
     quoted_path = shell_quote(path)
@@ -1203,7 +1217,7 @@ def generate_iterative_script_content(transfer):
     destination_remote, destination_path = split_remote_path(destination)
     commands = build_transfer_commands(transfer)
     source_root = normalize_source_path(source_path if source_remote else source)
-    source_exists_cmd, _ = build_source_exists_command(
+    source_probe_cmd, _ = build_source_probe_command(
         transfer['source'],
         transfer.get('source_port', ''),
     )
@@ -1437,6 +1451,7 @@ cleanup_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.cleanup.XXXX
 promote_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.promote.XXXXXX")"
 preflight_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.preflight.XXXXXX")"
 preflight_stderr_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.preflight-stderr.XXXXXX")"
+source_discovery_log="$(mktemp "${{TMPDIR:-/tmp}}/landingzones.{script_stem}.source-discovery.XXXXXX")"
 current_run=""
 current_run_id=""
 current_attempt_id=""
@@ -1458,7 +1473,7 @@ event_message=""
 event_row=""
 
 cleanup() {{
-    rm -f "$run_log" "$cleanup_log" "$promote_log" "$preflight_log" "$preflight_stderr_log"
+    rm -f "$run_log" "$cleanup_log" "$promote_log" "$preflight_log" "$preflight_stderr_log" "$source_discovery_log"
 }}
 debug_enabled() {{
     [ -t 1 ] || [ "${{LZ_DEBUG_CLI:-0}}" = "1" ]
@@ -2387,6 +2402,31 @@ summarize_log() {{
     awk 'NF {{ gsub(/\\t/, " "); print; exit }}' "$path"
 }}
 
+classify_ssh_error() {{
+    path="$1"
+    if grep -Eiq 'timed out|timeout' "$path" 2>/dev/null; then
+        printf 'ssh_timeout'
+    elif grep -Eiq 'permission denied|authentication failed|publickey' "$path" 2>/dev/null; then
+        printf 'ssh_authentication_failed'
+    elif grep -Eiq 'could not resolve hostname|name or service not known|no route to host|network is unreachable|connection refused|connection reset|connection closed' "$path" 2>/dev/null; then
+        printf 'ssh_host_unreachable'
+    else
+        printf 'ssh_failed'
+    fi
+}}
+
+source_discovery_failure_message() {{
+    detail="$(summarize_log "$source_discovery_log")"
+    if [ "$detail" = "see log" ] && [ -n "$source_probe_output" ]; then
+        detail="$(printf '%s' "$source_probe_output" | awk 'NF {{ gsub(/[[:space:]]+/, " "); print; exit }}')"
+    fi
+    if [ -n "$detail" ]; then
+        printf 'remote source discovery failed for %s:%s: %s' "$source_remote_target" "$source_root_runtime" "$detail"
+    else
+        printf 'remote source discovery failed for %s:%s' "$source_remote_target" "$source_root_runtime"
+    fi
+}}
+
 on_exit() {{
     status=$?
     if [ "$status" -ne 0 ]; then
@@ -2425,13 +2465,45 @@ if ! {flock_command} -n 9; then
 fi
 {remote_destination_setup}
 
-if ! {source_exists_cmd}; then
-    log_status "{missing_source_message}"
-    if ! route_observation_unchanged "failed" "discovery" "source_missing"; then
-        emit_transfer_event "failed" "discovery" "none" "" "{transfer_source_label}" "{transfer_destination_label}" "{missing_source_message}" "source_missing"
+source_probe_output=""
+source_probe_reason_code=""
+source_probe_exit_code=""
+if [ -n "$source_remote_target" ]; then
+    if source_probe_output="$({source_probe_cmd} 2>"$source_discovery_log")"; then
+        case "$source_probe_output" in
+            *LANDINGZONES_SOURCE_EXISTS*)
+                :
+                ;;
+            *LANDINGZONES_SOURCE_MISSING*)
+                source_probe_reason_code="source_missing"
+                source_probe_output=""
+                ;;
+            *)
+                source_probe_reason_code="ssh_failed"
+                ;;
+        esac
+    else
+        source_probe_exit_code=$?
+        source_probe_reason_code="$(classify_ssh_error "$source_discovery_log")"
     fi
-    printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "{missing_source_message}" >> "$log_file"
-    debug "{missing_source_message}"
+else
+    if ! {source_probe_cmd}; then
+        source_probe_reason_code="source_missing"
+    fi
+fi
+
+if [ -n "$source_probe_reason_code" ]; then
+    if [ "$source_probe_reason_code" = "source_missing" ]; then
+        source_probe_message="{missing_source_message}"
+    else
+        source_probe_message="$(source_discovery_failure_message)"
+    fi
+    log_status "$source_probe_message"
+    if ! route_observation_unchanged "failed" "discovery" "$source_probe_reason_code"; then
+        emit_transfer_event "failed" "discovery" "none" "" "{transfer_source_label}" "{transfer_destination_label}" "$source_probe_message" "$source_probe_reason_code" "$source_probe_exit_code"
+    fi
+    printf '%s %s\\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$source_probe_message" >> "$log_file"
+    debug "$source_probe_message"
     exit 0
 fi
 
@@ -2650,7 +2722,7 @@ fi
         ).replace('"', '\\"'),
         script_stem=sanitize_identifier(identifier),
         flock_command=commands['flock_command'],
-        source_exists_cmd=source_exists_cmd,
+        source_probe_cmd=source_probe_cmd,
         missing_source_message='source directory missing: {0}'.format(source_root),
         source_loop=source_loop,
         run_source_expr=run_source_expr,

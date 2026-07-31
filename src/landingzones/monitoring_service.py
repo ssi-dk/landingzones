@@ -5,7 +5,8 @@
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-from urllib.parse import parse_qs, unquote, urlsplit
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlsplit
 
 from landingzones.monitoring import query_run_detail, query_run_summaries
 
@@ -31,6 +32,36 @@ def _query_filters(query_string):
     }
 
 
+def _show_without_directory(query_string):
+    """Return whether the report should include route-only observations."""
+    values = parse_qs(query_string, keep_blank_values=False)
+    return values.get("show_without_directory", [""])[-1].lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _toggle_url(query_string, show_without_directory):
+    """Return a report URL that preserves filters while changing visibility."""
+    parameters = [
+        (name, value)
+        for name, value in parse_qsl(query_string, keep_blank_values=True)
+        if name != "show_without_directory"
+    ]
+    if show_without_directory:
+        parameters.append(("show_without_directory", "1"))
+    encoded = urlencode(parameters)
+    return "/?{0}".format(encoded) if encoded else "/"
+
+
+def _queried_at_utc():
+    """Return the current report-query timestamp in the event format."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+
+
 def _json_response(value, status=200):
     return (
         status,
@@ -51,7 +82,8 @@ def _format_age(age_seconds):
     return "{0}d".format(age_seconds // 86400)
 
 
-def _page(title, content):
+def _page(title, content, queried_at_utc=None):
+    queried_at_utc = queried_at_utc or _queried_at_utc()
     return """<!doctype html>
 <html lang="en">
 <head>
@@ -71,8 +103,13 @@ code {{ white-space: nowrap; }}
 .progress-active {{ color: #92400e; }}
 </style>
 </head>
-<body><h1>{0}</h1><p class="muted">Auto-refreshes every {1} seconds.</p>{2}</body>
-</html>""".format(escape(title), AUTO_REFRESH_SECONDS, content)
+<body><h1>{0}</h1><p class="muted">Last queried: {2} · Auto-refreshes every {1} seconds.</p>{3}</body>
+</html>""".format(
+        escape(title),
+        AUTO_REFRESH_SECONDS,
+        escape(queried_at_utc),
+        content,
+    )
 
 
 def _progress_text(run):
@@ -103,9 +140,19 @@ def _progress_class(state):
     return ""
 
 
-def _render_runs(runs):
+def _render_runs(
+    runs,
+    query_string="",
+    show_without_directory=False,
+    queried_at_utc=None,
+):
+    hidden_runs = [run for run in runs if not run["directory"]]
+    visible_runs = runs if show_without_directory else [
+        run for run in runs if run["directory"]
+    ]
+    hidden_errors = [run for run in hidden_runs if "failed" in run["state"]]
     rows = []
-    for run in runs:
+    for run in visible_runs:
         run_id = run["run_id"]
         directory_value = escape(run["directory"] or "—")
         if run_id:
@@ -164,10 +211,36 @@ def _render_runs(runs):
         "<th>Last event</th><th>Age</th><th>Attempts</th><th>Latest failure</th>"
         "</tr></thead><tbody>{0}</tbody></table>"
     ).format("".join(rows))
-    return _page("Landing Zones Transfer Runs", table)
+    if show_without_directory:
+        toggle = '<a href="{0}">Hide transfers without directories</a>'.format(
+            escape(_toggle_url(query_string, False))
+        )
+        visibility = "Showing transfers with and without directories. {0}.".format(
+            toggle
+        )
+    elif hidden_runs:
+        hidden_description = "{0} transfer{1} without a directory hidden".format(
+            len(hidden_runs), "s" if len(hidden_runs) != 1 else ""
+        )
+        if hidden_errors:
+            hidden_description += " · ⚠️ {0} hidden error{1}".format(
+                len(hidden_errors), "s" if len(hidden_errors) != 1 else ""
+            )
+        toggle = '<a href="{0}">Show them</a>'.format(
+            escape(_toggle_url(query_string, True))
+        )
+        visibility = "{0}. {1}.".format(hidden_description, toggle)
+    else:
+        visibility = "Showing transfers with directories."
+    controls = '<p class="muted">{0}</p>'.format(visibility)
+    return _page(
+        "Landing Zones Transfer Runs",
+        controls + table,
+        queried_at_utc=queried_at_utc,
+    )
 
 
-def _render_detail(detail):
+def _render_detail(detail, queried_at_utc=None):
     rows = []
     for event in detail["timeline"]:
         diagnostic = event["reason_code"] or ""
@@ -192,7 +265,11 @@ def _render_detail(detail):
         "<th>Phase</th><th>Attempt ID</th><th>Diagnostic</th></tr></thead>"
         "<tbody>{0}</tbody></table>"
     ).format("".join(rows))
-    return _page("Transfer Run {0}".format(detail["run_id"]), table)
+    return _page(
+        "Transfer Run {0}".format(detail["run_id"]),
+        table,
+        queried_at_utc=queried_at_utc,
+    )
 
 
 class MonitoringApplication:
@@ -203,12 +280,15 @@ class MonitoringApplication:
 
     def respond(self, path, query_string=""):
         """Return an HTTP-style status, headers, and text response body."""
+        queried_at_utc = _queried_at_utc()
         if path == "/api/runs":
             runs = query_run_summaries(
                 self.database_url,
                 **_query_filters(query_string)
             )
-            return _json_response({"runs": runs})
+            return _json_response(
+                {"queried_at_utc": queried_at_utc, "runs": runs}
+            )
         if path.startswith("/api/runs/"):
             run_id = unquote(path[len("/api/runs/") :])
             detail = query_run_detail(self.database_url, run_id)
@@ -222,12 +302,16 @@ class MonitoringApplication:
                 return (
                     404,
                     {"Content-Type": "text/html; charset=utf-8"},
-                    _page("Transfer Run not found", "<p>No matching event history.</p>"),
+                    _page(
+                        "Transfer Run not found",
+                        "<p>No matching event history.</p>",
+                        queried_at_utc=queried_at_utc,
+                    ),
                 )
             return (
                 200,
                 {"Content-Type": "text/html; charset=utf-8"},
-                _render_detail(detail),
+                _render_detail(detail, queried_at_utc=queried_at_utc),
             )
         if path == "/":
             runs = query_run_summaries(
@@ -237,7 +321,12 @@ class MonitoringApplication:
             return (
                 200,
                 {"Content-Type": "text/html; charset=utf-8"},
-                _render_runs(runs),
+                _render_runs(
+                    runs,
+                    query_string=query_string,
+                    show_without_directory=_show_without_directory(query_string),
+                    queried_at_utc=queried_at_utc,
+                ),
             )
         return _json_response({"error": "Not found"}, status=404)
 

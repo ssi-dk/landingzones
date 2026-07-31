@@ -41,6 +41,9 @@ EVENT_PHASES = frozenset(("discovery", "readiness", "transfer", "promotion", "cl
 REASON_CODES = frozenset(
     (
         "ssh_timeout",
+        "ssh_authentication_failed",
+        "ssh_host_unreachable",
+        "ssh_failed",
         "permission_denied",
         "source_missing",
         "destination_conflict",

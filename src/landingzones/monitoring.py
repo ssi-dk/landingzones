@@ -4,6 +4,7 @@
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import csv
 import os
 
 from sqlalchemy import (
@@ -118,6 +119,8 @@ class IngestionResult:
     checkpoint_offset: int
     deferred_bytes: int
     ingestion_batch: str
+    skipped: int = 0
+    warnings: tuple = ()
 
 
 def _create_engine(database_url):
@@ -174,6 +177,20 @@ def _read_spool_chunk(spool_path, checkpoint_offset):
     return header, complete, offset, len(deferred)
 
 
+def _spool_line_number_at_offset(spool_path, offset):
+    """Return the one-based line number that starts at a byte offset."""
+    newline_count = 0
+    remaining = offset
+    with open(spool_path, "rb") as handle:
+        while remaining:
+            chunk = handle.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            newline_count += chunk.count(b"\n")
+            remaining -= len(chunk)
+    return newline_count + 1
+
+
 def ingest_event_spool(database_url, spool_path, spool_id=None):
     """Ingest complete spool rows and atomically advance the source checkpoint."""
     absolute_path = os.path.abspath(os.fspath(spool_path))
@@ -211,14 +228,38 @@ def ingest_event_spool(database_url, spool_path, spool_id=None):
 
         inserted = 0
         duplicates = 0
+        skipped = 0
+        warnings = []
         spool_offset = start_offset
+        spool_line_number = _spool_line_number_at_offset(
+            absolute_path,
+            start_offset,
+        )
         for raw_line_with_ending in complete.splitlines(keepends=True):
             raw_line = raw_line_with_ending.rstrip(b"\r\n")
             try:
                 line = raw_line.decode("utf-8")
             except UnicodeDecodeError:
-                raise UnsupportedEventSpool("Event Spool row is not UTF-8")
-            event = event_from_tsv_row(line)
+                warning = (
+                    "skipped malformed Event Spool row at line {0}, "
+                    "byte offset {1}: invalid UTF-8"
+                ).format(spool_line_number, spool_offset)
+            else:
+                try:
+                    event = event_from_tsv_row(line)
+                except (ValueError, csv.Error) as exc:
+                    warning = (
+                        "skipped malformed Event Spool row at line {0}, "
+                        "byte offset {1}: {2}"
+                    ).format(spool_line_number, spool_offset, exc)
+                else:
+                    warning = None
+            if warning is not None:
+                skipped += 1
+                warnings.append(warning)
+                spool_offset += len(raw_line_with_ending)
+                spool_line_number += 1
+                continue
             event_values = asdict(event)
             event_values.update(
                 {
@@ -238,6 +279,7 @@ def ingest_event_spool(database_url, spool_path, spool_id=None):
             else:
                 duplicates += 1
             spool_offset += len(raw_line_with_ending)
+            spool_line_number += 1
 
         new_offset = start_offset + len(complete)
         checkpoint_values = {
@@ -268,6 +310,8 @@ def ingest_event_spool(database_url, spool_path, spool_id=None):
         checkpoint_offset=new_offset,
         deferred_bytes=deferred_bytes,
         ingestion_batch=batch_id,
+        skipped=skipped,
+        warnings=tuple(warnings),
     )
 
 

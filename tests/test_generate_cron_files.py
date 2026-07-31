@@ -1143,6 +1143,7 @@ class TestGenerateRsyncCommand:
         assert 'find "/source" -mindepth 1 -maxdepth 1 -type d ! -name ".*" -print | while IFS= read -r source_dir; do' in script
         assert 'preflight_log="$(mktemp "${TMPDIR:-/tmp}/landingzones.sample.preflight.XXXXXX")"' in script
         assert 'preflight_stderr_log="$(mktemp "${TMPDIR:-/tmp}/landingzones.sample.preflight-stderr.XXXXXX")"' in script
+        assert 'source_discovery_log="$(mktemp "${TMPDIR:-/tmp}/landingzones.sample.source-discovery.XXXXXX")"' in script
         assert 'if ! find "$source_dir" -type d -print | while IFS= read -r dir_path; do [ -w "$dir_path" ] && [ -x "$dir_path" ] || printf "%s\\n" "$dir_path"; done >"$preflight_log" 2>"$preflight_stderr_log"; then' in script
         assert 'rsync --dry-run -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$preflight_log" 2>&1' in script
         assert 'if rsync -av --remove-source-files "$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1; then' in script
@@ -1181,6 +1182,8 @@ class TestGenerateRsyncCommand:
         assert 'dump_debug_log "cleanup log" "$cleanup_log"' in script
         assert 'dump_debug_log "preflight log" "$preflight_log"' in script
         assert 'dump_debug_log "preflight stderr log" "$preflight_stderr_log"' in script
+        assert "classify_ssh_error() {" in script
+        assert "source_discovery_failure_message() {" in script
         assert 'debug "script failed with exit code $status"' in script
         assert 'debug "$dir_name started"' in script
         assert 'debug "$dir_name completed"' in script
@@ -1194,9 +1197,35 @@ class TestGenerateRsyncCommand:
         assert 'if ! [ -d "/source" ]; then' in script
         assert script.index('random_start_delay 60') < script.index('if ! [ -d "/source" ]; then')
         assert 'source directory missing: /source' in script
-        assert 'emit_transfer_event "failed" "discovery" "none" "" "/source" "/dest" "source directory missing: /source" "source_missing"' in script
+        assert 'source_probe_reason_code="source_missing"' in script
+        assert 'emit_transfer_event "failed" "discovery" "none" "" "/source" "/dest" "$source_probe_message" "$source_probe_reason_code" "$source_probe_exit_code"' in script
         assert 'latest_log_file="/tmp/test.log.latest"' in script
         assert 'cat "$run_log" > "$latest_log_file"' in script
+
+    def test_remote_source_probe_emits_markers_and_preserves_ssh_diagnostics(self):
+        """Remote discovery must separate missing directories from SSH failures."""
+        transfer = {
+            'identifiers': 'remote_sample',
+            'system': 'calc',
+            'users': 'f041664',
+            'source': 'grid@grid:/home/grid/Landing_Zone/to_calc/',
+            'source_port': '',
+            'destination': '/dest/',
+            'destination_port': '',
+            'rsync_options': '',
+            'io_nice': '',
+            'log_file': '/tmp/test.log',
+            'flock_file': '/tmp/test.lock',
+            'frequency': '',
+        }
+
+        script = gcf.generate_script_content(transfer)
+
+        assert 'LANDINGZONES_SOURCE_EXISTS' in script
+        assert 'LANDINGZONES_SOURCE_MISSING' in script
+        assert 'source_probe_reason_code="$(classify_ssh_error "$source_discovery_log")"' in script
+        assert 'source_probe_exit_code=$?' in script
+        assert 'remote source discovery failed for %s' in script
 
     def test_generate_script_content_with_portable_metadata(self):
         """Portable metadata should be initialized and appended in the right order."""
@@ -1849,7 +1878,7 @@ class TestGenerateRsyncCommand:
         assert 'rsync -av --remove-source-files -e \'ssh -p 2200\' "user@remote:$source_dir/" "/dest/.staging/$dir_name/" </dev/null >>"$run_log" 2>&1' in script
         assert 'current_run_source="user@remote:$source_dir"' in script
         assert 'current_run_destination="/dest/$dir_name"' in script
-        assert 'if ! ssh -p 2200 user@remote \'[ -d "/source" ]\'; then' in script
+        assert 'source_probe_output="$(ssh -p 2200 user@remote \'if [ -d "/source" ]; then printf "%s\\n" "LANDINGZONES_SOURCE_EXISTS"; else printf "%s\\n" "LANDINGZONES_SOURCE_MISSING"; fi\' 2>"$source_discovery_log")"' in script
         assert 'source directory missing: /source' in script
 
     def test_generate_script_content_skips_hidden_top_level_dirs(self):
