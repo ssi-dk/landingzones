@@ -36,7 +36,11 @@ def normalize_exit_code(result):
 
 def resolve_cli_config(args):
     """Resolve the effective config path, preferring subcommand override over global."""
-    subcommand_config = getattr(args, 'config', None)
+    # Keep the two options on distinct argparse destinations.  Several
+    # subparsers define --config as well, and using the generic ``config``
+    # destination makes it easy for a subparser default to hide the global
+    # value when the option is placed before the subcommand.
+    subcommand_config = getattr(args, 'subcommand_config', None)
     global_config = getattr(args, 'global_config', None)
     return subcommand_config or global_config
 
@@ -91,7 +95,7 @@ def build_cli_parser():
         'build',
         help='Generate cron files, transfer scripts, and validation wrappers',
     )
-    build_parser.add_argument('--config', '-c', default=None)
+    build_parser.add_argument('--config', '-c', dest='subcommand_config', default=None)
     build_parser.add_argument('--transfers', '-t', default=None)
     build_parser.add_argument('--output-dir', '-o', default=None)
     build_parser.add_argument('--log-dir', '-l', default=None)
@@ -113,7 +117,7 @@ def build_cli_parser():
         'deployment',
         help='Run deployment readiness checks',
     )
-    validate_deployment_parser.add_argument('--config', '-c', default=None)
+    validate_deployment_parser.add_argument('--config', '-c', dest='subcommand_config', default=None)
     validate_deployment_parser.add_argument('--transfers', '-t', default=None)
     validate_deployment_parser.add_argument('--validation-scripts-dir', default=None)
     validate_deployment_parser.add_argument('--runtime-id', action='append', default=None)
@@ -123,7 +127,7 @@ def build_cli_parser():
         'integration',
         help='Seed toy data and execute the configured transfer chain',
     )
-    validate_integration_parser.add_argument('--config', '-c', default=None)
+    validate_integration_parser.add_argument('--config', '-c', dest='subcommand_config', default=None)
     validate_integration_parser.add_argument('--transfers', '-t', default=None)
     validate_integration_parser.add_argument('--validation-scripts-dir', default=None)
     validate_integration_parser.add_argument('--runtime-id', action='append', default=None)
@@ -138,7 +142,7 @@ def build_cli_parser():
         'hop',
         help='Run a generated per-flow hop validation wrapper',
     )
-    validate_hop_parser.add_argument('--config', '-c', default=None)
+    validate_hop_parser.add_argument('--config', '-c', dest='subcommand_config', default=None)
     validate_hop_parser.add_argument('--validation-scripts-dir', default=None)
     validate_hop_parser.add_argument('--runtime-id', action='append', default=None)
     validate_hop_parser.add_argument('flow_group')
@@ -148,7 +152,7 @@ def build_cli_parser():
         'separation',
         help='Check whether tagged transfers collide with other enabled flows',
     )
-    validate_separation_parser.add_argument('--config', '-c', default=None)
+    validate_separation_parser.add_argument('--config', '-c', dest='subcommand_config', default=None)
     validate_separation_parser.add_argument('--transfers', '-t', default=None)
     validate_separation_parser.add_argument('--runtime-id', action='append', default=None)
     validate_separation_parser.add_argument(
@@ -162,7 +166,7 @@ def build_cli_parser():
         'chain',
         help='Run separation, deployment, integration, and reporting in order',
     )
-    validate_chain_parser.add_argument('--config', '-c', default=None)
+    validate_chain_parser.add_argument('--config', '-c', dest='subcommand_config', default=None)
     validate_chain_parser.add_argument('--transfers', '-t', default=None)
     validate_chain_parser.add_argument('--validation-scripts-dir', default=None)
     validate_chain_parser.add_argument(
@@ -197,7 +201,7 @@ def build_cli_parser():
         'cron',
         help='Prompt to deploy cron files for the current system/user',
     )
-    deploy_cron_parser.add_argument('--config', '-c', default=None)
+    deploy_cron_parser.add_argument('--config', '-c', dest='subcommand_config', default=None)
     deploy_cron_parser.add_argument('--transfers', '-t', default=None)
     deploy_cron_parser.add_argument('--validation-scripts-dir', default=None)
     deploy_cron_parser.add_argument('--runtime-id', action='append', default=None)
@@ -243,7 +247,7 @@ def build_cli_parser():
         help='Optional path to the transfer TSV report input; defaults to report_transfer_log_file from config',
     )
     report_transfers_parser.add_argument('--output', '-o', default=None)
-    report_transfers_parser.add_argument('--config', '-c', default=None)
+    report_transfers_parser.add_argument('--config', '-c', dest='subcommand_config', default=None)
     report_transfers_parser.add_argument('--transfers-file', '-t', default=None)
     report_transfers_parser.add_argument('--system', default=None)
     report_transfers_parser.add_argument('--runtime-id', action='append', default=None)
@@ -273,7 +277,7 @@ def build_cli_parser():
     monitor_ingest_parser.add_argument('spools', nargs='+')
     monitor_ingest_parser.add_argument('--database-url', default=None)
     monitor_ingest_parser.add_argument('--spool-id', default=None)
-    monitor_ingest_parser.add_argument('--config', '-c', default=None)
+    monitor_ingest_parser.add_argument('--config', '-c', dest='subcommand_config', default=None)
     monitor_ingest_parser.set_defaults(handler=handle_monitor_ingest)
 
     monitor_sync_parser = monitor_subparsers.add_parser(
@@ -281,7 +285,7 @@ def build_cli_parser():
         help='Synchronize current Transfer Definitions into monitoring',
     )
     monitor_sync_parser.add_argument('--database-url', default=None)
-    monitor_sync_parser.add_argument('--config', '-c', default=None)
+    monitor_sync_parser.add_argument('--config', '-c', dest='subcommand_config', default=None)
     monitor_sync_parser.add_argument('--transfers', '-t', default=None)
     monitor_sync_parser.add_argument('--runtime-id', action='append', default=None)
     monitor_sync_parser.set_defaults(handler=handle_monitor_sync_definitions)
@@ -291,7 +295,7 @@ def build_cli_parser():
         help='Serve live HTML and JSON monitoring views',
     )
     monitor_serve_parser.add_argument('--database-url', default=None)
-    monitor_serve_parser.add_argument('--config', '-c', default=None)
+    monitor_serve_parser.add_argument('--config', '-c', dest='subcommand_config', default=None)
     monitor_serve_parser.add_argument('--transfers', '-t', default=None)
     monitor_serve_parser.add_argument('--runtime-id', action='append', default=None)
     monitor_serve_parser.add_argument('--host', default='127.0.0.1')
