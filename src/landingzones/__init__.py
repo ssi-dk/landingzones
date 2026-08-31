@@ -7,7 +7,7 @@ This package provides tools for managing automated data transfers
 using a centralized configuration approach.
 """
 
-__version__ = '1.1.15'
+__version__ = '1.1.16'
 __author__ = 'SSI-DK'
 __description__ = 'Automated data transfer system using rsync and cron'
 
