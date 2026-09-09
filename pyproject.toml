@@ -2,6 +2,11 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.automation.standalone]
+task = "build-standalone"
+path = "packaging/dist/landingzones-standalone.tar.gz"
+launcher = "landingzones"
+
 [project]
 name = "landingzones"
 dynamic = ["version"]
