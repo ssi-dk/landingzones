@@ -380,6 +380,11 @@ needs system tools such as `rsync`, `ssh`, `flock`, `curl`, and `cron`.
 
 ## Testing
 
+For a local lab-machine → Cluster A → Cluster B scenario using real SSH/rsync
+and synthetic Linux users/groups, see the [container transfer lab](tests/container_lab/README.md).
+It includes project isolation, preprocessing, and outage/retry checks without
+access to production servers.
+
 ```bash
 # Run all tests
 pytest
