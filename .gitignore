@@ -63,6 +63,7 @@ venv.bak/
 .DS_Store
 
 # Project specific
+tests/container_lab/output/
 crontab.d/*.cron
 *.log
 *.lock

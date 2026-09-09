@@ -14,6 +14,7 @@ From this directory:
 python3 lab.py setup
 python3 lab.py run
 python3 lab.py inspect
+python3 lab.py validate
 python3 lab.py reset
 ```
 
@@ -30,6 +31,36 @@ writable Linux filesystem and survive stop/start. `reset` removes only resources
 in the fixed `landingzones-container-lab` Compose project. It leaves the reusable
 image cached. Run reset/setup for a fresh scenario, or after changing code.
 Do not use the reserved Compose project name for other work.
+
+### Review and validate the monitoring TSV
+
+Each transfer account writes real schema-version-1 events to
+`/home/<user>/runtime/log/monitor.transfers.tsv` inside its container. This is
+the generated event history; `runtime/transfers.tsv` remains the input route
+definition. No monitoring events are fabricated by the lab.
+
+After a successful scenario, `run` automatically validates these files and
+exports review copies to `tests/container_lab/output/` on the host:
+
+- `cluster-a.a_transfer.transfers.tsv`
+- `cluster-a.a_distributor.transfers.tsv`
+- `cluster-b.b_distributor.transfers.tsv`
+- `validation.json` — written only when all checks pass.
+
+Run `python3 lab.py validate` to repeat the check without rerunning transfers.
+Validation checks the exact header and row schema, unique event IDs, expected
+runtime/user/flow identities, exactly one completion per route, the deliberate
+`push_alpha` outage followed by a successful retry, and run identity across
+both hops. Unexpected failures and duplicate completions fail validation.
+An unfinished scenario will fail these final-history checks; use `inspect`
+to investigate it. A TSV is exported before validation so malformed rows can
+be reviewed too. Errors identify the file and, for malformed events, its row.
+
+The host output folder is ignored by Git and remains after `reset`; validation
+refreshes these files and removes any previous success summary first. Existing
+containers built before this feature need `reset` followed by `setup` to receive
+the explicit spool path and validator. Reset removes the lab's container data,
+so inspect or copy any old results you want to retain first.
 
 ## Route and accounts
 

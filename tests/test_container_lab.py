@@ -52,4 +52,98 @@ def test_compose_uses_one_image_and_separate_filesystems():
 def test_lab_driver_parses():
     result = subprocess.run([sys.executable, str(LAB / "lab.py"), "--help"], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert "setup,run,inspect,reset" in result.stdout
+    assert "setup,run,inspect,validate,reset" in result.stdout
+
+
+def write_event_fixture(root, role="cluster-a", user="a_transfer"):
+    from landingzones.transfer_events import (
+        EVENT_HEADER, create_transfer_event, event_to_tsv_row, new_identifier,
+    )
+    rows = []
+    for route in node.routes(role, user):
+        run_id = new_identifier()
+        common = dict(
+            transfer_identifier=route["identifiers"], system=role,
+            runtime_id=route["runtime_id"], execution_user=user,
+            flow_group=route["flow_group"], run_id=run_id,
+        )
+        if route["identifiers"] == "push_alpha":
+            rows.append(create_transfer_event(
+                **common, status="failed", phase="transfer", exit_code=255,
+                reason_code="ssh_failed", attempt_id=new_identifier(),
+            ))
+        rows.append(create_transfer_event(
+            **common, status="completed", phase="cleanup", attempt_id=new_identifier(),
+        ))
+    path = root / "log/monitor.transfers.tsv"
+    path.parent.mkdir()
+    path.write_text(EVENT_HEADER + "\n" + "\n".join(event_to_tsv_row(row) for row in rows) + "\n")
+    return path
+
+
+@pytest.mark.parametrize("role,user", [
+    ("cluster-a", "a_transfer"), ("cluster-a", "a_distributor"),
+    ("cluster-b", "b_distributor"),
+])
+def test_monitoring_tsv_validates_completed_scenario(tmp_path, role, user):
+    write_event_fixture(tmp_path, role, user)
+    result = node.validate_events(tmp_path, role, user)
+    assert result["failures"] == (1 if user == "a_transfer" else 0)
+    assert len(result["completed_runs"]) == len(node.routes(role, user))
+
+
+@pytest.mark.parametrize("damage,message", [
+    ("header", "header"), ("truncated", "columns"),
+    ("duplicate", "duplicate event_id"), ("missing", "completion"),
+    ("identity", "runtime/user/flow"), ("outage", "outage failure"),
+    ("retry", "retry reused attempt_id"),
+])
+def test_monitoring_tsv_rejects_broken_history(tmp_path, damage, message):
+    from landingzones.transfer_events import EVENT_COLUMNS
+    path = write_event_fixture(tmp_path)
+    lines = path.read_text().splitlines()
+    if damage == "header":
+        lines[0] = "wrong\theader"
+    elif damage == "truncated":
+        lines[-1] = lines[-1].rsplit("\t", 1)[0]
+    elif damage == "duplicate":
+        lines.append(lines[-1])
+    elif damage == "missing":
+        lines.pop()
+    elif damage == "identity":
+        lines[-1] = lines[-1].replace("cluster-a_test.a_transfer", "wrong-runtime")
+    elif damage == "outage":
+        lines = [line for line in lines if "\tfailed\t" not in line]
+    elif damage == "retry":
+        failure = next(line.split("\t") for line in lines if "\tfailed\t" in line)
+        for index, line in enumerate(lines):
+            if "\tpush_alpha\t" in line and "\tcompleted\t" in line:
+                row = line.split("\t")
+                row[EVENT_COLUMNS.index("attempt_id")] = failure[EVENT_COLUMNS.index("attempt_id")]
+                lines[index] = "\t".join(row)
+    path.write_text("\n".join(lines) + "\n")
+    with pytest.raises(ValueError, match=message):
+        node.validate_events(tmp_path, "cluster-a", "a_transfer")
+
+
+@pytest.mark.parametrize("phase,run_id,flow,valid", [
+    ("discovery", "", "", True),
+    ("discovery", "", "wrong-flow", False),
+    ("transfer", "", "", False),
+])
+def test_route_outage_flow_validation(tmp_path, phase, run_id, flow, valid):
+    from landingzones.transfer_events import EVENT_COLUMNS
+    path = write_event_fixture(tmp_path)
+    lines = path.read_text().splitlines()
+    for index, line in enumerate(lines):
+        if "\tfailed\t" in line:
+            row = line.split("\t")
+            for field, value in dict(phase=phase, run_id=run_id, attempt_id="", flow_group=flow).items():
+                row[EVENT_COLUMNS.index(field)] = value
+            lines[index] = "\t".join(row)
+    path.write_text("\n".join(lines) + "\n")
+    if valid:
+        assert node.validate_events(tmp_path, "cluster-a", "a_transfer")["failures"] == 1
+    else:
+        with pytest.raises(ValueError):
+            node.validate_events(tmp_path, "cluster-a", "a_transfer")

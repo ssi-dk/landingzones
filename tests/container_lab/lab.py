@@ -160,8 +160,40 @@ def run():
         transfer("cluster-b", "b_distributor", f"distribute_{project}", empty=True)
         assert json.loads(node("cluster-b", f"{project}_user", "verify-project", project, capture=True).stdout) == metadata
     isolation()
+    validate()
     print("PASS: full route, checksums, permissions, metadata, events, outage/retry, and duplicate checks.")
     print("Containers and logs retained. Use inspect, or reset to remove this lab.")
+
+
+def validate():
+    """Export real TSVs for review and check their final scenario history."""
+    output = Path(__file__).parent / "output"
+    output.mkdir(exist_ok=True)
+    # Remove an earlier success summary before attempting a new validation.
+    (output / "validation.json").unlink(missing_ok=True)
+    summaries = {}
+    event_ids = set()
+    for service, user in RUNTIMES:
+        spool = f"/home/{user}/runtime/log/monitor.transfers.tsv"
+        raw = execute(service, user, "cat", spool, capture=True).stdout
+        destination = output / f"{service}.{user}.transfers.tsv"
+        destination.write_text(raw)
+        summary = json.loads(node(service, user, "validate-events", user, capture=True).stdout)
+        ids = set(summary.pop("event_ids"))
+        if event_ids & ids:
+            raise RuntimeError("Duplicate event IDs across runtime spools")
+        event_ids.update(ids)
+        summaries[user] = summary
+        print(f"Validated {destination}: {summary['events']} events, {summary['failures']} expected failures", flush=True)
+    for project in PROJECTS:
+        raw = summaries["a_transfer"]["completed_runs"][f"pull_{project}"]
+        processed = summaries["a_transfer"]["completed_runs"][f"push_{project}"]
+        if raw != summaries["a_distributor"]["completed_runs"][f"distribute_{project}"]:
+            raise RuntimeError(f"{project}: raw run identity changed between hops")
+        if processed != summaries["b_distributor"]["completed_runs"][f"distribute_{project}"] or processed == raw:
+            raise RuntimeError(f"{project}: processed run identity is inconsistent")
+    (output / "validation.json").write_text(json.dumps({"status": "passed", "runtimes": summaries}, indent=2) + "\n")
+    print(f"PASS: monitoring TSV validation. Review files in {output}", flush=True)
 
 
 def inspect():
@@ -175,7 +207,7 @@ def inspect():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("setup", "run", "inspect", "reset"))
+    parser.add_argument("action", choices=("setup", "run", "inspect", "validate", "reset"))
     args = parser.parse_args()
     if not shutil.which("docker"):
         parser.exit(2, "Docker is unavailable. Install/start a Docker engine with Compose v2, then retry.\n")
@@ -190,5 +222,7 @@ if __name__ == "__main__":
     try:
         main()
     except (AssertionError, RuntimeError, subprocess.CalledProcessError) as exc:
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            print(exc.stderr, file=sys.stderr, end="" if exc.stderr.endswith("\n") else "\n")
         print(f"FAIL: {exc}\nState retained; use inspect. Reset and setup before a fresh run.", file=sys.stderr)
         sys.exit(1)

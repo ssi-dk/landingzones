@@ -77,6 +77,7 @@ def write_config(role, user, root):
     config = {
         "transfers_file": str(root / "transfers.tsv"),
         "output_dir": str(root / "output"), "log_dir": str(root / "log"),
+        "report_transfer_log_file": str(root / "log/monitor.transfers.tsv"),
         "crontab_dir": str(root / "output/crontab.d"),
         "validation_scripts_dir": str(root / "output/validation_scripts"),
         "rit_managed_locations": {role: str(root)},
@@ -124,7 +125,8 @@ def boot():
                 command("chown", "-R", f"{user}:{ROLES[role][user][0]}", str(root))
                 command("runuser", "-u", user, "--", "landingzones", "--config", str(root / "config.yaml"), "build")
         Path("/var/lib/lab-initialized").touch()
-    Path("/run/sshd").mkdir(exist_ok=True)
+    # The fixture umask permits group writes; sshd requires a protected directory.
+    directory("/run/sshd", "root", "root", mode=0o755)
     command("ssh-keygen", "-A")
     Path("/etc/ssh/ssh_host_ed25519_key.pub").chmod(0o644)
     Path("/etc/ssh/sshd_config").write_text(
@@ -140,9 +142,11 @@ def boot():
 def credentials(user):
     ssh = Path.home() / ".ssh"
     ssh.mkdir(mode=0o700, exist_ok=True)
+    ssh.chmod(0o700)
     if user == "a_transfer":
         command("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ssh / "id_ed25519"))
         (ssh / "config").write_text("Host *\n  BatchMode yes\n  StrictHostKeyChecking yes\n  ConnectTimeout 3\n  ConnectionAttempts 1\n")
+        (ssh / "config").chmod(0o600)
     else:
         (ssh / "authorized_keys").write_text("restrict " + sys.stdin.read().strip() + "\n")
         (ssh / "authorized_keys").chmod(0o600)
@@ -180,6 +184,69 @@ def events():
     print(json.dumps(result))
 
 
+def validate_events(root, role, user):
+    """Validate the real spool against the completed lab scenario."""
+    from landingzones.transfer_events import EVENT_COLUMNS, event_from_tsv_row
+
+    path = Path(root) / "log/monitor.transfers.tsv"
+    expected = {row["identifiers"]: row for row in routes(role, user)}
+    if not expected:
+        raise ValueError(f"No expected routes for {role}/{user}")
+    with path.open(newline="") as handle:
+        reader = csv.reader(handle, delimiter="\t")
+        if next(reader, None) != list(EVENT_COLUMNS):
+            raise ValueError(f"{path}: invalid Transfer Event header")
+        rows = []
+        seen = set()
+        for number, row in enumerate(reader, 2):
+            try:
+                event = event_from_tsv_row(row)
+                if event.event_id in seen:
+                    raise ValueError("duplicate event_id")
+                seen.add(event.event_id)
+                route = expected.get(event.transfer_identifier)
+                if route is None:
+                    raise ValueError("unexpected transfer_identifier")
+                route_failure = (
+                    event.status == "failed" and event.phase == "discovery"
+                    and not event.run_id and not event.attempt_id
+                )
+                if (event.system, event.runtime_id, event.execution_user) != (
+                    role, route["runtime_id"], user
+                ) or (event.flow_group != route["flow_group"] and not (
+                    route_failure and not event.flow_group
+                )):
+                    raise ValueError("event does not match the expected runtime/user/flow")
+                rows.append(event)
+            except ValueError as exc:
+                raise ValueError(f"{path}:{number}: {exc}") from exc
+    completed = {}
+    for identifier in expected:
+        matches = [event for event in rows if event.transfer_identifier == identifier and event.status == "completed"]
+        if len(matches) != 1 or matches[0].exit_code not in (None, 0):
+            raise ValueError(f"{path}: expected exactly one successful completion for {identifier}")
+        completed[identifier] = matches[0]
+    failures = [event for event in rows if event.status == "failed"]
+    if user == "a_transfer":
+        if not failures or any(event.transfer_identifier != "push_alpha" or event.exit_code in (None, 0) for event in failures):
+            raise ValueError(f"{path}: expected only the push_alpha outage failure")
+        retry = completed["push_alpha"]
+        for failure in failures:
+            if rows.index(failure) >= rows.index(retry):
+                raise ValueError(f"{path}: outage must precede successful retry")
+            if failure.run_id and failure.run_id != retry.run_id:
+                raise ValueError(f"{path}: retry changed run_id")
+            if failure.attempt_id and failure.attempt_id == retry.attempt_id:
+                raise ValueError(f"{path}: retry reused attempt_id")
+    elif failures:
+        raise ValueError(f"{path}: unexpected failure")
+    return {
+        "path": str(path), "events": len(rows), "failures": len(failures),
+        "event_ids": sorted(seen),
+        "completed_runs": {name: event.run_id for name, event in completed.items()},
+    }
+
+
 def verify_project(project):
     root = Path(f"/data/projects/{project}")
     assert sorted(p.name for p in root.iterdir() if not p.name.startswith(".")) == [f"processed_{project}"]
@@ -215,6 +282,8 @@ if __name__ == "__main__":
         preprocess()
     elif action == "events":
         events()
+    elif action == "validate-events":
+        print(json.dumps(validate_events(Path.home() / "runtime", os.environ["LAB_ROLE"], sys.argv[2])))
     elif action == "verify-project":
         verify_project(sys.argv[2])
     else:
