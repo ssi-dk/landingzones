@@ -348,11 +348,15 @@ landingzones-standalone-linux-x86_64.tar.gz
 For `v*` tags, the workflow also creates or updates the matching GitHub Release
 and uploads `landingzones-standalone-linux-x86_64.tar.gz` as a release asset.
 
-The GitHub Actions workflow `Create Release From Version` runs on pushes to
-`main` when the app version files change. It reads
-`src/landingzones/__init__.py`, validates `pixi.toml` has the same version, and
-creates the missing `v<version>` GitHub Release. That tag then triggers the
-existing `v*` release and publishing workflows.
+To release a version, update `src/landingzones/__init__.py` and `pixi.toml`
+to the same version and merge the changes into `main`. Tag that commit with
+`v<version>` and push the tag to GitHub. The standalone workflow builds from
+that tag, verifies the bundle CLI, and publishes the matching release asset.
+A version bump on `main` alone does not create a tag or release.
+
+For recovery or rebuilds, manually dispatch `Build Standalone Bundle` against
+the version tag. This replaces the existing standalone release asset. A manual
+run against a branch uploads an Actions artifact only.
 
 The bundle is written to:
 
