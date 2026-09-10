@@ -108,25 +108,28 @@ def test_github_action_builds_and_uploads_standalone_bundle():
     assert "packaging/dist/landingzones-standalone.tar.gz" in workflow_text
 
 
-def test_github_action_creates_release_from_app_version():
-    """The release workflow should create v<version> from the app version."""
+def test_standalone_release_is_driven_by_version_tags():
+    """Tag builds publish releases; branch dispatches only upload artifacts."""
     workflow_path = os.path.join(
-        APP_ROOT,
-        ".github",
-        "workflows",
-        "release-on-version.yml",
+        APP_ROOT, ".github", "workflows", "build-standalone.yml"
     )
     with open(workflow_path, "r") as handle:
-        workflow = yaml.safe_load(handle)
-    workflow_text = open(workflow_path, "r").read()
+        # BaseLoader preserves the GitHub Actions "on" key as a string.
+        workflow = yaml.load(handle, Loader=yaml.BaseLoader)
 
-    assert workflow["name"] == "Create Release From Version"
-    assert "workflow_dispatch" in workflow_text
-    assert "branches: [main]" in workflow_text
-    assert "src/landingzones/__init__.py" in workflow_text
-    assert "pixi.toml" in workflow_text
-    assert 'TAG="v${VERSION}"' in workflow_text
-    assert "gh release view" in workflow_text
-    assert "gh release create" in workflow_text
-    assert "--target \"$GITHUB_SHA\"" in workflow_text
-    assert "GH_TOKEN: ${{ github.token }}" in workflow_text
+    assert workflow["on"]["push"] == {"tags": ["v*"]}
+    assert "workflow_dispatch" in workflow["on"]
+    job = workflow["jobs"]["build-linux"]
+    assert job["permissions"]["contents"] == "write"
+    checkout = next(step for step in job["steps"]
+                    if step.get("uses", "").startswith("actions/checkout@"))
+    assert "ref" not in checkout.get("with", {})
+    publish = next(step for step in job["steps"]
+                   if step.get("name") == "Publish standalone bundle to GitHub Release")
+    assert publish["if"] == "startsWith(github.ref, 'refs/tags/')"
+    assert 'gh release create "$GITHUB_REF_NAME"' in publish["run"]
+    assert 'gh release upload "$GITHUB_REF_NAME"' in publish["run"]
+    assert "--clobber" in publish["run"]
+    assert not os.path.exists(os.path.join(
+        APP_ROOT, ".github", "workflows", "release-on-version.yml"
+    ))
