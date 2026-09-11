@@ -103,6 +103,30 @@ _Avoid_: Deleted cron, stale cron
 The system and Unix account under which a runtime command or cron job runs.
 _Avoid_: Runtime identity, deploy boundary
 
+## Independent package handoffs (feature branch)
+
+**Package**:
+An accepted set of logical data with a stable identity and content inventory.
+Moving, copying or translating a matching label preserves that identity;
+processing that changes the data creates a new Package.
+
+**Package Label**:
+Portable, versioned identity and content evidence, with optional descriptive
+itinerary, prepared handoff history and supplied provenance. It does not authorize
+arbitrary routes and is not the executor's durable receipt.
+
+**Connection Receipt**:
+Local durable execution and deduplication evidence for a Package on one configured
+Transfer Definition. Independent execution contexts maintain separate receipts.
+
+**Sequencing Run**:
+A producer/workflow identity that may span multiple Packages. It is distinct from
+a Transfer Run. Cross-processing relationships require explicit provenance.
+
+The revised Python executor selects one connection per flow group; a flow group
+is not an ordered journey in this path. Existing generated-script grouping and
+archive behavior remain separate pending migration. See ADR 0004.
+
 ## Relationships
 
 - A **Landing Zone Runtime** has exactly one **Runtime ID**.

@@ -2,6 +2,37 @@
 
 Automated data transfer system using rsync with cron job generation.
 
+## Independent Python connections (incremental)
+
+Python rows use `executor=python`, an explicit `adapter` and `operation`, and
+one connection per selected `flow_group`. Each execution context owns its local
+receipts and retries; a package's portable label links independent centers.
+No shared execution database or end-to-end request coordinator is required.
+Legacy generated-script routes remain available and are not silently migrated.
+
+`landingzones transfer preflight/run/status/resume` accepts one connection per
+request. `landingzones transfer discover --connection NAME` scans a configured
+input and resumes interrupted work; cron can call it directly. Requests and
+scans share admission, copy receipts and execution behavior. Python cron artifact
+creation is not automatic yet.
+
+Local copies/moves, local rsync, configured remote pulls through SFTP, rsync
+pushes and SFTP copies are supported. Remote-destination moves are rejected until
+an adapter can guarantee durable staging before source deletion. Local moves
+verify private staging, finish cleanup, then publish atomically. Consumers may
+immediately take published packages. The private staging root and local state
+must remain exclusively owned by their executor for recovery to be valid.
+
+Configuration uses `execution_schema_version: 1`; the revised local state uses
+schema 2 and rejects old request state rather than guessing a migration. Current
+portable labels, supported schema-0 equivalents and unlabelled input have explicit
+admission rules. Legacy archive bundles remain on the legacy executor.
+
+See the [connection examples and contract](examples/request-driven-transfers/README.md)
+and [handoff ADR](docs/adr/0004-independent-package-handoffs.md) for label formats,
+readiness, recovery assumptions and limitations. The
+[local lab](tests/container_lab/README.md) provides opt-in integration scenarios.
+
 ## Quick Start
 
 ```bash

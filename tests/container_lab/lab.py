@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import uuid
 
 from node import PROJECTS
 
@@ -40,7 +41,7 @@ def setup():
     node("cluster-a", "a_transfer", "credentials", "a_transfer")
     public = execute("cluster-a", "a_transfer", "cat", "/home/a_transfer/.ssh/id_ed25519.pub", capture=True).stdout
     known_hosts = []
-    for service, user in (("lab", "lab_transfer"), ("cluster-b", "b_receive")):
+    for service, user in (("lab", "lab_transfer"), ("cluster-b", "b_receive"), ("sftp-target", "upload")):
         node(service, user, "credentials", user, input=public)
         # Read the actual public host key through the local Docker control plane.
         key = execute(service, user, "cat", "/etc/ssh/ssh_host_ed25519_key.pub", capture=True).stdout.split()
@@ -48,6 +49,7 @@ def setup():
     execute("cluster-a", "a_transfer", "sh", "-c", "cat > ~/.ssh/known_hosts", input="".join(known_hosts))
     for host in ("lab_transfer@lab", "b_receive@cluster-b"):
         execute("cluster-a", "a_transfer", "ssh", host, "true")
+    execute("cluster-a", "a_transfer", "sftp", "-b", "-", "upload@sftp-target", input="ls /incoming\n")
     print("Setup complete. Run: python3 lab.py run", flush=True)
 
 
@@ -126,10 +128,100 @@ assert actual == expected
     )
 
 
+def sftp_smoke():
+    output = Path(__file__).parent / "output"
+    output.mkdir(exist_ok=True)
+    report = output / "sftp-smoke.json"
+    report.unlink(missing_ok=True)
+    result = json.loads(node("cluster-a", "a_transfer", "sftp-smoke", capture=True).stdout)
+    report.write_text(json.dumps(result, indent=2) + "\n")
+    print("PASS: SFTP transport smoke, source retention, round-trip bytes and shell denial. "
+          "This does not validate a Landing Zones SFTP delivery request.", flush=True)
+
+
+def python_transfers():
+    scenario_id = uuid.uuid4().hex
+    payload_name = "python-run-" + scenario_id
+    service, user = "cluster-a", "a_transfer"
+    output = Path(__file__).parent / "output"
+    output.mkdir(exist_ok=True)
+    report = output / "python-transfers.json"
+    report.unlink(missing_ok=True)
+    archive = output / "python-transfers" / scenario_id
+    archive.mkdir(parents=True)
+    evidence = {'status': 'started', 'scenario_id': scenario_id, 'payload_name': payload_name}
+    (archive / 'report.json').write_text(json.dumps(evidence, indent=2) + "\n")
+    print(f"Python scenario {scenario_id}; evidence: {archive}", flush=True)
+
+    def write_request(kind, value):
+        path = f"/home/a_transfer/{kind}-request-{scenario_id}.json"
+        execute(service, user, "python", "-c",
+                f"import sys; from pathlib import Path; Path({path!r}).write_text(sys.stdin.read())",
+                input=json.dumps(value))
+        return path
+
+    python(service, user, f"""
+from pathlib import Path
+for root in ('/data/copy-input', '/data/user-output'):
+    p = Path(root) / {payload_name!r}
+    p.mkdir()
+    (p / 'nested').mkdir()
+    (p / 'nested/data.txt').write_text('Python executor fixture')
+    (p / 'empty.txt').touch()
+    (p / 'file with spaces.txt').write_text('spaces')
+    (p / '.ready').touch()
+""")
+    base = ["landingzones", "--config", "/home/a_transfer/runtime/execution.yaml", "transfer"]
+    completed_connections = []
+    for connection in ("local_copy", "rsync_copy"):
+        request_path = write_request(connection, dict(idempotency_key=connection + scenario_id,
+                                                     payload_name=payload_name, connection=connection))
+        value = json.loads(execute(service, user, *base, "run", "--request", request_path, capture=True).stdout)
+        assert value['status'] == 'completed'
+        completed_connections.append(value)
+    request_path = write_request("copy", dict(idempotency_key="sftp-" + scenario_id,
+                                              payload_name=payload_name, connection="sftp_copy"))
+    compose("stop", "sftp-target")
+    try:
+        result = execute(service, user, *base, "run", "--request", request_path, capture=True, check=False)
+        assert result.returncode == 1, result.stderr + result.stdout
+        blocked = json.loads(result.stdout)
+        assert blocked['status'] == 'blocked'
+    finally:
+        compose("up", "-d", "--no-build", "--wait", "--wait-timeout", "120", "sftp-target")
+    result = execute(service, user, *base, "resume", blocked['request_id'], capture=True)
+    complete = json.loads(result.stdout)
+    assert complete['status'] == 'completed'
+    assert [a['phase'] for a in complete['deliveries'][0]['steps'][0]['attempts']] == ['transfer', 'transfer', 'promotion']
+    repeated = json.loads(execute(service, user, *base, "run", "--request", request_path, capture=True).stdout)
+    assert repeated == complete
+    python(service, user, f"from pathlib import Path; assert Path('/data/copy-input/{payload_name}/nested/data.txt').read_text() == 'Python executor fixture'")
+    move = dict(idempotency_key="python-move-" + scenario_id, payload_name=payload_name,
+                intake=dict(source_path=f"/data/user-output/{payload_name}", input_root="/data/move-input", operation="move"),
+                deliveries=[{"flow_group": "local_move"}])
+    move_path = write_request("move", move)
+    moved = json.loads(execute(service, user, *base, "run", "--request", move_path, capture=True).stdout)
+    assert moved['status'] == 'completed'
+    absent(service, user, f"/data/user-output/{payload_name}")
+    absent(service, user, f"/data/move-input/{payload_name}")
+    python(service, user, f"from pathlib import Path; assert Path('/data/move-output/{payload_name}/nested/data.txt').read_text() == 'Python executor fixture'")
+    raw = execute(service, user, "cat", "/home/a_transfer/runtime/log/python.events.tsv", capture=True).stdout
+    (output / "python.events.tsv").write_text(raw)
+    (archive / "events.tsv").write_text(raw)
+    evidence.update(status='passed', copy=complete, move=moved,
+                    request_paths={'copy': request_path, 'move': move_path})
+    result = json.dumps(evidence, indent=2) + "\n"
+    (archive / 'report.json').write_text(result)
+    report.write_text(result)
+    print("PASS: Python CLI copy, rsync, SFTP outage/resume, independent deliveries, intake and move cleanup", flush=True)
+
+
 def run():
     # A failed or completed run is preserved; never silently mix fixture generations.
     python("lab", "producer", "from pathlib import Path; p=Path.home()/'.lab-run-started'; assert not p.exists(), 'Run reset and setup before another run'; p.touch()")
     isolation()
+    sftp_smoke()
+    python_transfers()
     node("lab", "producer", "seed")
     raw_ids = {}
     for project in PROJECTS:
@@ -207,7 +299,7 @@ def inspect():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("setup", "run", "inspect", "validate", "reset"))
+    parser.add_argument("action", choices=("setup", "run", "inspect", "validate", "sftp-smoke", "python-transfers", "reset"))
     args = parser.parse_args()
     if not shutil.which("docker"):
         parser.exit(2, "Docker is unavailable. Install/start a Docker engine with Compose v2, then retry.\n")
@@ -215,7 +307,7 @@ def main():
     if args.action == "reset":
         compose("down", "--volumes", "--remove-orphans")
     else:
-        globals()[args.action]()
+        globals()[args.action.replace("-", "_")]()
 
 
 if __name__ == "__main__":
@@ -224,5 +316,5 @@ if __name__ == "__main__":
     except (AssertionError, RuntimeError, subprocess.CalledProcessError) as exc:
         if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
             print(exc.stderr, file=sys.stderr, end="" if exc.stderr.endswith("\n") else "\n")
-        print(f"FAIL: {exc}\nState retained; use inspect. Reset and setup before a fresh run.", file=sys.stderr)
+        print(f"FAIL: {exc}\nState retained; use inspect. See the lab README for retry and reset options.", file=sys.stderr)
         sys.exit(1)

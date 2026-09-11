@@ -1,0 +1,16 @@
+# Illustrative context: replace before execution. No real credentials are included.
+execution_schema_version: 1
+transfers_file: transfers.tsv
+runtime_ids: [relay_test.transfer]
+execution_context:
+  system: relay
+  user: transfer
+state_dir: /data/state
+event_spool: /data/events.tsv
+credentials:
+  internal_ssh:
+    private_key_file: /run/secrets/internal_ssh_key
+    known_hosts_file: /run/secrets/known_hosts
+  partner_sftp:
+    private_key_file: /run/secrets/partner_sftp_key
+    known_hosts_file: /run/secrets/known_hosts

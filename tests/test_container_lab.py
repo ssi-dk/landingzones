@@ -40,7 +40,7 @@ def test_real_cli_builds_lab_runtimes(tmp_path, role, user, count):
 def test_compose_uses_one_image_and_separate_filesystems():
     compose = yaml.safe_load((LAB / "compose.yaml").read_text())
     services = compose["services"]
-    assert set(services) == {"lab", "cluster-a", "cluster-b"}
+    assert set(services) == {"lab", "cluster-a", "cluster-b", "sftp-target"}
     assert len({s["image"] for s in services.values()}) == 1
     assert compose["networks"]["lab"]["internal"] is True
     for service in services.values():
@@ -52,7 +52,7 @@ def test_compose_uses_one_image_and_separate_filesystems():
 def test_lab_driver_parses():
     result = subprocess.run([sys.executable, str(LAB / "lab.py"), "--help"], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert "setup,run,inspect,validate,reset" in result.stdout
+    assert "setup,run,inspect,validate,sftp-smoke,python-transfers,reset" in result.stdout
 
 
 def write_event_fixture(root, role="cluster-a", user="a_transfer"):
@@ -147,3 +147,39 @@ def test_route_outage_flow_validation(tmp_path, phase, run_id, flow, valid):
     else:
         with pytest.raises(ValueError):
             node.validate_events(tmp_path, "cluster-a", "a_transfer")
+
+
+def test_catalog_separates_legacy_and_python_owners():
+    rows = node.catalog()
+    legacy = [row for row in rows if row["executor"] == "legacy"]
+    assert len(legacy) == 8
+    assert all(row["operation"] == "move" for row in legacy)
+    python_rows = [row for row in rows if row["executor"] == "python"]
+    assert len(python_rows) == 4
+    assert {row["adapter"] for row in python_rows} == {"local", "sftp", "rsync"}
+    assert all(row["enabled"] == "TRUE" for row in python_rows)
+
+
+def test_catalog_never_silently_executes_legacy_copy_as_move(tmp_path):
+    import csv
+    rows = node.catalog()
+    rows[0]["operation"] = "copy"
+    path = tmp_path / "transfers.tsv"
+    with path.open("w") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter="\t")
+        writer.writeheader()
+        writer.writerows(rows)
+    with pytest.raises(ValueError, match="Legacy route"):
+        node.catalog(path)
+
+
+def test_legacy_build_from_shared_table_excludes_python_owned_routes(tmp_path):
+    node.write_config('cluster-a', 'a_transfer', tmp_path)
+    result = subprocess.run(
+        [sys.executable, '-m', 'landingzones.cli', '--config', str(tmp_path / 'config.yaml'),
+         'build', '--transfers', str(LAB / 'transfers.tsv'), '--runtime-id', 'cluster-a_test.a_transfer'],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {p.stem for p in (tmp_path / 'output/scripts').glob('*.sh')} == {
+        'pull_alpha', 'pull_beta', 'push_alpha', 'push_beta'}

@@ -302,6 +302,20 @@ def build_cli_parser():
     monitor_serve_parser.add_argument('--port', type=int, default=8080)
     monitor_serve_parser.set_defaults(handler=handle_monitor_serve)
 
+    transfer_parser = subparsers.add_parser('transfer', help='Execute and inspect Python-owned delivery requests')
+    actions = transfer_parser.add_subparsers(dest='transfer_action', required=True)
+    for action in ('preflight', 'run', 'status', 'resume', 'discover'):
+        command = actions.add_parser(action)
+        command.add_argument('--config', '-c', dest='subcommand_config', default=None)
+        if action in ('preflight', 'run'):
+            command.add_argument('--request', required=True, help='JSON delivery request')
+        elif action == 'discover':
+            command.add_argument('--connection', required=True)
+        else:
+            command.add_argument('request_id')
+        if action == 'resume':
+            command.add_argument('--retry-parked', action='store_true', help='Grant a new bounded retry budget')
+        command.set_defaults(handler=handle_transfer)
     return parser
 
 
@@ -593,6 +607,35 @@ def handle_monitor_serve(args, extra_args):
         port=args.port,
     )
     return 0
+
+
+def handle_transfer(args, extra_args):
+    import json
+    from landingzones.execution.engine import Executor
+    if extra_args:
+        raise SystemExit('unrecognized arguments: ' + ' '.join(extra_args))
+    if effective_runtime_ids(args):
+        raise SystemExit('Python execution uses explicit runtime_ids from its config')
+    path = resolve_cli_config(args)
+    if not path:
+        raise SystemExit('Python execution requires --config')
+    try:
+        executor = Executor(path)
+        if args.transfer_action in ('run', 'preflight'):
+            with open(args.request) as handle:
+                request = json.load(handle)
+            result = executor.preflight(request) if args.transfer_action == 'preflight' else executor.submit(request)
+        elif args.transfer_action == 'discover':
+            result = executor.discover(args.connection)
+        elif args.transfer_action == 'status':
+            result = executor.status(args.request_id)
+        else:
+            result = executor.resume(args.request_id, args.retry_parked)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if args.transfer_action in ('preflight', 'status') or result['status'] == 'completed' else 1
+    except (ValueError, KeyError, OSError) as exc:
+        print('Transfer rejected: ' + str(exc), file=sys.stderr)
+        return 2
 
 
 def main(argv=None):

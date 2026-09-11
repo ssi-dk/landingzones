@@ -9,9 +9,12 @@ import pwd
 import socket
 import subprocess
 import sys
+import tempfile
+from urllib.parse import urlsplit
 
 PROJECTS = ("alpha", "beta")
 ROLES = {
+    "sftp-target": {"upload": ["upload"]},
     "lab": {"producer": ["export"], "lab_transfer": ["export"]},
     "cluster-a": {
         "a_transfer": ["intake", "outbound"],
@@ -38,31 +41,39 @@ def directory(path, owner, group, mode=0o2770):
     path.chmod(mode)
 
 
-def routes(role, user):
-    rows = []
-    for project in PROJECTS:
-        if user == "a_transfer":
-            specs = [
-                ("pull", f"lab_transfer@lab:/data/export/{project}/*", f"/data/intake/{project}/", True, False, "raw"),
-                ("push", f"/data/outbound/{project}/*", f"b_receive@cluster-b:/data/intake/{project}/", True, False, "processed"),
-            ]
-        elif user == "a_distributor":
-            specs = [("distribute", f"/data/intake/{project}/*", f"/data/projects/{project}/", False, True, "raw")]
-        elif user == "b_distributor":
-            specs = [("distribute", f"/data/intake/{project}/*", f"/data/projects/{project}/", False, True, "processed")]
-        else:
-            continue
-        for step, source, destination, entry, end, flow in specs:
-            rows.append(dict(
-                identifiers=f"{step}_{project}", runtime_id=f"{role}_test.{user}",
-                system=role, users=user, enabled="TRUE", source=source,
-                destination=destination, rsync_options="--no-owner --no-group --chmod=D2770,F660",
-                log_file=f"{step}_{project}.log", flock_file=f"{step}_{project}.lock",
-                frequency="0 * * * *", flow_group=f"{flow}_{project}",
-                is_entry_point=str(entry).upper(), is_end_point=str(end).upper(),
-                notify_on_success="FALSE", notify_on_error="FALSE",
-            ))
+def catalog(path=None):
+    """Single maintained lab table, including explicitly disabled future cases."""
+    with Path(path or Path(__file__).with_name("transfers.tsv")).open() as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        rows = list(reader)
+    seen = set()
+    for row in rows:
+        if None in row or any(value is None for value in row.values()):
+            raise ValueError("Malformed lab transfer row")
+        identity = (row["runtime_id"], row["identifiers"])
+        if identity in seen:
+            raise ValueError("Duplicate lab transfer identity")
+        seen.add(identity)
+        if row["enabled"] not in ("TRUE", "FALSE"):
+            raise ValueError("Invalid enabled value")
+        if row["executor"] not in ("legacy", "python"):
+            raise ValueError("Unknown lab executor")
+        if row["enabled"] == "TRUE" and (
+            row["executor"] == "legacy" and (row["operation"] != "move"
+            or row["adapter"] not in ("local", "rsync"))
+        ):
+            raise ValueError("Legacy route cannot implement this adapter or operation")
     return rows
+
+
+def routes(role, user):
+    return [
+        {key: value for key, value in row.items()
+         if key not in ("adapter", "operation", "step_order", "executor")}
+        for row in catalog()
+        if row["system"] == role and row["users"] == user
+        and row["enabled"] == "TRUE" and row["executor"] == "legacy"
+    ]
 
 
 def write_config(role, user, root):
@@ -86,6 +97,19 @@ def write_config(role, user, root):
     }
     # JSON is a YAML subset; avoid a dependency for host-side inspection.
     (root / "config.yaml").write_text(json.dumps(config, indent=2))
+    if user == "a_transfer":
+        settings = {
+            "execution_schema_version": 1, "transfers_file": str(Path(__file__).with_name("transfers.tsv")),
+            "runtime_ids": [f"{role}_test.{user}"],
+            "execution_context": {"system": role, "user": user},
+            "state_dir": str(root / "python-state"), "event_spool": str(root / "log/python.events.tsv"),
+            "credentials": {"partner_sftp": {
+                "private_key_file": f"/home/{user}/.ssh/id_ed25519",
+                "known_hosts_file": f"/home/{user}/.ssh/known_hosts",
+            }},
+        }
+        settings["credentials"]["internal_ssh"] = dict(settings["credentials"]["partner_sftp"])
+        (root / "execution.yaml").write_text(json.dumps(settings, indent=2))
 
 
 def boot():
@@ -105,6 +129,10 @@ def boot():
             directory("/data/export", "producer", "export")
             for project in PROJECTS:
                 directory(f"/data/export/{project}", "producer", "export")
+        elif role == "sftp-target":
+            directory("/srv/sftp", "root", "root", mode=0o755)
+            directory("/srv/sftp/incoming", "upload", "upload")
+            directory("/srv/sftp/.landingzones-staging-incoming", "upload", "upload", 0o700)
         else:
             distributor = "a_distributor" if role == "cluster-a" else "b_distributor"
             receiver = "a_transfer" if role == "cluster-a" else "b_receive"
@@ -114,7 +142,16 @@ def boot():
             for project in PROJECTS:
                 directory(f"/data/intake/{project}", receiver, "intake")
                 directory(f"/data/projects/{project}", distributor, project)
+            if role == "cluster-b":
+                directory("/data/intake/python", "b_receive", "intake")
+                directory("/data/intake/.landingzones-staging-python", "b_receive", "intake", 0o700)
             if role == "cluster-a":
+                directory("/data/copy-input", "a_transfer", "intake")
+                directory("/data/copy-output", "a_transfer", "intake")
+                for target in ("copy-output", "move-input", "move-output"):
+                    directory("/data/.landingzones-staging-" + target, "a_transfer", "intake", 0o700)
+                for path in ("move-input", "move-output", "rsync-output", "user-output"):
+                    directory("/data/" + path, "a_transfer", "intake")
                 directory("/data/outbound", "processor", "outbound")
                 for project in PROJECTS:
                     directory(f"/data/outbound/{project}", "processor", "outbound")
@@ -133,8 +170,11 @@ def boot():
         "Port 22\nHostKey /etc/ssh/ssh_host_ed25519_key\n"
         "PasswordAuthentication no\nKbdInteractiveAuthentication no\n"
         "PermitRootLogin no\nUsePAM no\nAllowTcpForwarding no\n"
-        "X11Forwarding no\nPermitTunnel no\n"
-        "AllowUsers lab_transfer b_receive\n"
+        "X11Forwarding no\nPermitTunnel no\nSubsystem sftp internal-sftp\n"
+        + ("AllowUsers upload\n"
+         "Match User upload\nChrootDirectory /srv/sftp\n"
+         "ForceCommand internal-sftp\nPermitTTY no\n"
+         if role == "sftp-target" else "AllowUsers lab_transfer b_receive\n")
     )
     os.execv("/usr/sbin/sshd", ["/usr/sbin/sshd", "-D", "-e"])
 
@@ -150,6 +190,49 @@ def credentials(user):
     else:
         (ssh / "authorized_keys").write_text("restrict " + sys.stdin.read().strip() + "\n")
         (ssh / "authorized_keys").chmod(0o600)
+
+
+def sftp_smoke():
+    """Exercise endpoint transport only; not the future product delivery API."""
+    candidates = [row for row in catalog() if row["adapter"] == "sftp"]
+    if len(candidates) != 1:
+        raise ValueError("SFTP smoke requires exactly one configured SFTP fixture")
+    row = candidates[0]
+    if row["operation"] != "copy":
+        raise ValueError("SFTP smoke supports copy fixtures only")
+    target = urlsplit(row["destination"])
+    if target.scheme != "sftp" or not target.hostname or not target.username:
+        raise ValueError("Invalid SFTP fixture destination")
+    if target.password or any(c in row["destination"] for c in ('"', "\n", "\r")):
+        raise ValueError("Invalid SFTP fixture destination")
+    source = Path(tempfile.mkdtemp(prefix="smoke_", dir=row["source"]))
+    (source / "nested").mkdir()
+    (source / "nested/data.txt").write_text("synthetic SFTP payload\n")
+    (source / "empty.txt").touch()
+    (source / "file with spaces.txt").write_text("spaces preserved\n")
+
+    def inventory(root):
+        return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in root.rglob("*") if path.is_file()}
+
+    before = inventory(source)
+    remote = target.path.rstrip("/") + "/" + source.name
+    destination = f"{target.username}@{target.hostname}"
+    base = ["sftp", "-P", str(target.port or 22), "-b", "-", destination]
+    with tempfile.TemporaryDirectory(prefix="lz-sftp-download-") as download:
+        batch = f'put -r "{source}" "{remote}"\nget -r "{remote}" "{download}/received"\n'
+        subprocess.run(base, input=batch, check=True, text=True, capture_output=True, timeout=30)
+        assert inventory(Path(download) / "received") == before, "SFTP round-trip mismatch"
+    assert inventory(source) == before, "SFTP copy altered source"
+    shell = subprocess.run(
+        ["ssh", "-p", str(target.port or 22), destination, "true"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert shell.returncode != 0, "SFTP account unexpectedly allows shell commands"
+    print(json.dumps({"status": "passed", "scope": "transport-smoke-only",
+                      "transfer_identifier": row["identifiers"], "source": str(source),
+                      "destination": remote, "file_checksums": before,
+                      "source_retained": True, "shell_denied": True}))
 
 
 def seed():
@@ -276,6 +359,8 @@ if __name__ == "__main__":
             assert connection.recv(100).startswith(b"SSH-")
     elif action == "credentials":
         credentials(sys.argv[2])
+    elif action == "sftp-smoke":
+        sftp_smoke()
     elif action == "seed":
         seed()
     elif action == "preprocess":

@@ -1,0 +1,5 @@
+identifiers	enabled	runtime_id	system	users	flow_group	step_order	source	destination	adapter	operation	credential_ref	trigger	frequency	readiness_policy	verification	destination_exists	max_attempts	executor	admission_policy
+analysis_copy	TRUE	relay_test.transfer	relay	transfer	analysis	1	/data/input	ssh://receiver@analysis/data/intake	rsync	copy	internal_ssh	request		producer_marker	checksum	fail	3	python	strict
+analysis_publish	TRUE	analysis_test.transfer	analysis	transfer	analysis_publish	1	/data/intake	/data/projects	local	move		request		managed_ready	checksum	fail	3	python	strict
+partner_copy	TRUE	relay_test.transfer	relay	transfer	partner	1	/data/input	sftp://upload@sftp-target:22/incoming	sftp	copy	partner_sftp	request		producer_marker	size	fail	3	python	strict
+scheduled_move	TRUE	relay_test.transfer	relay	transfer	scheduled_archive	1	/data/scheduled-input	/data/archive	local	move		discovery	*/5 * * * *	producer_marker	checksum	fail	3	python	strict
