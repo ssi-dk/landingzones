@@ -84,6 +84,21 @@ class TestOperatorCli:
         assert rc == 0
         assert captured['argv'] == ['--config', 'local.yaml']
 
+    def test_config_works_before_build_subcommand(self, monkeypatch):
+        """A global config must survive parsing when placed before the command."""
+        captured = {}
+
+        def fake_main(argv=None):
+            captured['argv'] = argv
+            return 0
+
+        monkeypatch.setattr(cli.gcf, 'main', fake_main)
+
+        rc = cli.main(['--config', 'config/config.yaml', 'build'])
+
+        assert rc == 0
+        assert captured['argv'] == ['--config', 'config/config.yaml']
+
     def test_validate_deployment_routes_to_readiness(self, monkeypatch):
         """`landingzones validate deployment` should route to readiness checks."""
         captured = {}

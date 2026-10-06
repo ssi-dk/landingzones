@@ -1,0 +1,28 @@
+name: landingzones-container-lab
+x-node: &node
+  image: landingzones-container-lab:local
+  build:
+    context: ../..
+    dockerfile: tests/container_lab/Dockerfile
+  networks: [lab]
+  healthcheck:
+    test: ["CMD", "python", "/opt/lab/node.py", "health"]
+    interval: 2s
+    timeout: 5s
+    retries: 30
+services:
+  lab:
+    <<: *node
+    hostname: lab
+    environment: {LAB_ROLE: lab}
+  cluster-a:
+    <<: *node
+    hostname: cluster-a
+    environment: {LAB_ROLE: cluster-a}
+  cluster-b:
+    <<: *node
+    hostname: cluster-b
+    environment: {LAB_ROLE: cluster-b}
+networks:
+  lab:
+    internal: true
