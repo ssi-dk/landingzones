@@ -159,6 +159,33 @@ Start the live service with:
 landingzones monitor serve --host 127.0.0.1 --port 8080
 ```
 
+To run ingestion and reporting in one service, configure explicit schema-v1
+spool paths and listener settings:
+
+```yaml
+monitoring_spools:
+  - output/log/events.tsv
+monitoring_ingest_interval: 60
+monitoring_host: 127.0.0.1
+monitoring_port: 8080
+```
+
+Then use:
+
+```bash
+landingzones --config config/config.yaml monitor serve
+```
+
+The service ingests at startup and polls independently of browser requests.
+Missing spools are retried because a writer may create them later. An
+incompatible existing spool fails startup; later ingestion errors are logged
+and retried while the report remains available. Do not run a separate ingestion
+loop for the same sources when the combined service owns them.
+Without `monitoring_spools`, serving retains its database-reader behavior.
+Listener CLI options override the config. `LZ_MONITORING_SPOOLS` accepts a
+comma-separated list; `LZ_MONITORING_INGEST_INTERVAL`, `LZ_MONITORING_HOST` and
+`LZ_MONITORING_PORT` override their corresponding YAML settings.
+
 Service startup loads the configured transfer file and synchronizes Transfer
 Definitions before accepting requests; use `--transfers` and repeatable
 `--runtime-id` options to override the configured inventory or selection.

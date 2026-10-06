@@ -298,8 +298,8 @@ def build_cli_parser():
     monitor_serve_parser.add_argument('--config', '-c', dest='subcommand_config', default=None)
     monitor_serve_parser.add_argument('--transfers', '-t', default=None)
     monitor_serve_parser.add_argument('--runtime-id', action='append', default=None)
-    monitor_serve_parser.add_argument('--host', default='127.0.0.1')
-    monitor_serve_parser.add_argument('--port', type=int, default=8080)
+    monitor_serve_parser.add_argument('--host', default=None)
+    monitor_serve_parser.add_argument('--port', type=int, default=None)
     monitor_serve_parser.set_defaults(handler=handle_monitor_serve)
 
     return parser
@@ -579,18 +579,27 @@ def handle_monitor_serve(args, extra_args):
         raise SystemExit("unrecognized arguments: {0}".format(' '.join(extra_args)))
     database_url = _monitor_database_url(args)
     synchronized = _sync_monitoring_definitions(database_url, args)
+    host = args.host if args.host is not None else config.monitoring_host
+    port = args.port if args.port is not None else config.monitoring_port
     print(
         "Synchronized {0} Transfer Definitions; serving Landing Zones monitoring "
         "on http://{1}:{2}".format(
             synchronized,
-            args.host,
-            args.port,
+            host,
+            port,
         )
     )
+    ingestion = {}
+    if config.monitoring_spools:
+        ingestion = {
+            "spools": config.monitoring_spools,
+            "ingest_interval": config.monitoring_ingest_interval,
+        }
     monitoring_service.serve_monitoring(
         database_url,
-        host=args.host,
-        port=args.port,
+        host=host,
+        port=port,
+        **ingestion,
     )
     return 0
 

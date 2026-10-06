@@ -700,3 +700,30 @@ class TestOperatorCli:
         assert rc == 1
         assert "Unknown flow_group 'missing-flow'" in captured.err
         assert "flow_a" in captured.err
+
+
+def test_monitor_service_uses_yaml_settings_and_cli_listener_overrides(tmp_path, monkeypatch, request):
+    # CLI configuration is shared across commands; never leak this fixture's
+    # inventory selection into later reporting or cron tests.
+    snapshot = cli.config.snapshot_state()
+    request.addfinalizer(lambda: cli.config.restore_state(snapshot))
+    config_file = tmp_path / 'config.yaml'
+    config_file.write_text('''monitoring_database_url: sqlite:///configured.sqlite
+monitoring_host: 0.0.0.0
+monitoring_port: 9001
+monitoring_spools: [events.tsv]
+monitoring_ingest_interval: 15
+runtime_ids: [server1_prod.user1]
+''')
+    calls = []
+    monkeypatch.setattr(cli, '_sync_monitoring_definitions', lambda *args: 0)
+    monkeypatch.setattr(cli.monitoring_service, 'serve_monitoring',
+                        lambda database_url, **kwargs: calls.append((database_url, kwargs)))
+    assert cli.main(['--config', str(config_file), 'monitor', 'serve']) == 0
+    assert calls[-1] == ('sqlite:///configured.sqlite', dict(
+        host='0.0.0.0', port=9001, spools=['events.tsv'], ingest_interval=15.0
+    ))
+    assert cli.main(['--config', str(config_file), 'monitor', 'serve',
+                     '--host', '127.0.0.1', '--port', '9002']) == 0
+    assert calls[-1][1]['host'] == '127.0.0.1'
+    assert calls[-1][1]['port'] == 9002

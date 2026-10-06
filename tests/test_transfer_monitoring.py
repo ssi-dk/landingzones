@@ -1215,3 +1215,99 @@ def test_event_spool_write_failure_is_diagnostic_not_a_transfer_failure(tmp_path
     assert "event spool append failed" in (
         tmp_path / "stage_lab.log.mini"
     ).read_text()
+
+
+def test_service_ingestion_picks_up_appended_events_and_late_sources(tmp_path, monkeypatch):
+    from landingzones import monitoring_service
+
+    clock = [0.0]
+    monkeypatch.setattr(monitoring_service.time, 'monotonic', lambda: clock[0])
+    database_url = 'sqlite:///' + str(tmp_path / 'monitor.sqlite')
+    spool = tmp_path / 'events.tsv'
+    ingestor = monitoring_service.SpoolIngestion(database_url, [str(spool)], 10)
+    ingestor.poll(startup=True)  # A writer may not have created its spool yet.
+    run_id = str(uuid.uuid4())
+    event = create_transfer_event(
+        transfer_identifier='route', system='server1', runtime_id='server1_prod.user1',
+        execution_user='user1', status='started', phase='transfer',
+        run_id=run_id, attempt_id=str(uuid.uuid4()),
+    )
+    spool.write_text(EVENT_HEADER + '\n' + event_to_tsv_row(event) + '\n')
+    clock[0] = 10.0
+    ingestor.poll()
+    application = MonitoringApplication(database_url)
+    status, _, body = application.respond('/api/runs/' + run_id, '')
+    assert status == 200
+    assert len(json.loads(body)['timeline']) == 1
+    from dataclasses import replace
+    event = replace(event, event_id=str(uuid.uuid4()), status='delivered', phase='promotion')
+    with spool.open('a') as handle:
+        handle.write(event_to_tsv_row(event) + '\n')
+    ingestor.poll()  # Not due yet.
+    assert len(query_run_detail(database_url, run_id)['timeline']) == 1
+    clock[0] = 20.0
+    ingestor.poll()
+    status, _, body = application.respond('/api/runs/' + run_id, '')
+    assert status == 200
+    assert [row['status'] for row in json.loads(body)['timeline']] == ['started', 'delivered']
+    clock[0] = 30.0
+    ingestor.poll()
+    assert len(query_run_detail(database_url, run_id)['timeline']) == 2
+
+
+def test_service_ingestion_rejects_legacy_source_and_retries_runtime_failure(tmp_path, monkeypatch, caplog):
+    from landingzones import monitoring_service
+
+    clock = [0.0]
+    monkeypatch.setattr(monitoring_service.time, 'monotonic', lambda: clock[0])
+    spool = tmp_path / 'legacy.tsv'
+    spool.write_text('event_time_utc\ttransfer_identifier\n')
+    ingestor = monitoring_service.SpoolIngestion(
+        'sqlite:///' + str(tmp_path / 'monitor.sqlite'), [str(spool)], 10
+    )
+    with pytest.raises(UnsupportedEventSpool):
+        ingestor.poll(startup=True)
+    spool.write_text(EVENT_HEADER + '\n')
+    ingestor.poll(startup=True)
+    spool.write_text('event_time_utc\ttransfer_identifier\n')
+    clock[0] = 10.0
+    ingestor.poll()
+    assert 'Monitoring ingestion failed' in caplog.text
+    spool.write_text(EVENT_HEADER + '\n')
+    clock[0] = 20.0
+    ingestor.poll()
+
+
+def test_http_service_polls_without_browser_requests_and_closes_socket(tmp_path, monkeypatch):
+    from landingzones import monitoring_service
+
+    clock = [0.0]
+    monkeypatch.setattr(monitoring_service.time, 'monotonic', lambda: clock[0])
+    spool = tmp_path / 'events.tsv'
+    spool.write_text(EVENT_HEADER + '\n')
+    database_url = 'sqlite:///' + str(tmp_path / 'monitor.sqlite')
+    run_id = str(uuid.uuid4())
+    event = create_transfer_event(
+        transfer_identifier='route', system='server1', runtime_id='server1_prod.user1',
+        execution_user='user1', status='started', phase='transfer',
+        run_id=run_id, attempt_id=str(uuid.uuid4()),
+    )
+    closed = []
+
+    class LocalServer:
+        def __init__(self, address, handler):
+            assert address == ('127.0.0.1', 8080)
+
+        def serve_forever(self):
+            with spool.open('a') as handle:
+                handle.write(event_to_tsv_row(event) + '\n')
+            clock[0] = 10.0
+            self.service_actions()
+            assert len(query_run_detail(database_url, run_id)['timeline']) == 1
+
+        def server_close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(monitoring_service, 'ThreadingHTTPServer', LocalServer)
+    monitoring_service.serve_monitoring(database_url, spools=[str(spool)], ingest_interval=10)
+    assert closed == [True]
