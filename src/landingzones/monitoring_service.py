@@ -5,10 +5,13 @@
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
+import math
+import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlsplit
 
-from landingzones.monitoring import query_run_detail, query_run_summaries
+from landingzones.monitoring import ingest_event_spool, query_run_detail, query_run_summaries
 
 
 FILTER_ARGUMENTS = {
@@ -331,8 +334,40 @@ class MonitoringApplication:
         return _json_response({"error": "Not found"}, status=404)
 
 
-def serve_monitoring(database_url, host="127.0.0.1", port=8080):
+class SpoolIngestion:
+    """Poll explicit event sources independently of HTTP page requests."""
+
+    def __init__(self, database_url, spools, interval=60):
+        if not math.isfinite(interval) or interval <= 0:
+            raise ValueError("ingest_interval must be finite and positive")
+        self.database_url = database_url
+        self.spools = tuple(spools)
+        self.interval = interval
+        self.next_poll = 0
+
+    def poll(self, startup=False):
+        now = time.monotonic()
+        if not startup and now < self.next_poll:
+            return
+        for path in self.spools:
+            try:
+                result = ingest_event_spool(self.database_url, path)
+                for warning in result.warnings:
+                    logging.warning("%s: %s", path, warning)
+            except FileNotFoundError:
+                logging.warning("Monitoring event spool does not exist yet: %s", path)
+            except Exception:
+                if startup:
+                    raise
+                logging.exception("Monitoring ingestion failed for %s; will retry", path)
+        self.next_poll = time.monotonic() + self.interval
+
+
+def serve_monitoring(database_url, host="127.0.0.1", port=8080,
+                     spools=(), ingest_interval=60):
     """Serve live monitoring pages until interrupted."""
+    ingestor = SpoolIngestion(database_url, spools, ingest_interval)
+    ingestor.poll(startup=True)
     application = MonitoringApplication(database_url)
 
     class RequestHandler(BaseHTTPRequestHandler):
@@ -350,5 +385,12 @@ def serve_monitoring(database_url, host="127.0.0.1", port=8080):
             self.end_headers()
             self.wfile.write(body_bytes)
 
-    server = ThreadingHTTPServer((host, port), RequestHandler)
-    server.serve_forever()
+    class MonitoringServer(ThreadingHTTPServer):
+        def service_actions(self):
+            ingestor.poll()
+
+    server = MonitoringServer((host, port), RequestHandler)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
