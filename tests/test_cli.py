@@ -702,7 +702,11 @@ class TestOperatorCli:
         assert "flow_a" in captured.err
 
 
-def test_monitor_service_uses_yaml_settings_and_cli_listener_overrides(tmp_path, monkeypatch):
+def test_monitor_service_uses_yaml_settings_and_cli_listener_overrides(tmp_path, monkeypatch, request):
+    # CLI configuration is shared across commands; never leak this fixture's
+    # inventory selection into later reporting or cron tests.
+    snapshot = cli.config.snapshot_state()
+    request.addfinalizer(lambda: cli.config.restore_state(snapshot))
     config_file = tmp_path / 'config.yaml'
     config_file.write_text('''monitoring_database_url: sqlite:///configured.sqlite
 monitoring_host: 0.0.0.0
