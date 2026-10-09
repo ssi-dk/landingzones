@@ -307,7 +307,8 @@ def test_test_tag_release_is_never_latest_and_stable_release_behavior_is_preserv
     )
     fake_gh.chmod(0o755)
     log = tmp_path / "calls.jsonl"
-    environment = dict(os.environ, GITHUB_REF_NAME=tag, GH_CALL_LOG=str(log),
+    revision = "a" * 40
+    environment = dict(os.environ, GITHUB_REF_NAME=tag, GITHUB_SHA=revision, GH_CALL_LOG=str(log),
                        GH_RELEASE_EXISTS="yes" if existing else "no",
                        PATH=str(tmp_path) + os.pathsep + os.environ["PATH"])
     architectures = ["x86_64", "aarch64"] if tag.startswith("test-") else ["x86_64"]
@@ -316,6 +317,9 @@ def test_test_tag_release_is_never_latest_and_stable_release_behavior_is_preserv
     calls = [json.loads(line) for line in log.read_text().splitlines()]
     creates = [call for call in calls if call[:2] == ["release", "create"]]
     assert len(creates) == (0 if existing else 1)
+    for call in creates:
+        assert "--verify-tag" in call
+        assert call[call.index("--target") + 1] == revision
     edits = [call for call in calls if call[:2] == ["release", "edit"]]
     if tag.startswith("test-"):
         assert edits == [["release", "edit", tag, "--prerelease", "--latest=false"]]

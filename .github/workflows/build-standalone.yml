@@ -163,7 +163,7 @@ jobs:
             release_flags=(--prerelease --latest=false)
           fi
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
-            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "Landing Zones $GITHUB_REF_NAME" "${release_flags[@]}"
+            gh release create "$GITHUB_REF_NAME" --verify-tag --target "$GITHUB_SHA" --title "$GITHUB_REF_NAME" --notes "Landing Zones $GITHUB_REF_NAME" "${release_flags[@]}"
           if [[ "$GITHUB_REF_NAME" == test-* ]]; then
             gh release edit "$GITHUB_REF_NAME" --prerelease --latest=false
           fi
