@@ -135,7 +135,7 @@ def _progress_class(state):
         return "progress-complete"
     if "failed" in state:
         return "progress-failed"
-    if state in ("in progress", "delivered with cleanup pending", "waiting"):
+    if state in ("in progress", "delivered with cleanup pending", "delivered with submission pending", "waiting"):
         return "progress-active"
     return ""
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Schema-version-1 Transfer Event domain model."""
+"""Transfer Events: legacy schema 1 and schema 2 external-submission facts."""
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -10,6 +10,8 @@ import uuid
 
 
 SCHEMA_VERSION = "1"
+SUBMISSION_SCHEMA_VERSION = "2"
+SUPPORTED_SCHEMA_VERSIONS = frozenset((SCHEMA_VERSION, SUBMISSION_SCHEMA_VERSION))
 EVENT_COLUMNS = (
     "schema_version",
     "event_id",
@@ -37,7 +39,8 @@ EVENT_COLUMNS = (
 )
 EVENT_HEADER = "\t".join(EVENT_COLUMNS)
 EVENT_STATUSES = frozenset(("waiting", "started", "delivered", "completed", "failed"))
-EVENT_PHASES = frozenset(("discovery", "readiness", "transfer", "promotion", "cleanup"))
+LEGACY_EVENT_PHASES = frozenset(("discovery", "readiness", "transfer", "promotion", "cleanup"))
+EVENT_PHASES = LEGACY_EVENT_PHASES | {"submission"}
 REASON_CODES = frozenset(
     (
         "ssh_timeout",
@@ -51,6 +54,10 @@ REASON_CODES = frozenset(
         "rsync_failed",
     )
 )
+
+
+class UnsupportedEventSchema(ValueError):
+    """A reader upgrade is required; ingestion must not skip this event."""
 
 
 @dataclass(frozen=True)
@@ -106,8 +113,8 @@ def _validate_uuid4(value, field_name, required=False):
 
 
 def _validate_event(event):
-    if event.schema_version != SCHEMA_VERSION:
-        raise ValueError("unsupported Transfer Event schema version: {0}".format(event.schema_version))
+    if event.schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise UnsupportedEventSchema("unsupported Transfer Event schema version: {0}".format(event.schema_version))
     for field_name in (
         "event_id",
         "event_time_utc",
@@ -125,7 +132,8 @@ def _validate_event(event):
     _validate_uuid4(event.attempt_id, "attempt_id")
     if event.status not in EVENT_STATUSES:
         raise ValueError("unsupported Transfer Event status: {0}".format(event.status))
-    if event.phase not in EVENT_PHASES:
+    phases = LEGACY_EVENT_PHASES if event.schema_version == SCHEMA_VERSION else EVENT_PHASES
+    if event.phase not in phases:
         raise ValueError("unsupported Transfer Event phase: {0}".format(event.phase))
     if event.reason_code and event.reason_code not in REASON_CODES:
         raise ValueError("unsupported Transfer Event reason_code: {0}".format(event.reason_code))
@@ -135,11 +143,11 @@ def _validate_event(event):
         raise ValueError("event_time_utc must be an RFC 3339 timestamp")
     if not event.event_time_utc.endswith("Z") or parsed_time.utcoffset() != timezone.utc.utcoffset(None):
         raise ValueError("event_time_utc must be represented in UTC")
-    if event.status in ("waiting", "started", "delivered", "completed") and not event.run_id:
+    if (event.status in ("waiting", "started", "delivered", "completed") or event.phase == "submission") and not event.run_id:
         raise ValueError("run_id is required for run-specific events")
     if (
         event.status in ("started", "delivered", "completed")
-        or (event.status == "failed" and event.phase in ("transfer", "promotion", "cleanup"))
+        or (event.status == "failed" and event.phase in ("transfer", "promotion", "cleanup", "submission"))
     ) and not event.attempt_id:
         raise ValueError("attempt_id is required for actual attempt work")
 
@@ -157,7 +165,8 @@ def create_transfer_event(
 ):
     """Create and validate one immutable Transfer Event."""
     event = TransferEvent(
-        schema_version=SCHEMA_VERSION,
+        # Keep existing producers byte-compatible while versioning the new phase.
+        schema_version=SUBMISSION_SCHEMA_VERSION if phase == "submission" else SCHEMA_VERSION,
         event_id=event_id or new_identifier(),
         event_time_utc=event_time_utc or utc_now_text(),
         transfer_identifier=transfer_identifier,
@@ -180,14 +189,14 @@ def sanitize_tsv_value(value):
 
 
 def event_to_tsv_row(event):
-    """Serialize one event as an exact-width schema-version-1 TSV row."""
+    """Serialize one event using the shared exact-width TSV columns."""
     _validate_event(event)
     values = asdict(event)
     return "\t".join(sanitize_tsv_value(values[column]) for column in EVENT_COLUMNS)
 
 
 def event_from_tsv_row(row):
-    """Parse and validate one exact-width schema-version-1 TSV row."""
+    """Parse and validate one exact-width schema-version-1 or -2 TSV row."""
     if isinstance(row, str):
         values = next(csv.reader(io.StringIO(row), delimiter="\t"))
     else:

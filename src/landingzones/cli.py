@@ -304,7 +304,14 @@ def build_cli_parser():
 
     transfer_parser = subparsers.add_parser('transfer', help='Execute and inspect Python-owned delivery requests')
     actions = transfer_parser.add_subparsers(dest='transfer_action', required=True)
-    for action in ('preflight', 'run', 'status', 'resume', 'discover'):
+    credentials_command = actions.add_parser(
+        'validate-credentials',
+        help='Check configured runtime credentials and endpoint access without transferring files',
+    )
+    credentials_command.add_argument('--config', '-c', dest='subcommand_config', default=None)
+    credentials_command.add_argument('--connection', help='Check only this configured connection')
+    credentials_command.set_defaults(handler=handle_validate_credentials)
+    for action in ('preflight', 'run', 'status', 'resume', 'discover', 'reconcile'):
         command = actions.add_parser(action)
         command.add_argument('--config', '-c', dest='subcommand_config', default=None)
         if action in ('preflight', 'run'):
@@ -315,6 +322,10 @@ def build_cli_parser():
             command.add_argument('request_id')
         if action == 'resume':
             command.add_argument('--retry-parked', action='store_true', help='Grant a new bounded retry budget')
+        if action == 'reconcile':
+            command.add_argument('--receipt', required=True, help='ENA XML receipt obtained independently')
+            command.add_argument('--environment', required=True, choices=('test', 'production'),
+                                 help='Service from which the receipt was obtained')
         command.set_defaults(handler=handle_transfer)
     return parser
 
@@ -609,6 +620,36 @@ def handle_monitor_serve(args, extra_args):
     return 0
 
 
+def handle_validate_credentials(args, extra_args):
+    from datetime import datetime, timezone
+    import json
+    import pwd
+    import socket
+    from landingzones.execution.credential_validation import validate_credentials
+    if extra_args:
+        raise SystemExit('unrecognized arguments: ' + ' '.join(extra_args))
+    if effective_runtime_ids(args):
+        raise SystemExit('Python execution uses explicit runtime_ids from its config')
+    path = resolve_cli_config(args)
+    if not path:
+        raise SystemExit('Credential validation requires --config')
+    try:
+        result = validate_credentials(path, connection=args.connection)
+    except (ValueError, KeyError, OSError, TypeError) as exc:
+        # Configuration or library exceptions can contain secrets. Endpoint
+        # failures are reported individually by the validator with fixed messages.
+        result = {'status': 'failed', 'connections': [], 'runtime_ids': [],
+                  'checked_at': datetime.now(timezone.utc).isoformat(),
+                  'execution_context': {'system': socket.gethostname(),
+                                        'user': pwd.getpwuid(os.geteuid()).pw_name},
+                  'error': {'code': 'configuration_error', 'type': type(exc).__name__,
+                            'message': 'Cannot validate the runtime configuration; check its schema, context and selected connections.'}}
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result['status'] == 'passed' else 1
+
+
 def handle_transfer(args, extra_args):
     import json
     from landingzones.execution.engine import Executor
@@ -629,6 +670,8 @@ def handle_transfer(args, extra_args):
             result = executor.discover(args.connection)
         elif args.transfer_action == 'status':
             result = executor.status(args.request_id)
+        elif args.transfer_action == 'reconcile':
+            result = executor.reconcile(args.request_id, args.receipt, args.environment)
         else:
             result = executor.resume(args.request_id, args.retry_parked)
         print(json.dumps(result, indent=2, sort_keys=True))

@@ -8,9 +8,12 @@ execution_context:
 state_dir: /data/state
 event_spool: /data/events.tsv
 credentials:
-  internal_ssh:
+  rsync_cluster_writer: &cluster_ssh
     private_key_file: /run/secrets/internal_ssh_key
     known_hosts_file: /run/secrets/known_hosts
-  partner_sftp:
+  sftp_partner_upload: &partner_ssh
     private_key_file: /run/secrets/partner_sftp_key
     known_hosts_file: /run/secrets/known_hosts
+  # Compatibility for already accepted requests using the previous references.
+  internal_ssh: *cluster_ssh
+  partner_sftp: *partner_ssh

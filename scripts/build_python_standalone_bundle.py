@@ -225,12 +225,12 @@ def ensure_pip(python_bin):
 
 
 def install_application(python_bin, site_packages, wheelhouse):
-    """Install Landing Zones and dependencies into the bundle site-packages."""
+    """Install Landing Zones and its SFTP backend into the bundle site-packages."""
     site_packages.mkdir(parents=True, exist_ok=True)
     command = [str(python_bin), "-m", "pip", "install", "--target", str(site_packages)]
     if wheelhouse:
         command.extend(["--no-index", "--find-links", wheelhouse])
-    command.append(str(APP_ROOT))
+    command.append(str(APP_ROOT) + "[sftp]")
     run(command)
 
 

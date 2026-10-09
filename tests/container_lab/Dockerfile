@@ -6,6 +6,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /opt/landingzones
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir '.[sftp]'
 COPY tests/container_lab /opt/lab
 ENTRYPOINT ["python", "/opt/lab/node.py", "boot"]

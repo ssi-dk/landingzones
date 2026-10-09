@@ -60,7 +60,7 @@ def remote_url(value, scheme='sftp'):
     return parsed
 
 
-def load_settings(config_file):
+def load_settings(config_file, *, resolve_credentials=True):
     path = Path(config_file).resolve()
     with path.open() as handle:
         settings = yaml.safe_load(handle)
@@ -69,8 +69,11 @@ def load_settings(config_file):
     for key in ('transfers_file', 'state_dir', 'event_spool'):
         value = Path(settings[key])
         settings[key] = str((path.parent / value).resolve()) if not value.is_absolute() else str(value)
-    for credential in settings.get('credentials', {}).values():
+    credentials = settings.get('credentials', {}) if resolve_credentials else {}
+    for credential in credentials.values():
         for key in ('private_key_file', 'known_hosts_file'):
+            if key not in credential:
+                continue  # ENA credentials and unused adapters have different fields.
             value = Path(credential[key])
             credential[key] = str((path.parent / value).resolve()) if not value.is_absolute() else str(value)
     context = settings['execution_context']
@@ -81,7 +84,7 @@ def load_settings(config_file):
     return settings
 
 
-def load_steps(settings):
+def load_steps(settings, *, validate_credentials=True):
     selected = []
     identities = set()
     with open(settings['transfers_file']) as handle:
@@ -103,8 +106,14 @@ def load_steps(settings):
             if identity in identities:
                 raise ValueError('Duplicate step identity')
             identities.add(identity)
-            if step.adapter not in ('local', 'rsync', 'sftp') or step.operation not in ('copy', 'move'):
+            if step.adapter not in ('local', 'rsync', 'sftp', 'ena') or step.operation not in ('copy', 'move'):
                 raise ValueError('Unsupported adapter or operation')
+            if step.adapter == 'ena':
+                if step.operation != 'copy' or step.verification != 'checksum':
+                    raise ValueError('ENA requires copy with checksum verification; uploads are not archival completion')
+                if '://' in step.source or not step.destination.startswith('ena://'):
+                    raise ValueError('ENA requires a local source and an ena:// destination')
+                # Credentials are required only when this optional adapter is selected.
             if step.operation == 'move' and step.verification != 'checksum':
                 raise ValueError('Moves require checksum verification before source deletion')
             if step.verification not in ('checksum', 'size') or step.max_attempts < 1:
@@ -123,17 +132,19 @@ def load_steps(settings):
                 raise ValueError('Use a port in the SFTP URL; legacy port columns are unsupported')
             if step.source.startswith(('sftp://', 'ssh://')):
                 remote_url(step.source, 'sftp' if step.source.startswith('sftp://') else 'ssh')
-                if step.credential_ref not in settings.get('credentials', {}):
+                if validate_credentials and step.credential_ref not in settings.get('credentials', {}):
                     raise ValueError('Missing source credential reference')
             else:
                 local_root(step.source)
-            if step.adapter == 'sftp' or step.destination.startswith('ssh://'):
+            if step.adapter == 'ena':
+                pass  # ENA URL validation is lazy and belongs to the selected adapter.
+            elif step.adapter == 'sftp' or step.destination.startswith('ssh://'):
                 remote_url(step.destination, 'sftp' if step.adapter == 'sftp' else 'ssh')
                 if step.adapter not in ('sftp', 'rsync'):
                     raise ValueError('Remote destination requires sftp or rsync')
             else:
                 local_root(step.destination)
-            if (step.adapter == 'sftp' or step.destination.startswith('ssh://')) and step.credential_ref not in settings.get('credentials', {}):
+            if validate_credentials and (step.adapter == 'sftp' or step.destination.startswith('ssh://')) and step.credential_ref not in settings.get('credentials', {}):
                 raise ValueError('Missing SFTP credential reference')
             selected.append(step)
     groups = {}

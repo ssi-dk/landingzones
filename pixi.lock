@@ -1707,7 +1707,6 @@ packages:
 - pypi: ./
   name: landingzones
   requires_dist:
-  - paramiko>=3,<4
   - pyyaml>=5.0.0
   - sqlalchemy>=2.0,<3
   - black ; extra == 'dev'
@@ -1716,6 +1715,7 @@ packages:
   - pytest-cov>=4.0.0 ; extra == 'dev'
   - pytest>=7.0.0 ; extra == 'dev'
   - pandas>=1.0.0 ; extra == 'report'
+  - paramiko>=3,<4 ; extra == 'sftp'
   - pandas>=1.0.0 ; extra == 'test'
   - pytest-cov>=4.0.0 ; extra == 'test'
   - pytest>=7.0.0 ; extra == 'test'

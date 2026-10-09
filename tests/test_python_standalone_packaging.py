@@ -3,7 +3,11 @@
 """Tests for the optional python-build-standalone bundle assets."""
 
 import os
+import importlib.util
+from pathlib import Path
 import subprocess
+
+import pytest
 import yaml
 
 
@@ -87,6 +91,45 @@ def test_base_package_does_not_require_pandas():
 
     assert '"pandas' not in base_dependencies
     assert "report = [" in pyproject_text
+
+
+def test_sftp_backend_is_optional_for_normal_package_installation():
+    """Minimal pip installs stay local-only; the named extra supplies one backend."""
+    pyproject_text = (Path(APP_ROOT) / "pyproject.toml").read_text()
+    base_dependencies, optional_dependencies = pyproject_text.split(
+        "[project.optional-dependencies]", 1
+    )
+    sftp_dependencies = optional_dependencies.split("sftp = [", 1)[1].split("]", 1)[0]
+
+    assert '"paramiko' not in base_dependencies
+    assert '"paramiko' in sftp_dependencies
+
+
+@pytest.mark.parametrize("offline", [False, True])
+def test_standalone_install_includes_sftp_extra_without_changing_offline_mode(
+    tmp_path, monkeypatch, offline
+):
+    """The actual pip invocation requests SFTP in both online and wheelhouse builds."""
+    script = Path(APP_ROOT) / "scripts" / "build_python_standalone_bundle.py"
+    spec = importlib.util.spec_from_file_location("standalone_builder", script)
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    commands = []
+    monkeypatch.setattr(builder, "run", lambda command: commands.append(command))
+    application = tmp_path / "source with spaces"
+    monkeypatch.setattr(builder, "APP_ROOT", application)
+    python_bin = tmp_path / "python" / "bin" / "python3"
+    site_packages = tmp_path / "bundle" / "site-packages"
+    wheelhouse = str(tmp_path / "local wheels") if offline else ""
+
+    builder.install_application(python_bin, site_packages, wheelhouse)
+
+    expected = [str(python_bin), "-m", "pip", "install", "--target", str(site_packages)]
+    if offline:
+        expected.extend(["--no-index", "--find-links", wheelhouse])
+    expected.append(str(application) + "[sftp]")
+    assert commands == [expected]
+    assert site_packages.is_dir()
 
 
 def test_github_action_builds_and_uploads_standalone_bundle():

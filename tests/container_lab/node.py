@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import pwd
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -103,12 +104,12 @@ def write_config(role, user, root):
             "runtime_ids": [f"{role}_test.{user}"],
             "execution_context": {"system": role, "user": user},
             "state_dir": str(root / "python-state"), "event_spool": str(root / "log/python.events.tsv"),
-            "credentials": {"partner_sftp": {
+            "credentials": {"sftp_partner_upload": {
                 "private_key_file": f"/home/{user}/.ssh/id_ed25519",
                 "known_hosts_file": f"/home/{user}/.ssh/known_hosts",
             }},
         }
-        settings["credentials"]["internal_ssh"] = dict(settings["credentials"]["partner_sftp"])
+        settings["credentials"]["rsync_cluster_writer"] = dict(settings["credentials"]["sftp_partner_upload"])
         (root / "execution.yaml").write_text(json.dumps(settings, indent=2))
 
 
@@ -193,7 +194,7 @@ def credentials(user):
 
 
 def sftp_smoke():
-    """Exercise endpoint transport only; not the future product delivery API."""
+    """Exercise OpenSSH transport only; not the product's Paramiko adapter."""
     candidates = [row for row in catalog() if row["adapter"] == "sftp"]
     if len(candidates) != 1:
         raise ValueError("SFTP smoke requires exactly one configured SFTP fixture")
@@ -233,6 +234,56 @@ def sftp_smoke():
                       "transfer_identifier": row["identifiers"], "source": str(source),
                       "destination": remote, "file_checksums": before,
                       "source_retained": True, "shell_denied": True}))
+
+
+def sftp_adapter():
+    """Probe the real product adapter without executor, receipts or event writes."""
+    from landingzones.execution.adapters import SFTPAdapter, manifest
+    from landingzones.execution.model import load_settings, load_steps
+
+    settings = load_settings(Path.home() / "runtime/execution.yaml")
+    candidates = [step for group in load_steps(settings).values() for step in group
+                  if step.adapter == "sftp"]
+    if len(candidates) != 1 or candidates[0].operation != "copy":
+        raise ValueError("SFTP adapter probe requires one SFTP copy fixture")
+    step = candidates[0]
+    source = Path(tempfile.mkdtemp(prefix="adapter_", dir=step.source))
+    (source / "nested").mkdir()
+    (source / "nested/data.txt").write_text("synthetic product SFTP adapter payload\n")
+    (source / "empty.txt").touch()
+    (source / "file with spaces.txt").write_text("spaces preserved\n")
+    accepted = manifest(source)
+    final = source.name
+    with SFTPAdapter(step, settings) as transport:
+        stage = transport.stage_name(source.name)
+        assert not transport.exists(final), "Disposable destination already exists"
+        transport.copy(source, stage, accepted)
+        permissions = transport.check_path(transport.path(stage.rsplit('/', 1)[0])).st_mode
+        assert stat.S_ISDIR(permissions) and permissions & 0o077 == 0, "Staging is not private"
+        assert transport.inspect(stage) == accepted, "Staged checksum mismatch"
+        assert not transport.exists(final), "Staged data appeared at final destination"
+        transport.promote(stage, final)
+        assert not transport.exists(stage), "Published stage remains"
+        assert transport.inspect(final) == accepted, "Published checksum mismatch"
+
+        # An existing consumer-visible destination must survive a second promotion.
+        conflict_stage = transport.stage_name(source.name + "-conflict")
+        transport.copy(source, conflict_stage, accepted)
+        try:
+            transport.promote(conflict_stage, final)
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("SFTP publication overwrote an existing destination")
+        assert transport.exists(conflict_stage), "Conflict discarded unpublished data"
+        assert transport.inspect(final) == accepted, "Conflict changed published data"
+    assert manifest(source) == accepted, "SFTP copy altered source"
+    print(json.dumps({"status": "passed", "scope": "product-sftp-adapter-only",
+                      "transfer_identifier": step.identifiers, "source": str(source),
+                      "destination": step.destination.rstrip('/') + '/' + final,
+                      "manifest": accepted, "staging_private": True,
+                      "source_retained": True, "destination_conflict_refused": True,
+                      "retained_conflict_stage": conflict_stage}))
 
 
 def seed():
@@ -361,6 +412,8 @@ if __name__ == "__main__":
         credentials(sys.argv[2])
     elif action == "sftp-smoke":
         sftp_smoke()
+    elif action == "sftp-adapter":
+        sftp_adapter()
     elif action == "seed":
         seed()
     elif action == "preprocess":

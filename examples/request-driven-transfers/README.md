@@ -5,7 +5,36 @@ Replace illustrative paths, hostname, account and credentials with a permitted
 local execution context before use. Each `flow_group` selects one connection;
 `step_order` remains a compatibility field, not a cross-server dispatcher.
 
+## Credential references
+
+Use `<method>_<endpoint-or-purpose>` for credential names, for example
+`rsync_sequencer_reader`, `rsync_cluster_writer`, `sftp_partner_upload` and
+`ena_webin`. Each connection's `credential_ref` names an entry under
+`credentials` in its runtime configuration. Local connections need no reference.
+The configuration points to SSH key/known-hosts files or, for ENA, a username
+and password environment variable; private keys and passwords stay outside the
+transfer table.
+
+The prefix is a naming convention for operators. The explicit `adapter` field
+selects the transfer implementation; prefixes are not parsed or required.
+Several references can use the same key file, or each can use a separate key.
+For a remote source with a local destination, name the credentials after the
+source transport. `sftp_` applies to SFTP source reads even when the destination
+adapter is `local`.
+Existing credential names remain valid. When renaming a deployed reference,
+retain the old configuration entry while accepted requests still refer to it.
+
 ## Invoking work
+
+Run `transfer validate-credentials --config config.yaml` as the runtime account
+to check every enabled connection's credentials before transfers. This contacts
+configured endpoints without moving files. Use `--connection NAME` for one route;
+see the [credential validation guide](../../docs/credential-validation.md).
+
+SFTP uses the Paramiko backend (`landingzones[sftp]`). Its remote staging root
+must have mode `0700`; host keys remain pinned through `known_hosts_file`.
+ENA is a separate optional adapter for upload and prepared metadata submission;
+see the [ENA configuration, receipts and recovery guide](../../docs/ena.md).
 
 `request.example.json` chooses one configured connection and optionally supplies
 an expected itinerary. `transfer preflight --request FILE` validates admission;

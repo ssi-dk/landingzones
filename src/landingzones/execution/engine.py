@@ -29,7 +29,7 @@ class Executor:
                     raise ValueError('Legacy request state needs explicit migration; use a separate state directory')
 
     def preflight(self, request):
-        if not isinstance(request, dict) or set(request) - {'idempotency_key', 'payload_name', 'connection', 'deliveries', 'intake', 'itinerary'}:
+        if not isinstance(request, dict) or set(request) - {'idempotency_key', 'payload_name', 'connection', 'deliveries', 'intake', 'itinerary', 'adapter_options'}:
             raise ValueError('Unsupported request fields')
         key = request.get('idempotency_key')
         if not isinstance(key, str) or not key:
@@ -44,7 +44,7 @@ class Executor:
         if not isinstance(group, str) or group not in groups:
             raise ValueError('Unknown configured connection')
         step = groups[group][0]
-        remote_destination = step.destination.startswith(('ssh://', 'sftp://'))
+        remote_destination = step.destination.startswith(('ssh://', 'sftp://', 'ena://'))
         if remote_destination and step.operation == 'move':
             raise ValueError('Remote destination move requires durable publication support; use copy or a legacy route')
         if not remote_destination:
@@ -67,23 +67,34 @@ class Executor:
                                       adapter='local', operation=intake['operation'], readiness_policy='producer_marker')
                 admission_step = intake_step
         for work in ([intake_step] if intake_step else []) + [step]:
-            if not work.source.startswith(('ssh://', 'sftp://')) and not work.destination.startswith(('ssh://', 'sftp://')):
+            if not work.source.startswith(('ssh://', 'sftp://')) and not work.destination.startswith(('ssh://', 'sftp://', 'ena://')):
                 source = Path(local_root(work.source)) / payload
                 destination = Path(local_root(work.destination)) / payload
                 if source == destination or source in destination.parents or destination in source.parents:
                     raise ValueError('Source and destination overlap')
+        options = request.get('adapter_options', {})
+        if not isinstance(options, dict):
+            raise ValueError('adapter_options must be an object')
+        transport = adapter(step, self.settings)  # Construction never opens a connection.
+        if options and not hasattr(transport, 'prepare_request'):
+            raise ValueError('This adapter does not support request options')
         with Source(admission_step, self.settings) as source:
             if not source.ready(payload):
                 raise ValueError('Producer completion marker .ready is required')
             contents = source.inspect(payload)
             previous = source.label(payload)
             label = admit(contents, previous, step.admission_policy, request.get('itinerary'))
+        adapter_request = transport.prepare_request(options, contents) if hasattr(transport, 'prepare_request') else {}
         # An unlabelled package has a stable local admission key until it receives a label.
         identity = previous.get('package_id') if isinstance(previous, dict) and previous.get('content_version') == label['content_version'] else None
-        receipt_key = json.dumps([step.runtime_id, step.identifiers, step.source, step.destination, step.operation,
-                                  identity, label['content_version'], payload], sort_keys=True)
+        receipt_parts = [step.runtime_id, step.identifiers, step.source, step.destination, step.operation,
+                         identity, label['content_version'], payload]
+        # Preserve existing receipt identities for routes without external submissions.
+        if adapter_request:
+            receipt_parts.append(adapter_request)
+        receipt_key = json.dumps(receipt_parts, sort_keys=True)
         return {'payload_name': payload, 'manifest': contents, 'label': label,
-                'receipt_key': receipt_key, 'connection': step.record(),
+                'receipt_key': receipt_key, 'connection': step.record(), 'adapter_request': adapter_request,
                 'intake': intake_step.record() if intake_step else None}
 
     def submit(self, request):
@@ -107,11 +118,12 @@ class Executor:
                         return self._execute(existing)
                 def work(definition):
                     return {'definition': definition, 'step_id': new_identifier(), 'status': 'pending', 'attempts': [],
-                            'attempt_limit': {phase: definition['max_attempts'] for phase in ('transfer', 'cleanup', 'promotion')}}
+                            'attempt_limit': {phase: definition['max_attempts'] for phase in ('transfer', 'cleanup', 'promotion', 'submission')}}
                 state = {'schema_version': 2, 'request_id': request_id, 'request_content': serialized,
                          'receipt_key': plan['receipt_key'], 'run_id': plan['label']['transfer_run_id'],
                          'payload_id': plan['label']['package_id'], 'payload_version': plan['label']['content_version'],
                          'payload_name': plan['payload_name'], 'manifest': plan['manifest'], 'label': plan['label'],
+                         'adapter_request': plan['adapter_request'],
                          'total_bytes': sum(v.get('size', 0) for v in plan['manifest'].values()),
                          'context': self.settings['execution_context'], 'status': 'accepted', 'accepted_at': now(),
                          'intake': work(plan['intake']) if plan['intake'] else None,
@@ -181,6 +193,36 @@ class Executor:
         return {'connection': connection, 'results': results,
                 'status': 'blocked' if any(r['status'] in ('blocked', 'parked') for r in results) else 'completed'}
 
+    def reconcile(self, request_id, receipt_file, environment):
+        """Import independently obtained submission evidence; never contact a service."""
+        with self.store.locked():
+            state = self.store.read(request_id)
+            self._validate_state(state)
+            work = state['deliveries'][0]['steps'][0]
+            plan = state.get('adapter_request', {})
+            if not work.get('published') or not plan or not work.get('submission'):
+                raise ValueError('Only an attempted submission after delivery can be reconciled')
+            if environment != plan.get('environment'):
+                raise ValueError('Receipt environment must match the accepted submission')
+            transport = adapter(Step(**work['definition']), self.settings)
+            if not hasattr(transport, 'reconcile'):
+                raise ValueError('This adapter does not support receipt reconciliation')
+            with open(receipt_file, 'rb') as handle:
+                raw = handle.read(4 * 1024 * 1024 + 1)
+            if len(raw) > 4 * 1024 * 1024:
+                raise ValueError('Submission receipt is too large')
+            try:
+                receipt_xml = raw.decode('utf-8')
+            except UnicodeDecodeError:
+                raise ValueError('Submission receipt must be UTF-8') from None
+            result = transport.reconcile(plan, receipt_xml, work['submission'], lambda: self.store.save(state))
+            work.update(result=result, status='completed', completed_at=now(),
+                        reconciled_at=now(), receipt_sha256=hashlib.sha256(raw).hexdigest())
+            self.store.save(state)
+            attempt = next(a for a in reversed(work['attempts']) if a['phase'] == 'submission')
+            self._event(state, work, attempt, 'completed', 'submission', 'Receipt reconciled locally')
+            return self._execute(state)
+
     @staticmethod
     def _work(state):
         return ([state['intake']] if state['intake'] else []) + state['deliveries'][0]['steps']
@@ -227,7 +269,9 @@ class Executor:
             return False
 
     def _execute_work(self, state, work):
-        if work['status'] in ('completed', 'parked'):
+        accepted = (work.get('published') and state.get('adapter_request')
+                    and work.get('submission', {}).get('status') == 'accepted')
+        if work['status'] == 'completed' or (work['status'] == 'parked' and not accepted):
             return
         step = Step(**work['definition'])
         payload = state['payload_name']
@@ -235,7 +279,7 @@ class Executor:
         def transfer():
             with adapter(step, self.settings) as transport, Source(step, self.settings) as source:
                 stage = transport.stage_name(work['step_id'])
-                if transport.exists(payload):
+                if getattr(transport, 'publication_mode', 'rename') == 'rename' and transport.exists(payload):
                     raise FileExistsError('Destination conflict')
                 if source.inspect(payload) != state['manifest']:
                     raise ValueError('Source changed since acceptance')
@@ -275,24 +319,48 @@ class Executor:
         def publish():
             with adapter(step, self.settings) as transport:
                 stage = transport.stage_name(work['step_id'])
+                rename_publication = getattr(transport, 'publication_mode', 'rename') == 'rename'
                 if transport.exists(stage):
                     if not matches(transport.inspect(stage), state['manifest'], step.verification):
                         raise ValueError('Staging changed; publication refused')
-                    if transport.exists(payload):
+                    if rename_publication and transport.exists(payload):
                         raise FileExistsError('Destination conflict')
                     work['promotion_intent'] = True
                     self.store.save(state)
-                    transport.promote(stage, payload)
+                    receipt = transport.promote(stage, payload)
+                    if receipt is not None:
+                        work['delivery_receipt'] = receipt
+                elif not rename_publication:
+                    raise ValueError('Verified upload directory is missing; completion cannot be inferred')
                 elif not work.get('promotion_intent'):
                     raise ValueError('Private staging missing without publication intent')
                 # Only this executor may remove its private stage. With durable intent,
                 # its disappearance proves rename, even if the consumer removed output.
-                work.update(status='completed', verified=True, completed_at=now())
+                work.update(status='published', published=True, verified=True)
                 self.store.save(state)
-        if self._phase(state, work, 'promotion', publish):
+        if not work.get('published'):
+            if not self._phase(state, work, 'promotion', publish):
+                return
             attempt = work['attempts'][-1]
             self._event(state, work, attempt, 'delivered', 'promotion')
-            self._event(state, work, attempt, 'completed', 'cleanup')
+        plan = state.get('adapter_request', {}) if work is not state.get('intake') else {}
+        if plan and work.get('submission', {}).get('status') == 'accepted':
+            # The service receipt can be durable even if the process stopped before
+            # phase bookkeeping. Recover it without spending a retry or another POST.
+            work['result'] = work['submission']['result']
+        elif plan:
+            def finalize():
+                transport = adapter(step, self.settings)
+                if not hasattr(transport, 'finalize'):
+                    raise ValueError('Adapter no longer supports the accepted submission')
+                progress = work.setdefault('submission', {})
+                work['result'] = transport.finalize(plan, work.get('delivery_receipt', {}), progress,
+                                                    lambda: self.store.save(state))
+            if not self._phase(state, work, 'submission', finalize):
+                return
+        work.update(status='completed', completed_at=now())
+        self.store.save(state)
+        self._event(state, work, work['attempts'][-1], 'completed', 'submission' if plan else 'cleanup')
 
     def _execute(self, state):
         if state['status'] == 'completed':

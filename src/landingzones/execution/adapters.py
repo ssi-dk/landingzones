@@ -184,13 +184,18 @@ class SFTPAdapter:
         self.root = self.target.path.rstrip('/') or '/'
         self.credentials = settings['credentials'][step.credential_ref]
         self.client = None
+        self.sftp = None
 
     def __enter__(self):
-        import paramiko
-        self.client = paramiko.SSHClient()
-        self.client.load_host_keys(self.credentials['known_hosts_file'])
-        self.client.set_missing_host_key_policy(paramiko.RejectPolicy())
         try:
+            import paramiko
+        except ImportError as exc:
+            raise ValueError('SFTP transport requires the optional landingzones[sftp] dependencies') from exc
+        self.client = paramiko.SSHClient()
+        self.sftp = None
+        try:
+            self.client.load_host_keys(self.credentials['known_hosts_file'])
+            self.client.set_missing_host_key_policy(paramiko.RejectPolicy())
             self.client.connect(self.target.hostname, port=self.target.port or 22,
                                 username=self.target.username,
                                 key_filename=self.credentials['private_key_file'],
@@ -198,15 +203,25 @@ class SFTPAdapter:
                                 timeout=10, auth_timeout=10, banner_timeout=10)
             self.sftp = self.client.open_sftp()
             self.sftp.get_channel().settimeout(30)
-            self.check_path(self.root)
+            if not stat.S_ISDIR(self.check_path(self.root).st_mode):
+                raise ValueError('Remote root must be a directory')
             return self
-        except BaseException:
-            self.client.close()
+        except BaseException as exc:
+            try:
+                self.__exit__()
+            except Exception:
+                pass  # Preserve the setup failure after attempting both closes.
+            if isinstance(exc, paramiko.SSHException):
+                raise OSError('SFTP connection or host-key validation failed: ' + type(exc).__name__) from exc
             raise
 
     def __exit__(self, *args):
         if self.client:
-            self.client.close()
+            try:
+                if self.sftp is not None:
+                    self.sftp.close()
+            finally:
+                self.client.close()
 
     def check_path(self, path):
         current = ''
@@ -246,6 +261,8 @@ class SFTPAdapter:
                 if not (stat.S_ISREG(entry.st_mode) or stat.S_ISDIR(entry.st_mode)):
                     raise ValueError('Remote special file refused')
                 if is_metadata(key):
+                    if key in ('.ready', LABEL) and not stat.S_ISREG(entry.st_mode):
+                        raise ValueError('Package marker must be a regular file')
                     continue
                 child = path + '/' + entry.filename
                 if stat.S_ISDIR(entry.st_mode):
@@ -264,6 +281,8 @@ class SFTPAdapter:
 
     def stage_name(self, token):
         # Remote copy staging is outside the watched destination root.
+        if self.root == '/':
+            raise ValueError('Destination must have a private sibling staging location')
         return '../.landingzones-staging-' + self.root.rsplit('/', 1)[-1] + '/' + token
 
     def write_label(self, relative, label):
@@ -280,9 +299,15 @@ class SFTPAdapter:
                 raise
         self.check_path(path)
 
-    def copy(self, source, relative, accepted):
-        self.mkdir(relative.rsplit('/', 1)[0])
+    def prepare_stage(self, relative):
+        staging_root = relative.rsplit('/', 1)[0]
+        self.mkdir(staging_root)
+        if self.check_path(self.path(staging_root)).st_mode & 0o077:
+            raise ValueError('Staging root must be private to the executor (mode 0700)')
         self.mkdir(relative)
+
+    def copy(self, source, relative, accepted):
+        self.prepare_stage(relative)
         for key, item in accepted.items():
             target = relative + '/' + key
             if item['kind'] == 'directory':
@@ -302,25 +327,29 @@ class SFTPAdapter:
 
 class RemoteRsyncAdapter(SFTPAdapter):
     """Rsync over SSH for bytes; SFTP for inspection and non-overwriting rename."""
-    def copy(self, source, relative, accepted):
-        self.mkdir(relative.rsplit('/', 1)[0])
-        self.mkdir(relative)
-        ssh = ['ssh', '-p', str(self.target.port or 22),
+    def ssh_command(self):
+        return ['ssh', '-p', str(self.target.port or 22),
                '-i', self.credentials['private_key_file'],
                '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
                '-o', 'StrictHostKeyChecking=yes',
                '-o', 'UserKnownHostsFile=' + self.credentials['known_hosts_file'],
                '-o', 'ConnectTimeout=10']
+
+    def copy(self, source, relative, accepted):
+        self.prepare_stage(relative)
         host = self.target.hostname
         if ':' in host:
             host = '[' + host + ']'
         remote = self.target.username + '@' + host + ':' + self.path(relative) + '/'
         subprocess.run(['rsync', '-r', '--delete', '--protect-args', '--exclude=/.ready', '--exclude=/' + LABEL, '--exclude=/.landing_zones/',
-                        '-e', shlex.join(ssh), '--', str(source) + '/', remote],
+                        '-e', shlex.join(self.ssh_command()), '--', str(source) + '/', remote],
                        check=True, capture_output=True, text=True, timeout=3600)
 
 
 def adapter(step, settings):
+    if step.adapter == 'ena':
+        from .ena import ENAAdapter
+        return ENAAdapter(step, settings)
     if step.adapter == 'sftp':
         return SFTPAdapter(step, settings)
     if step.adapter == 'rsync' and step.destination.startswith('ssh://'):

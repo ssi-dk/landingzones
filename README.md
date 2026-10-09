@@ -2,7 +2,7 @@
 
 Automated data transfer system using rsync with cron job generation.
 
-## Independent Python connections (incremental)
+## Independent Python connections (feature branch)
 
 Python rows use `executor=python`, an explicit `adapter` and `operation`, and
 one connection per selected `flow_group`. Each execution context owns its local
@@ -32,6 +32,21 @@ See the [connection examples and contract](examples/request-driven-transfers/REA
 and [handoff ADR](docs/adr/0004-independent-package-handoffs.md) for label formats,
 readiness, recovery assumptions and limitations. The
 [local lab](tests/container_lab/README.md) provides opt-in integration scenarios.
+
+[ENA transfers](docs/ena.md) support verified uploads and optional prepared Webin
+V2 metadata submission, with returned accessions in the local receipt. ENA is
+optional and adds no third-party dependency. SFTP uses one Paramiko backend,
+available through `landingzones[sftp]` and included in the Pixi environment and
+standalone bundle. Upgrade monitoring ingestors before enabling ENA submission
+events; the ENA guide describes the schema compatibility boundary.
+
+[Test each layer separately](docs/testing-transfers.md) to check the transport,
+adapter, request processing and account permissions independently. A disposable
+local SFTP lab needs no production credentials; live ENA checks can be deferred.
+
+[Validate runtime credentials](docs/credential-validation.md) before activation
+with `transfer validate-credentials`. It checks enabled connections through their
+configured transports and reports failures without moving payloads.
 
 ## Quick Start
 

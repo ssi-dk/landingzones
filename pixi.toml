@@ -14,10 +14,14 @@ pytest = ">=7.0.0"
 sqlalchemy = ">=2.0,<3"
 
 [pypi-dependencies]
-landingzones = { path = ".", editable = true }
+landingzones = { path = ".", editable = true, extras = ["sftp"] }
 getpybs = ">=0.1.0"
 
 [tasks]
 test = "pytest"
+test-processing = "pytest tests/test_execution.py tests/test_external_execution.py -k 'not remote and not sftp'"
+test-sftp-unit = "pytest tests/test_sftp_adapter.py"
+test-ena-unit = "pytest tests/test_ena_upload.py tests/test_ena_submission.py"
+test-ena-execution = "pytest tests/test_ena_execution.py"
 test-packaging = "pytest tests/test_python_standalone_packaging.py"
 build-standalone = "python scripts/build_python_standalone_bundle.py --download-python"
