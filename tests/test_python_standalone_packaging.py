@@ -6,6 +6,7 @@ import os
 import hashlib
 import json
 import tarfile
+import sys
 import importlib.util
 from pathlib import Path
 import subprocess
@@ -154,7 +155,7 @@ def test_github_action_builds_and_uploads_standalone_bundle():
     assert "packaging/dist/landingzones-standalone-linux-x86_64.tar.gz.manifest.json" in workflow_text
 
 
-def test_standalone_release_is_driven_by_version_tags():
+def test_standalone_release_is_driven_by_version_or_explicit_test_tags():
     """Tag builds publish releases; branch dispatches only upload artifacts."""
     workflow_path = os.path.join(
         APP_ROOT, ".github", "workflows", "build-standalone.yml"
@@ -163,8 +164,7 @@ def test_standalone_release_is_driven_by_version_tags():
         # BaseLoader preserves the GitHub Actions "on" key as a string.
         workflow = yaml.load(handle, Loader=yaml.BaseLoader)
 
-    assert workflow["on"]["push"]["tags"] == ["v*"]
-    assert workflow["on"]["push"]["branches"] == ["feature/request-driven-transfers"]
+    assert workflow["on"]["push"] == {"tags": ["v*", "test-*"]}
     assert "workflow_dispatch" in workflow["on"]
     job = workflow["jobs"]["build-linux"]
     assert job["permissions"]["contents"] == "write"
@@ -173,7 +173,7 @@ def test_standalone_release_is_driven_by_version_tags():
     assert "ref" not in checkout.get("with", {})
     publish = next(step for step in job["steps"]
                    if step.get("name") == "Publish standalone bundle to GitHub Release")
-    assert publish["if"] == "startsWith(github.ref, 'refs/tags/')"
+    assert publish["if"] == "startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/test-')"
     assert 'gh release create "$GITHUB_REF_NAME"' in publish["run"]
     assert 'gh release upload "$GITHUB_REF_NAME"' in publish["run"]
     assert "--clobber" in publish["run"]
@@ -278,3 +278,51 @@ def test_candidate_workflow_pins_commit_and_uploads_all_verification_files():
     archive = "packaging/dist/landingzones-standalone-linux-x86_64.tar.gz"
     assert paths == [archive, archive + ".manifest.json", archive + ".sha256"]
     assert "${{ github.sha }}" in upload["with"]["name"]
+
+
+@pytest.mark.parametrize("tag,existing", [
+    ("test-request-driven-transfers-001", False),
+    ("test-request-driven-transfers-001", True),
+    ("v1.1.16", False),
+    ("v1.1.16", True),
+])
+def test_test_tag_release_is_never_latest_and_stable_release_behavior_is_preserved(tmp_path, tag, existing):
+    workflow = yaml.load((Path(APP_ROOT) / ".github/workflows/build-standalone.yml").read_text(), Loader=yaml.BaseLoader)
+    publish = next(step for step in workflow["jobs"]["build-linux"]["steps"]
+                   if step.get("name") == "Publish standalone bundle to GitHub Release")
+    fake_gh = tmp_path / "gh"
+    fake_gh.write_text(
+        "#!" + sys.executable + "\n"
+        "import json, os, sys\n"
+        "with open(os.environ['GH_CALL_LOG'], 'a') as handle:\n"
+        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1:3] == ['release', 'view'] and os.environ['GH_RELEASE_EXISTS'] == 'no':\n"
+        "    sys.exit(1)\n"
+    )
+    fake_gh.chmod(0o755)
+    log = tmp_path / "calls.jsonl"
+    environment = dict(os.environ, GITHUB_REF_NAME=tag, GH_CALL_LOG=str(log),
+                       GH_RELEASE_EXISTS="yes" if existing else "no",
+                       PATH=str(tmp_path) + os.pathsep + os.environ["PATH"])
+    subprocess.run(["bash", "-e", "-c", publish["run"]], check=True, env=environment)
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    creates = [call for call in calls if call[:2] == ["release", "create"]]
+    assert len(creates) == (0 if existing else 1)
+    edits = [call for call in calls if call[:2] == ["release", "edit"]]
+    if tag.startswith("test-"):
+        assert edits == [["release", "edit", tag, "--prerelease", "--latest=false"]]
+        for call in creates:
+            assert "--prerelease" in call and "--latest=false" in call
+    else:
+        assert edits == []
+        assert all("--prerelease" not in call and "--latest=false" not in call for call in creates)
+    uploads = [call for call in calls if call[:2] == ["release", "upload"]]
+    assert len(uploads) == 1
+    assert uploads[0][2] == tag
+    assert uploads[0][-1] == "--clobber"
+
+
+def test_test_tags_do_not_publish_to_package_registries():
+    for name in ("publish.yml", "publish-conda.yml"):
+        workflow = yaml.load((Path(APP_ROOT) / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
+        assert workflow["on"]["push"]["tags"] == ["v*"]

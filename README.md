@@ -387,9 +387,8 @@ lab machines.
 an environment with `landingzones[report]` installed.
 
 The same bundle can be produced by the GitHub Actions workflow
-`Build Standalone Bundle`. Run it manually from Actions, push the
-`feature/request-driven-transfers` branch, or push a `v*` tag. It builds the
-exact commit selected by GitHub and uploads
+`Build Standalone Bundle`. Run it manually from Actions, or push a `v*` or
+`test-*` tag. It builds the exact commit selected by GitHub and uploads
 `landingzones-standalone-linux-x86_64-<commit>` containing:
 
 ```text
@@ -401,6 +400,16 @@ landingzones-standalone-linux-x86_64.tar.gz.sha256
 For `v*` tags, the workflow also creates or updates the matching GitHub Release
 and uploads the tarball, manifest and checksum as release assets.
 
+For a feature candidate, point a tag such as `test-request-driven-transfers-001`
+at the reviewed feature commit and push that tag. The same build publishes the
+same asset names to a GitHub prerelease, explicitly excluded from Latest. The
+tag selects a fixed commit; later changes to the feature branch do not move it.
+Use a new test tag for another candidate. Test tags do not trigger the existing
+PyPI or Conda publication workflows, which remain restricted to `v*` tags.
+The CLI still reports the application version; the manifest's source commit
+and archive digest distinguish test builds. Before promotion, pin and validate
+the published artifact itself through the paired test environments.
+
 To release a version, update `src/landingzones/__init__.py` and `pixi.toml`
 to the same version and merge the changes into `main`. Tag that commit with
 `v<version>` and push the tag to GitHub. The standalone workflow builds from
@@ -408,8 +417,10 @@ that tag, verifies the bundle CLI, and publishes the matching release asset.
 A version bump on `main` alone does not create a tag or release.
 
 For recovery or rebuilds, manually dispatch `Build Standalone Bundle` against
-the version tag. This replaces the existing standalone release asset. A manual
-run against a branch uploads an Actions artifact only.
+a `v*` or `test-*` tag. This replaces that tag's standalone assets; test tags
+remain prereleases and never become Latest. Rebuilt bytes require a new reviewed
+digest and repeat acceptance. A manual run against a branch uploads an Actions
+artifact only.
 
 The bundle is written to:
 
