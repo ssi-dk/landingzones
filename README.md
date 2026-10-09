@@ -389,12 +389,15 @@ an environment with `landingzones[report]` installed.
 The same bundle can be produced by the GitHub Actions workflow
 `Build Standalone Bundle`. Run it manually from Actions, or push a `v*` or
 `test-*` tag. It builds the exact commit selected by GitHub and uploads
-`landingzones-standalone-linux-x86_64-<commit>` containing:
+`landingzones-standalone-linux-<architecture>-<commit>`. Stable `v*` tags keep
+building Linux/x86_64. Test tags build both Linux/x86_64 and Linux/aarch64 on
+matching GitHub runners; one publication job waits for both builds before
+publishing their assets. Each architecture provides:
 
 ```text
-landingzones-standalone-linux-x86_64.tar.gz
-landingzones-standalone-linux-x86_64.tar.gz.manifest.json
-landingzones-standalone-linux-x86_64.tar.gz.sha256
+landingzones-standalone-linux-<architecture>.tar.gz
+landingzones-standalone-linux-<architecture>.tar.gz.manifest.json
+landingzones-standalone-linux-<architecture>.tar.gz.sha256
 ```
 
 For `v*` tags, the workflow also creates or updates the matching GitHub Release
@@ -420,7 +423,9 @@ For recovery or rebuilds, manually dispatch `Build Standalone Bundle` against
 a `v*` or `test-*` tag. This replaces that tag's standalone assets; test tags
 remain prereleases and never become Latest. Rebuilt bytes require a new reviewed
 digest and repeat acceptance. A manual run against a branch uploads an Actions
-artifact only.
+artifact only and lets you select `x86_64` (the default) or `aarch64`. Tag
+runs always use their predefined platform set. Choose the artifact matching the
+local test runtime; each architecture has its own digest and validation evidence.
 
 The bundle is written to:
 

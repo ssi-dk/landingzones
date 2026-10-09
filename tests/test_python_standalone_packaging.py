@@ -152,7 +152,7 @@ def test_github_action_builds_and_uploads_standalone_bundle():
     assert "workflow_dispatch" in workflow_text
     assert "pixi run build-standalone" in workflow_text
     assert "landingzones-standalone-linux" in workflow_text
-    assert "packaging/dist/landingzones-standalone-linux-x86_64.tar.gz.manifest.json" in workflow_text
+    assert "packaging/dist/landingzones-standalone-linux-${{ matrix.architecture }}.tar.gz.manifest.json" in workflow_text
 
 
 def test_standalone_release_is_driven_by_version_or_explicit_test_tags():
@@ -167,13 +167,19 @@ def test_standalone_release_is_driven_by_version_or_explicit_test_tags():
     assert workflow["on"]["push"] == {"tags": ["v*", "test-*"]}
     assert "workflow_dispatch" in workflow["on"]
     job = workflow["jobs"]["build-linux"]
-    assert job["permissions"]["contents"] == "write"
+    assert job["permissions"]["contents"] == "read"
     checkout = next(step for step in job["steps"]
                     if step.get("uses", "").startswith("actions/checkout@"))
     assert "ref" not in checkout.get("with", {})
-    publish = next(step for step in job["steps"]
+    assert workflow["concurrency"] == {
+        "group": "${{ github.workflow }}-${{ github.ref }}", "cancel-in-progress": "false"
+    }
+    publishing_job = workflow["jobs"]["publish"]
+    assert publishing_job["needs"] == "build-linux"
+    assert publishing_job["permissions"]["contents"] == "write"
+    assert publishing_job["if"] == "startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/test-')"
+    publish = next(step for step in publishing_job["steps"]
                    if step.get("name") == "Publish standalone bundle to GitHub Release")
-    assert publish["if"] == "startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/test-')"
     assert 'gh release create "$GITHUB_REF_NAME"' in publish["run"]
     assert 'gh release upload "$GITHUB_REF_NAME"' in publish["run"]
     assert "--clobber" in publish["run"]
@@ -275,7 +281,7 @@ def test_candidate_workflow_pins_commit_and_uploads_all_verification_files():
     assert build["env"]["SOURCE_REVISION"] == "${{ github.sha }}"
     upload = next(step for step in steps if step.get("uses", "").startswith("actions/upload-artifact@"))
     paths = upload["with"]["path"].splitlines()
-    archive = "packaging/dist/landingzones-standalone-linux-x86_64.tar.gz"
+    archive = "packaging/dist/landingzones-standalone-linux-${{ matrix.architecture }}.tar.gz"
     assert paths == [archive, archive + ".manifest.json", archive + ".sha256"]
     assert "${{ github.sha }}" in upload["with"]["name"]
 
@@ -288,7 +294,7 @@ def test_candidate_workflow_pins_commit_and_uploads_all_verification_files():
 ])
 def test_test_tag_release_is_never_latest_and_stable_release_behavior_is_preserved(tmp_path, tag, existing):
     workflow = yaml.load((Path(APP_ROOT) / ".github/workflows/build-standalone.yml").read_text(), Loader=yaml.BaseLoader)
-    publish = next(step for step in workflow["jobs"]["build-linux"]["steps"]
+    publish = next(step for step in workflow["jobs"]["publish"]["steps"]
                    if step.get("name") == "Publish standalone bundle to GitHub Release")
     fake_gh = tmp_path / "gh"
     fake_gh.write_text(
@@ -304,7 +310,9 @@ def test_test_tag_release_is_never_latest_and_stable_release_behavior_is_preserv
     environment = dict(os.environ, GITHUB_REF_NAME=tag, GH_CALL_LOG=str(log),
                        GH_RELEASE_EXISTS="yes" if existing else "no",
                        PATH=str(tmp_path) + os.pathsep + os.environ["PATH"])
-    subprocess.run(["bash", "-e", "-c", publish["run"]], check=True, env=environment)
+    architectures = ["x86_64", "aarch64"] if tag.startswith("test-") else ["x86_64"]
+    expected_assets = create_publishing_assets(tmp_path, architectures)
+    subprocess.run(["bash", "-e", "-c", publish["run"]], check=True, env=environment, cwd=tmp_path)
     calls = [json.loads(line) for line in log.read_text().splitlines()]
     creates = [call for call in calls if call[:2] == ["release", "create"]]
     assert len(creates) == (0 if existing else 1)
@@ -320,9 +328,63 @@ def test_test_tag_release_is_never_latest_and_stable_release_behavior_is_preserv
     assert len(uploads) == 1
     assert uploads[0][2] == tag
     assert uploads[0][-1] == "--clobber"
+    assert set(uploads[0][3:-1]) == set(expected_assets)
 
 
 def test_test_tags_do_not_publish_to_package_registries():
     for name in ("publish.yml", "publish-conda.yml"):
         workflow = yaml.load((Path(APP_ROOT) / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
         assert workflow["on"]["push"]["tags"] == ["v*"]
+
+
+
+def create_publishing_assets(root, architectures):
+    folder = root / "packaging/dist"
+    folder.mkdir(parents=True, exist_ok=True)
+    assets = []
+    for architecture in architectures:
+        filename = "landingzones-standalone-linux-" + architecture + ".tar.gz"
+        archive = folder / filename
+        archive.write_bytes(architecture.encode())
+        (folder / (filename + ".manifest.json")).write_text("{}\n")
+        (folder / (filename + ".sha256")).write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + filename + "\n")
+        assets.extend("packaging/dist/" + filename + suffix for suffix in ("", ".manifest.json", ".sha256"))
+    return assets
+
+
+@pytest.mark.parametrize("problem", ["missing_arm", "missing_manifest", "corrupt_archive"])
+def test_publication_stops_before_release_changes_for_incomplete_or_corrupt_assets(tmp_path, problem):
+    workflow = yaml.load((Path(APP_ROOT) / ".github/workflows/build-standalone.yml").read_text(), Loader=yaml.BaseLoader)
+    publish = next(step for step in workflow["jobs"]["publish"]["steps"]
+                   if step.get("name") == "Publish standalone bundle to GitHub Release")
+    architectures = ["x86_64"] if problem == "missing_arm" else ["x86_64", "aarch64"]
+    create_publishing_assets(tmp_path, architectures)
+    archive = tmp_path / "packaging/dist/landingzones-standalone-linux-aarch64.tar.gz"
+    if problem == "missing_manifest":
+        Path(str(archive) + ".manifest.json").unlink()
+    if problem == "corrupt_archive":
+        archive.write_bytes(b"changed")
+    log = tmp_path / "gh-called"
+    fake_gh = tmp_path / "gh"
+    fake_gh.write_text("#!/bin/sh\ntouch '" + str(log) + "'\n")
+    fake_gh.chmod(0o755)
+    environment = dict(os.environ, GITHUB_REF_NAME="test-candidate", PATH=str(tmp_path) + os.pathsep + os.environ["PATH"])
+    result = subprocess.run(["bash", "-e", "-c", publish["run"]], env=environment, cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert not log.exists()
+
+
+def test_multiarchitecture_builds_use_native_runners_and_one_release_publisher():
+    workflow = yaml.load((Path(APP_ROOT) / ".github/workflows/build-standalone.yml").read_text(), Loader=yaml.BaseLoader)
+    job = workflow["jobs"]["build-linux"]
+    assert job["strategy"]["matrix"]["architecture"] == "${{ fromJSON(startsWith(github.ref, 'refs/tags/test-') && '[\"x86_64\",\"aarch64\"]' || (!startsWith(github.ref, 'refs/tags/v') && inputs.architecture == 'aarch64' && '[\"aarch64\"]' || '[\"x86_64\"]')) }}"
+    assert job["runs-on"] == "${{ matrix.architecture == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}"
+    assert workflow["on"]["workflow_dispatch"]["inputs"]["architecture"]["options"] == ["x86_64", "aarch64"]
+    build = next(step for step in job["steps"] if step.get("name") == "Build standalone bundle")
+    assert build["env"]["PBS_ARCHITECTURE"] == "${{ matrix.architecture }}-unknown-linux-gnu"
+    assert build["env"]["ARCHIVE_NAME"] == "landingzones-standalone-linux-${{ matrix.architecture }}.tar.gz"
+    publishers = [name for name, value in workflow["jobs"].items() if any("gh release upload" in step.get("run", "") for step in value["steps"])]
+    assert publishers == ["publish"]
+    download = workflow["jobs"]["publish"]["steps"][0]
+    assert download["with"]["merge-multiple"] == "true"
+    assert "${{ github.sha }}" in download["with"]["pattern"]

@@ -8,20 +8,33 @@ on:
         required: false
         default: "3.12"
       architecture:
-        description: "Optional python-build-standalone architecture override"
+        description: "Branch dispatch architecture; release tags use their predefined platforms"
+        type: choice
         required: false
-        default: ""
+        default: "x86_64"
+        options:
+          - "x86_64"
+          - "aarch64"
   push:
     tags:
       - "v*"
       - "test-*"
 
+# Serialize rebuilds of the same tag so tarballs and sidecars publish together.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-linux:
-    name: Build Linux standalone bundle
-    runs-on: ubuntu-latest
+    name: Build Linux ${{ matrix.architecture }} standalone bundle
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: ${{ fromJSON(startsWith(github.ref, 'refs/tags/test-') && '["x86_64","aarch64"]' || (!startsWith(github.ref, 'refs/tags/v') && inputs.architecture == 'aarch64' && '["aarch64"]' || '["x86_64"]')) }}
+    runs-on: ${{ matrix.architecture == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     permissions:
-      contents: write
+      contents: read
     defaults:
       run:
         working-directory: .
@@ -30,6 +43,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Pixi
+        if: matrix.architecture == 'x86_64'
         uses: prefix-dev/setup-pixi@v0.8.14
         with:
           pixi-version: v0.69.0
@@ -37,44 +51,113 @@ jobs:
           manifest-path: pixi.toml
 
       - name: Show Pixi version
+        if: matrix.architecture == 'x86_64'
         run: pixi --version
 
+      - name: Set up Python for ARM packaging
+        if: matrix.architecture == 'aarch64'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ARM packaging tools
+        if: matrix.architecture == 'aarch64'
+        run: python -m pip install getpybs pytest pyyaml
+
       - name: Run packaging tests
-        run: pixi run test-packaging
+        env:
+          BUNDLE_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          if [[ "$BUNDLE_ARCHITECTURE" == aarch64 ]]; then
+            python -m pytest tests/test_python_standalone_packaging.py
+          else
+            pixi run test-packaging
+          fi
 
       - name: Build standalone bundle
         env:
           PBS_PYTHON_VERSION: ${{ github.event.inputs.python-version || '3.12' }}
-          PBS_ARCHITECTURE: ${{ github.event.inputs.architecture }}
+          PBS_ARCHITECTURE: ${{ matrix.architecture }}-unknown-linux-gnu
           SOURCE_REVISION: ${{ github.sha }}
-          ARCHIVE_NAME: landingzones-standalone-linux-x86_64.tar.gz
-        run: pixi run build-standalone
+          ARCHIVE_NAME: landingzones-standalone-linux-${{ matrix.architecture }}.tar.gz
+          BUNDLE_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          if [[ "$BUNDLE_ARCHITECTURE" == aarch64 ]]; then
+            python scripts/build_python_standalone_bundle.py --download-python
+          else
+            pixi run build-standalone
+          fi
 
       - name: Verify bundle CLI
+        env:
+          BUNDLE_ARCHITECTURE: ${{ matrix.architecture }}
         run: |
           file ./packaging/dist/landingzones-standalone/python/bin/python3
-          ./packaging/dist/landingzones-standalone/python/bin/python3 -c "import platform, sys; print(platform.system(), platform.machine(), sys.version)"
+          test "$(uname -m)" = "$BUNDLE_ARCHITECTURE"
+          ./packaging/dist/landingzones-standalone/python/bin/python3 - <<'PYTHON'
+          import json, os, platform
+          from pathlib import Path
+          expected = {"system": "Linux", "machine": os.environ["BUNDLE_ARCHITECTURE"]}
+          actual = {"system": platform.system(), "machine": platform.machine()}
+          assert actual == expected, (actual, expected)
+          embedded = json.loads(Path("packaging/dist/landingzones-standalone/bundle.json").read_text())
+          manifest_path = Path("packaging/dist/landingzones-standalone-linux-" + expected["machine"] + ".tar.gz.manifest.json")
+          manifest = json.loads(manifest_path.read_text())
+          assert embedded["platform"] == expected, embedded["platform"]
+          assert manifest["platform"] == expected, manifest["platform"]
+          print(actual, platform.python_version())
+          PYTHON
           ./packaging/dist/landingzones-standalone/landingzones --help
 
       - name: Verify artifact checksum
         working-directory: packaging/dist
-        run: sha256sum --check landingzones-standalone-linux-x86_64.tar.gz.sha256
+        env:
+          BUNDLE_ARCHITECTURE: ${{ matrix.architecture }}
+        run: sha256sum --check "landingzones-standalone-linux-$BUNDLE_ARCHITECTURE.tar.gz.sha256"
 
       - name: Upload standalone bundle
         uses: actions/upload-artifact@v4
         with:
-          name: landingzones-standalone-linux-x86_64-${{ github.sha }}
+          name: landingzones-standalone-linux-${{ matrix.architecture }}-${{ github.sha }}
           path: |
-            packaging/dist/landingzones-standalone-linux-x86_64.tar.gz
-            packaging/dist/landingzones-standalone-linux-x86_64.tar.gz.manifest.json
-            packaging/dist/landingzones-standalone-linux-x86_64.tar.gz.sha256
+            packaging/dist/landingzones-standalone-linux-${{ matrix.architecture }}.tar.gz
+            packaging/dist/landingzones-standalone-linux-${{ matrix.architecture }}.tar.gz.manifest.json
+            packaging/dist/landingzones-standalone-linux-${{ matrix.architecture }}.tar.gz.sha256
           if-no-files-found: error
 
+  publish:
+    name: Publish completed standalone bundles
+    needs: build-linux
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/test-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download this run's completed bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: landingzones-standalone-linux-*-${{ github.sha }}
+          path: packaging/dist
+          merge-multiple: true
+
       - name: Publish standalone bundle to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/test-')
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          architectures=(x86_64)
+          if [[ "$GITHUB_REF_NAME" == test-* ]]; then
+            architectures+=(aarch64)
+          fi
+          assets=()
+          for architecture in "${architectures[@]}"; do
+            for suffix in "" .manifest.json .sha256; do
+              asset="packaging/dist/landingzones-standalone-linux-$architecture.tar.gz$suffix"
+              test -f "$asset"
+              assets+=("$asset")
+            done
+          done
+          (cd packaging/dist && sha256sum --check ./*.sha256)
           release_flags=()
           if [[ "$GITHUB_REF_NAME" == test-* ]]; then
             release_flags=(--prerelease --latest=false)
@@ -84,7 +167,4 @@ jobs:
           if [[ "$GITHUB_REF_NAME" == test-* ]]; then
             gh release edit "$GITHUB_REF_NAME" --prerelease --latest=false
           fi
-          gh release upload "$GITHUB_REF_NAME" \
-            packaging/dist/landingzones-standalone-linux-x86_64.tar.gz \
-            packaging/dist/landingzones-standalone-linux-x86_64.tar.gz.manifest.json \
-            packaging/dist/landingzones-standalone-linux-x86_64.tar.gz.sha256 --clobber
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
