@@ -3,6 +3,9 @@
 """Tests for the optional python-build-standalone bundle assets."""
 
 import os
+import hashlib
+import json
+import tarfile
 import importlib.util
 from pathlib import Path
 import subprocess
@@ -148,7 +151,7 @@ def test_github_action_builds_and_uploads_standalone_bundle():
     assert "workflow_dispatch" in workflow_text
     assert "pixi run build-standalone" in workflow_text
     assert "landingzones-standalone-linux" in workflow_text
-    assert "packaging/dist/landingzones-standalone.tar.gz" in workflow_text
+    assert "packaging/dist/landingzones-standalone-linux-x86_64.tar.gz.manifest.json" in workflow_text
 
 
 def test_standalone_release_is_driven_by_version_tags():
@@ -160,7 +163,8 @@ def test_standalone_release_is_driven_by_version_tags():
         # BaseLoader preserves the GitHub Actions "on" key as a string.
         workflow = yaml.load(handle, Loader=yaml.BaseLoader)
 
-    assert workflow["on"]["push"] == {"tags": ["v*"]}
+    assert workflow["on"]["push"]["tags"] == ["v*"]
+    assert workflow["on"]["push"]["branches"] == ["feature/request-driven-transfers"]
     assert "workflow_dispatch" in workflow["on"]
     job = workflow["jobs"]["build-linux"]
     assert job["permissions"]["contents"] == "write"
@@ -176,3 +180,101 @@ def test_standalone_release_is_driven_by_version_tags():
     assert not os.path.exists(os.path.join(
         APP_ROOT, ".github", "workflows", "release-on-version.yml"
     ))
+
+
+@pytest.fixture
+def builder():
+    script = Path(APP_ROOT) / "scripts" / "build_python_standalone_bundle.py"
+    spec = importlib.util.spec_from_file_location("standalone_builder", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_candidate_archives_exact_commit_and_excludes_uncommitted_changes(builder, tmp_path, monkeypatch):
+    source = tmp_path / "app"
+    source.mkdir()
+    subprocess.run(["git", "init", str(source)], check=True, capture_output=True)
+    (source / "payload.txt").write_text("committed content")
+    subprocess.run(["git", "add", "."], cwd=source, check=True)
+    subprocess.run(["git", "-c", "user.name=Packaging Test", "-c",
+                    "user.email=packaging@example.invalid", "commit", "-m", "fixture"],
+                   cwd=source, check=True, capture_output=True)
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
+    (source / "payload.txt").write_text("uncommitted replacement")
+    (source / "untracked.txt").write_text("local only")
+    monkeypatch.setattr(builder, "APP_ROOT", source)
+    build = tmp_path / "build"
+    build.mkdir()
+
+    frozen, metadata = builder.prepare_source(revision, build)
+
+    assert (frozen / "payload.txt").read_text() == "committed content"
+    assert not (frozen / "untracked.txt").exists()
+    assert metadata == {"source_revision": revision, "source_kind": "git-archive"}
+    local, metadata = builder.prepare_source("", build)
+    assert local == source
+    assert metadata == {"source_revision": revision, "source_kind": "local-working-tree"}
+
+
+@pytest.mark.parametrize("revision", ["main", "abc123", "HEAD", "a" * 40 + "^{commit}"])
+def test_candidate_rejects_nonimmutable_revision(builder, tmp_path, revision):
+    with pytest.raises(SystemExit, match="full lowercase Git commit SHA"):
+        builder.prepare_source(revision, tmp_path)
+
+
+def test_manifest_binds_tar_bytes_to_embedded_provenance(builder, tmp_path, monkeypatch):
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    bundle = tmp_path / "landingzones-standalone"
+    bundle.mkdir()
+    (bundle / "landingzones").write_text("#!/bin/sh\n")
+    metadata = builder.write_bundle_metadata(
+        bundle, {"system": "Linux", "machine": "x86_64", "version": "3.12.12"},
+        {"source_revision": "a" * 40, "source_kind": "git-archive"},
+        {"landingzones": "1.1.16", "paramiko": "3.5.1"},
+    )
+    archive = builder.create_tarball(bundle, "candidate-linux-x86_64.tar.gz")
+    manifest = json.loads(builder.write_artifact_manifest(archive, bundle, metadata).read_text())
+
+    assert manifest["archive"] == {
+        "filename": archive.name,
+        "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        "root": "landingzones-standalone", "launcher": "landingzones",
+    }
+    assert Path(str(archive) + ".sha256").read_text() == manifest["archive"]["sha256"] + "  " + archive.name + "\n"
+    with tarfile.open(archive) as handle:
+        embedded = json.load(handle.extractfile("landingzones-standalone/bundle.json"))
+    assert embedded == {key: value for key, value in manifest.items() if key != "archive"}
+    assert "publication" not in embedded
+    assert embedded["capabilities"] == ["sftp", "ena"]
+
+
+def test_ci_publication_requires_source_to_match_run(builder, monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    for key, value in {
+        "GITHUB_REPOSITORY": "example/landingzones", "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": "b" * 40,
+        "GITHUB_SERVER_URL": "https://github.com",
+    }.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(SystemExit, match="exact GITHUB_SHA"):
+        builder.publication_metadata({"source_kind": "git-archive", "source_revision": "a" * 40})
+    with pytest.raises(SystemExit, match="exact GITHUB_SHA"):
+        builder.publication_metadata({"source_kind": "local-working-tree", "source_revision": "b" * 40})
+    publication = builder.publication_metadata({"source_kind": "git-archive", "source_revision": "b" * 40})
+    assert publication == {
+        "provider": "github-actions", "repository": "example/landingzones", "run_id": "123",
+        "run_attempt": "2", "run_url": "https://github.com/example/landingzones/actions/runs/123",
+    }
+
+
+def test_candidate_workflow_pins_commit_and_uploads_all_verification_files():
+    workflow = yaml.load((Path(APP_ROOT) / ".github/workflows/build-standalone.yml").read_text(), Loader=yaml.BaseLoader)
+    steps = workflow["jobs"]["build-linux"]["steps"]
+    build = next(step for step in steps if step.get("name") == "Build standalone bundle")
+    assert build["env"]["SOURCE_REVISION"] == "${{ github.sha }}"
+    upload = next(step for step in steps if step.get("uses", "").startswith("actions/upload-artifact@"))
+    paths = upload["with"]["path"].splitlines()
+    archive = "packaging/dist/landingzones-standalone-linux-x86_64.tar.gz"
+    assert paths == [archive, archive + ".manifest.json", archive + ".sha256"]
+    assert "${{ github.sha }}" in upload["with"]["name"]

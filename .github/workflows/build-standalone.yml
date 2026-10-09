@@ -12,6 +12,8 @@ on:
         required: false
         default: ""
   push:
+    branches:
+      - "feature/request-driven-transfers"
     tags:
       - "v*"
 
@@ -45,6 +47,8 @@ jobs:
         env:
           PBS_PYTHON_VERSION: ${{ github.event.inputs.python-version || '3.12' }}
           PBS_ARCHITECTURE: ${{ github.event.inputs.architecture }}
+          SOURCE_REVISION: ${{ github.sha }}
+          ARCHIVE_NAME: landingzones-standalone-linux-x86_64.tar.gz
         run: pixi run build-standalone
 
       - name: Verify bundle CLI
@@ -53,14 +57,18 @@ jobs:
           ./packaging/dist/landingzones-standalone/python/bin/python3 -c "import platform, sys; print(platform.system(), platform.machine(), sys.version)"
           ./packaging/dist/landingzones-standalone/landingzones --help
 
-      - name: Prepare release asset
-        run: cp packaging/dist/landingzones-standalone.tar.gz packaging/dist/landingzones-standalone-linux-x86_64.tar.gz
+      - name: Verify artifact checksum
+        working-directory: packaging/dist
+        run: sha256sum --check landingzones-standalone-linux-x86_64.tar.gz.sha256
 
       - name: Upload standalone bundle
         uses: actions/upload-artifact@v4
         with:
-          name: landingzones-standalone-linux-x86_64
-          path: packaging/dist/landingzones-standalone-linux-x86_64.tar.gz
+          name: landingzones-standalone-linux-x86_64-${{ github.sha }}
+          path: |
+            packaging/dist/landingzones-standalone-linux-x86_64.tar.gz
+            packaging/dist/landingzones-standalone-linux-x86_64.tar.gz.manifest.json
+            packaging/dist/landingzones-standalone-linux-x86_64.tar.gz.sha256
           if-no-files-found: error
 
       - name: Publish standalone bundle to GitHub Release
@@ -70,4 +78,7 @@ jobs:
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
             gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "Landing Zones $GITHUB_REF_NAME"
-          gh release upload "$GITHUB_REF_NAME" packaging/dist/landingzones-standalone-linux-x86_64.tar.gz --clobber
+          gh release upload "$GITHUB_REF_NAME" \
+            packaging/dist/landingzones-standalone-linux-x86_64.tar.gz \
+            packaging/dist/landingzones-standalone-linux-x86_64.tar.gz.manifest.json \
+            packaging/dist/landingzones-standalone-linux-x86_64.tar.gz.sha256 --clobber

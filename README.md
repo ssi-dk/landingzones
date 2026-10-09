@@ -378,21 +378,28 @@ packaging/dist/landingzones-standalone/python/bin/python3 -c "import platform; p
 
 Expected for the current lab machines is Linux/x86_64.
 
-The standalone bundle installs the core operator CLI without pandas, so it is
-intended for `build`, `validate`, and `deploy` on locked-down lab machines.
+The standalone bundle includes the operator CLI, the Paramiko SFTP backend,
+and ENA upload/submission support. ENA is activated only by configured ENA
+routes; other routes do not need ENA credentials. It excludes pandas, so it is
+intended for runtime execution, `build`, `validate`, and `deploy` on locked-down
+lab machines.
 `landingzones report transfers` remains a reporting extra and should run from
 an environment with `landingzones[report]` installed.
 
 The same bundle can be produced by the GitHub Actions workflow
-`Build Standalone Bundle`. Run it manually from Actions, or push a `v*` tag.
-It uploads `landingzones-standalone-linux-x86_64` containing:
+`Build Standalone Bundle`. Run it manually from Actions, push the
+`feature/request-driven-transfers` branch, or push a `v*` tag. It builds the
+exact commit selected by GitHub and uploads
+`landingzones-standalone-linux-x86_64-<commit>` containing:
 
 ```text
 landingzones-standalone-linux-x86_64.tar.gz
+landingzones-standalone-linux-x86_64.tar.gz.manifest.json
+landingzones-standalone-linux-x86_64.tar.gz.sha256
 ```
 
 For `v*` tags, the workflow also creates or updates the matching GitHub Release
-and uploads `landingzones-standalone-linux-x86_64.tar.gz` as a release asset.
+and uploads the tarball, manifest and checksum as release assets.
 
 To release a version, update `src/landingzones/__init__.py` and `pixi.toml`
 to the same version and merge the changes into `main`. Tag that commit with
@@ -409,7 +416,36 @@ The bundle is written to:
 ```text
 app/packaging/dist/landingzones-standalone/
 app/packaging/dist/landingzones-standalone.tar.gz
+app/packaging/dist/landingzones-standalone.tar.gz.manifest.json
+app/packaging/dist/landingzones-standalone.tar.gz.sha256
 ```
+
+For a local candidate that can later be tested from a published artifact, select
+an exact committed source revision:
+
+```bash
+pixi run build-standalone --source-revision "$(git rev-parse HEAD)"
+```
+
+The builder packages a fresh `git archive` of that commit. Uncommitted source
+changes are excluded. Without `--source-revision`, the builder packages the local
+working tree for standalone installation testing; its manifest identifies it as
+`local-working-tree`, which deployment consumers must not promote to servers.
+`--archive-name` can set a platform-specific tarball basename without changing
+the bundle directory layout.
+
+Each archive contains `bundle.json` with schema version `1`, application/version,
+full source revision, source kind, OS/architecture, Python version, capabilities,
+and the resolved package versions. GitHub Actions builds additionally record
+`publication` with the producing repository, run ID/attempt and run URL; local
+builds omit it. The adjacent manifest repeats these fields
+and adds `archive.filename`, `archive.sha256`, `archive.root` and
+`archive.launcher`. The SHA-256 file uses the standard `sha256sum --check` format.
+The manifest and digest identify the built bytes: rebuilding a commit can resolve
+different dependencies, so promotion must reuse the tested archive and pin its
+digest as well as its commit. Consumers should verify the digest, platform and
+embedded provenance before activation. GitHub Actions artifacts have retention
+limits; retain the tested candidate or publish it as a release before its expiry.
 
 Copy the tarball to the lab machine, extract it, and run it like the normal CLI:
 
