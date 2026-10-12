@@ -9,7 +9,7 @@ import warnings
 
 from landingzones.transfer_events import EVENT_HEADER, create_transfer_event, event_to_tsv_row, new_identifier
 from .adapters import adapter, manifest, matches
-from .model import Step, load_settings, load_steps, local_root, name
+from .model import Step, load_settings, load_steps, local_root, name, resolve_local_endpoint
 from .package import admit
 from .source import Source
 from .storage import StateStore
@@ -57,7 +57,9 @@ class Executor:
         if intake:
             if not isinstance(intake, dict) or set(intake) != {'source_path', 'input_root', 'operation'}:
                 raise ValueError('Intake requires source_path, input_root and operation')
-            if step.source.startswith(('ssh://', 'sftp://')) or intake['input_root'] != step.source or intake['operation'] not in ('copy', 'move'):
+            if (step.source.startswith(('ssh://', 'sftp://'))
+                    or Path(resolve_local_endpoint(intake['input_root'], self.settings.get('local_path_base'))) != Path(step.source)
+                    or intake['operation'] not in ('copy', 'move')):
                 raise ValueError('Intake must match a configured same-server input')
             source = Path(local_root(intake['source_path']))
             if source.name != payload:

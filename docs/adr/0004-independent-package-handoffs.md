@@ -53,6 +53,26 @@ available, accepted version and payload name. Another request key or scan reuses
 existing work. Unlabelled admissions across separate connections may assign distinct
 identities; use a managed labelled input when copies need shared identity.
 
+## Configured local endpoint mappings
+
+The executor supports an optional `local_path_base`, resolved relative to the
+execution configuration's directory. Relative local transfer roots resolve from
+that explicit base; absolute roots remain supported. Only configured endpoint
+roots are normalized through symlinks. Payload paths retain canonical-path and
+symlink checks. Remote endpoint URLs retain their existing contract.
+
+Normalize roots before validating overlap or conflicting shared-source moves.
+Accepted state, receipt identity and event source/destination paths use resolved
+physical endpoints for mapped roots. Recovery uses the accepted snapshot rather
+than resolving a changed alias again. Already-physical absolute spellings are
+retained to preserve existing receipt keys. Each environment owns separate state;
+promoting configuration does not promote test receipts.
+
+Deployment owns the runtime, link targets, account access and private staging
+beside the physical destination. The application only interprets configured
+paths and applies the connection logic; it does not install a runtime or create
+its endpoint aliases.
+
 ## Consequences and migration boundary
 
 ADR 0003 remains applicable: completion follows both delivery and required cleanup,

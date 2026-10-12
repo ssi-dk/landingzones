@@ -5,6 +5,15 @@ Replace illustrative paths, hostname, account and credentials with a permitted
 local execution context before use. Each `flow_group` selects one connection;
 `step_order` remains a compatibility field, not a cross-server dispatcher.
 
+## Relative local endpoints
+
+For a runtime with `config/execution.yaml`, set `local_path_base: ..` and use
+local endpoint names such as `data/input` and `data/output` in the transfer table.
+Deployments supply those queue links; the executor resolves their physical roots
+for processing, receipts and events. Configuration/state/log paths remain
+relative to the configuration directory. See [local endpoint paths](../../README.md#local-endpoint-paths)
+for the complete base and staging contract. Remote URLs remain explicit.
+
 ## Credential references
 
 Use `<method>_<endpoint-or-purpose>` for credential names, for example

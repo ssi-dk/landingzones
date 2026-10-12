@@ -48,6 +48,35 @@ local SFTP lab needs no production credentials; live ENA checks can be deferred.
 with `transfer validate-credentials`. It checks enabled connections through their
 configured transports and reports failures without moving payloads.
 
+### Local endpoint paths
+
+Set `local_path_base` to anchor local transfer-table endpoints independently of
+where the command is invoked. The base itself resolves relative to the directory
+containing the execution configuration. For `config/execution.yaml` inside an
+application runtime:
+
+```yaml
+local_path_base: ..
+transfers_file: transfers.tsv
+state_dir: ../state
+event_spool: ../log/events.tsv
+```
+
+A local connection can then use `source=data/input` and
+`destination=data/output`. Deployment creates those queue directories or symlinks.
+Landing Zones resolves configured local root aliases to physical absolute paths
+before overlap/shared-source checks and execution. Accepted work and Transfer
+Events retain those physical endpoints; changing a link cannot redirect an
+unfinished transfer. The configured transfer table keeps its readable logical
+paths. Existing absolute endpoints remain supported; relative endpoints require
+an explicit base. SSH/SFTP and ENA URLs retain their remote meaning.
+
+Links inside payloads remain rejected. Deployment must provision private sibling
+staging on the resolved destination's filesystem, rather than beside its alias.
+State remains private to each executor. An intake request's `input_root` may use
+the configured alias; its user-supplied `source_path` still requires an absolute
+physical path.
+
 ## Quick Start
 
 ```bash

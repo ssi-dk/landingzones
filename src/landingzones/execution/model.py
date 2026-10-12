@@ -1,6 +1,6 @@
 """Validated configuration for the first Python-owned transfer paths."""
 import csv
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import os
 from pathlib import Path
 import pwd
@@ -49,6 +49,28 @@ def local_root(value):
     return str(path)
 
 
+def resolve_local_endpoint(value, base=None):
+    """Resolve trusted configured roots; payload paths still use local_root()."""
+    if (not isinstance(value, str) or not value or '://' in value
+            or any(c in value for c in '\n\r\0')):
+        raise ValueError('Expected a configured local filesystem path')
+    configured = Path(value)
+    if '..' in configured.parts:
+        raise ValueError('Configured local endpoints must not contain traversal')
+    path = configured
+    if not path.is_absolute():
+        if base is None:
+            raise ValueError('Relative local endpoints require local_path_base')
+        path = Path(base) / path
+    try:
+        resolved = path.resolve()
+        local_root(str(resolved))
+    except (OSError, RuntimeError) as exc:
+        raise ValueError('Configured local endpoint cannot be resolved') from exc
+    # Keep already-physical absolute spellings so existing receipt keys are stable.
+    return value if configured.is_absolute() and configured == resolved else str(resolved)
+
+
 def remote_url(value, scheme='sftp'):
     parsed = urlsplit(value)
     if (parsed.scheme != scheme or not parsed.hostname or not parsed.username
@@ -66,6 +88,18 @@ def load_settings(config_file, *, resolve_credentials=True):
         settings = yaml.safe_load(handle)
     if not isinstance(settings, dict) or settings.get('execution_schema_version') != 1:
         raise ValueError('Python execution requires execution_schema_version: 1')
+    if 'local_path_base' in settings:
+        value = settings['local_path_base']
+        if (not isinstance(value, str) or not value or '://' in value
+                or any(c in value for c in '\n\r\0')):
+            raise ValueError('local_path_base must name an existing directory')
+        try:
+            base = (path.parent / value).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError('local_path_base must resolve to an existing directory') from exc
+        if not base.is_dir():
+            raise ValueError('local_path_base must name an existing directory')
+        settings['local_path_base'] = str(base)
     for key in ('transfers_file', 'state_dir', 'event_spool'):
         value = Path(settings[key])
         settings[key] = str((path.parent / value).resolve()) if not value.is_absolute() else str(value)
@@ -135,7 +169,7 @@ def load_steps(settings, *, validate_credentials=True):
                 if validate_credentials and step.credential_ref not in settings.get('credentials', {}):
                     raise ValueError('Missing source credential reference')
             else:
-                local_root(step.source)
+                step = replace(step, source=resolve_local_endpoint(step.source, settings.get('local_path_base')))
             if step.adapter == 'ena':
                 pass  # ENA URL validation is lazy and belongs to the selected adapter.
             elif step.adapter == 'sftp' or step.destination.startswith('ssh://'):
@@ -143,7 +177,7 @@ def load_steps(settings, *, validate_credentials=True):
                 if step.adapter not in ('sftp', 'rsync'):
                     raise ValueError('Remote destination requires sftp or rsync')
             else:
-                local_root(step.destination)
+                step = replace(step, destination=resolve_local_endpoint(step.destination, settings.get('local_path_base')))
             if validate_credentials and (step.adapter == 'sftp' or step.destination.startswith('ssh://')) and step.credential_ref not in settings.get('credentials', {}):
                 raise ValueError('Missing SFTP credential reference')
             selected.append(step)
@@ -156,7 +190,8 @@ def load_steps(settings, *, validate_credentials=True):
             raise ValueError('One connection per flow_group is required; split journey steps into independent groups')
     moves = {}
     for step in selected:
-        moves.setdefault(step.source, []).append(step)
+        source = step.source if step.source.startswith(('ssh://', 'sftp://')) else local_root(step.source)
+        moves.setdefault(source, []).append(step)
     if any(len(group) > 1 and any(s.operation == 'move' for s in group) for group in moves.values()):
         raise ValueError('Conflicting shared-source move connections; use separate input folders')
     return groups
