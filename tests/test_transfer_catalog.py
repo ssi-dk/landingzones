@@ -3,6 +3,8 @@
 """Tests for transfer catalog loading."""
 
 import pytest
+import csv
+import yaml
 
 from landingzones import generate_cron_files as gcf
 from landingzones import transfer_catalog
@@ -14,6 +16,71 @@ from landingzones.transfer_catalog import (
     load_runtime_transfer_catalog,
     load_runtime_transfer_definitions,
 )
+
+
+def test_monitoring_reads_execution_routes_with_relative_paths_and_disabled_inventory(tmp_path, monkeypatch):
+    """A report can read the executor's managed-ready catalog from another context."""
+    runtime = tmp_path / 'runtime'
+    (runtime / 'config').mkdir(parents=True)
+    (runtime / 'data').mkdir()
+    physical = tmp_path / 'physical-output'
+    physical.mkdir()
+    (runtime / 'data' / 'output').symlink_to(physical, target_is_directory=True)
+    config_file = runtime / 'config' / 'execution.yaml'
+    config_file.write_text(yaml.safe_dump(dict(
+        execution_schema_version=1, local_path_base='..', transfers_file='transfers.tsv',
+        state_dir='../state', event_spool='../log/events.tsv', runtime_ids=['example.test'],
+        execution_context={'system': 'configured-host', 'user': 'configured-account'},
+        credentials={'unused': {'private_key_file': '/inaccessible/key'}},
+    )))
+    rows = [dict(identifiers=identifier, enabled=enabled, runtime_id='example.test',
+                 system='configured-host', users='configured-account', source=source,
+                 destination='data/output', readiness_policy='managed_ready', executor='python')
+            for identifier, enabled, source in (
+                ('pull', 'TRUE', 'ssh://reader@example:22223/inbox'),
+                ('disabled', 'FALSE', 'data/input'),
+            )]
+    with (runtime / 'config' / 'transfers.tsv').open('w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter='\t')
+        writer.writeheader()
+        writer.writerows(rows)
+    monkeypatch.chdir(tmp_path)
+    snapshot = gcf.config.snapshot_state()
+    try:
+        definitions = load_monitoring_transfer_definitions(config_file=str(config_file))
+        assert [item.identifier for item in definitions] == ['pull', 'disabled']
+        assert definitions[0].source == 'ssh://reader@example:22223/inbox'
+        assert definitions[0].destination == str(physical)
+        assert definitions[0].readiness_policy == 'managed_ready'
+        assert definitions[1].source == str(runtime / 'data' / 'input')
+        assert not definitions[1].enabled
+        assert load_monitoring_transfer_definitions(config_file=str(config_file), runtime_ids=['missing.test']) == []
+        assert load_monitoring_transfer_definitions(config_file=str(config_file), system='another-host') == []
+        from landingzones.execution.model import load_settings
+        with pytest.raises(ValueError, match='actual local hostname'):
+            load_settings(config_file)
+    finally:
+        gcf.config.restore_state(snapshot)
+
+
+def test_monitoring_execution_catalog_rejects_foreign_route_ownership(tmp_path):
+    """Reporting does not silently relabel a route from another execution context."""
+    config_file = tmp_path / 'execution.yaml'
+    config_file.write_text(yaml.safe_dump(dict(
+        execution_schema_version=1, local_path_base='.', transfers_file='transfers.tsv',
+        state_dir='state', event_spool='events.tsv', runtime_ids=['example.test'],
+        execution_context={'system': 'configured-host', 'user': 'configured-account'},
+    )))
+    (tmp_path / 'transfers.tsv').write_text(
+        'identifiers\tenabled\truntime_id\tsystem\tusers\tsource\tdestination\texecutor\n'
+        'pull\tTRUE\texample.test\tforeign-host\tconfigured-account\tinput\toutput\tpython\n'
+    )
+    snapshot = gcf.config.snapshot_state()
+    try:
+        with pytest.raises(ValueError, match='another execution context'):
+            load_monitoring_transfer_definitions(config_file=str(config_file))
+    finally:
+        gcf.config.restore_state(snapshot)
 
 
 def test_runtime_catalog_preserves_build_loading_invariants(tmp_path):

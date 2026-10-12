@@ -82,7 +82,8 @@ def remote_url(value, scheme='sftp'):
     return parsed
 
 
-def load_settings(config_file, *, resolve_credentials=True):
+def load_settings(config_file, *, resolve_credentials=True, validate_context=True):
+    """Load execution paths; read-only monitoring may inspect a different context."""
     path = Path(config_file).resolve()
     with path.open() as handle:
         settings = yaml.safe_load(handle)
@@ -111,7 +112,7 @@ def load_settings(config_file, *, resolve_credentials=True):
             value = Path(credential[key])
             credential[key] = str((path.parent / value).resolve()) if not value.is_absolute() else str(value)
     context = settings['execution_context']
-    if context != {'system': socket.gethostname(), 'user': pwd.getpwuid(os.geteuid()).pw_name}:
+    if validate_context and context != {'system': socket.gethostname(), 'user': pwd.getpwuid(os.geteuid()).pw_name}:
         raise ValueError('Execution context must match the actual local hostname and effective user')
     if not settings.get('runtime_ids'):
         raise ValueError('Explicit runtime_ids are required')

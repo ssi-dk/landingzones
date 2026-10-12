@@ -10,3 +10,10 @@ Transfer runtimes emit immutable, schema-versioned Transfer Events to a local Ev
 - Transfer Definitions and Transfer Events remain separate so disabled or never-observed routes are visible without inventing operational history.
 - The live monitoring service queries the database for every request. The existing static report remains a legacy schema-0 surface.
 - Schema version 1 supports synchronous host-local SQLite only. Additional backends require an explicit adapter and integration coverage.
+
+Monitoring also reads schema-1 Python execution configurations. It resolves the
+transfer table from the configuration directory and local endpoint aliases from
+`local_path_base`, preserving remote URLs and disabled definitions. Reporting
+does not authenticate credentials or require the report process to share the
+executor's hostname/account; route ownership must still match the configured
+execution context. Transfer execution retains its actual-context check.
