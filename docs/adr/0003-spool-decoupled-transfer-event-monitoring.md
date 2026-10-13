@@ -1,6 +1,6 @@
 # Spool-Decoupled Transfer Event Monitoring
 
-Transfer runtimes emit immutable, schema-versioned Transfer Events to a local Event Spool and never write to the monitoring database directly, so monitoring availability cannot affect data movement. A separately invoked SQLAlchemy adapter ingests schema-version-1 spools idempotently into a host-local SQLite database, while current Transfer Definitions are synchronized into a separate table so expected routes with no history remain visible; other database backends require their own future integration coverage.
+Transfer runtimes emit immutable, schema-versioned Transfer Events to a local Event Spool and never write to the monitoring database directly, so monitoring availability cannot affect data movement. A monitoring-side SQLAlchemy adapter ingests schema-version-1 spools idempotently into a host-local SQLite database, while current Transfer Definitions are synchronized into a separate table so expected routes with no history remain visible; other database backends require their own future integration coverage.
 
 **Consequences**
 
@@ -17,3 +17,9 @@ transfer table from the configuration directory and local endpoint aliases from
 does not authenticate credentials or require the report process to share the
 executor's hostname/account; route ownership must still match the configured
 execution context. Transfer execution retains its actual-context check.
+
+The monitoring HTTP process may own periodic ingestion of explicitly configured
+schema-v1 spools. This keeps one service responsible for ingestion and reporting
+without moving database access into transfer execution. Separate `monitor ingest`
+invocations remain supported; reader-only serving remains the default when no
+spools are configured.

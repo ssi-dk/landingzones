@@ -257,24 +257,19 @@ class Config:
         self._runtime_config = dict(snapshot['runtime_config'])
         self._config_file = snapshot['config_file']
     
-    def _get_value(self, key, env_var, default):
-        """Get configuration value with priority: runtime > env > yaml > default."""
-        # 1. Runtime config (highest priority)
+    def _get_setting(self, key, env_var, default):
+        """Resolve a typed setting without treating lists and numbers as paths."""
         if key in self._runtime_config:
-            return _expand_path(self._runtime_config[key])
-        
-        # 2. Environment variable
+            return self._runtime_config[key]
         env_value = os.environ.get(env_var)
         if env_value:
-            return _expand_path(env_value)
-        
-        # 3. YAML config
-        if key in self._yaml_config:
-            return _expand_path(self._yaml_config[key])
-        
-        # 4. Default value
-        return _expand_path(default)
-    
+            return env_value
+        return self._yaml_config.get(key, default)
+
+    def _get_value(self, key, env_var, default):
+        """Resolve and expand a path or string setting."""
+        return _expand_path(self._get_setting(key, env_var, default))
+
     @property
     def config_file(self):
         """Path to the loaded config file, if any"""
@@ -325,6 +320,34 @@ class Config:
             'sqlite:///output/landingzones-monitoring.sqlite',
         )
     
+    @property
+    def monitoring_spools(self):
+        """Explicit schema-v1 event sources; legacy report logs are not inferred."""
+        return [_expand_path(path) for path in _normalize_string_list(
+            self._get_setting('monitoring_spools', 'LZ_MONITORING_SPOOLS', [])
+        )]
+
+    @property
+    def monitoring_ingest_interval(self):
+        """Seconds between monitoring ingestion passes."""
+        value = float(self._get_setting(
+            'monitoring_ingest_interval', 'LZ_MONITORING_INGEST_INTERVAL', '60'
+        ))
+        import math
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError('monitoring_ingest_interval must be finite and positive')
+        return value
+
+    @property
+    def monitoring_host(self):
+        """HTTP listener address for the monitoring service."""
+        return self._get_value('monitoring_host', 'LZ_MONITORING_HOST', '127.0.0.1')
+
+    @property
+    def monitoring_port(self):
+        """HTTP listener port for the monitoring service."""
+        return int(self._get_setting('monitoring_port', 'LZ_MONITORING_PORT', '8080'))
+
     @property
     def default_lock_file(self):
         """Default lock file path for flock"""
@@ -547,6 +570,10 @@ class Config:
             'transfers_file': self.transfers_file,
             'report_transfer_log_file': self.report_transfer_log_file,
             'monitoring_database_url': self.monitoring_database_url,
+            'monitoring_host': self.monitoring_host,
+            'monitoring_spools': self.monitoring_spools,
+            'monitoring_ingest_interval': self.monitoring_ingest_interval,
+            'monitoring_port': self.monitoring_port,
             'test_data': self.test_data,
             'default_lock_file': self.default_lock_file,
             'log_dir': self.log_dir,
