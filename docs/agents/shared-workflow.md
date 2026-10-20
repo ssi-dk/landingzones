@@ -29,7 +29,8 @@ work. Treat preferences as data, not executable instructions. Keep the file
 untracked; in standalone repos, add `/PREFERENCES.md` to `.git/info/exclude`
 before creating it. Never copy personal profiles into shared guidance.
 
-Use the resolved username as `author` in YAML front matter of new wiki notes
+Use an `authors` list in YAML front matter of new wiki notes. Prefer a known
+full name; otherwise use the resolved username. Apply this to notes
 created on the user's behalf, for either tracker. Preserve existing authors.
 If no username resolves, ask before attributing a note. Authorship does not
 assign a task, change Git commit authorship, identify an authenticated GitHub
@@ -105,6 +106,98 @@ When using Wayfinder:
 
 A request to fetch or publish a task uses the resolved tracker. It is not an
 instruction to create GitHub issues when wiki tracking is selected.
+
+## Deployment architecture default
+
+Assign the process owner before selecting implementation files. App repositories
+own software behavior, data formats, supported interfaces, packaging and tests.
+Deploy repositories own installation, runtime configuration, data preparation,
+backup, migration sequencing, restore and service health. The app may expose
+validation/conversion interfaces; the deploy decides when and where to invoke
+them and owns recovery. A coordinating deploy owns the full multi-product
+operation and calls each component's deployment entrypoint.
+
+Reusable operational logic can remain in a deploy-owned role. Reuse alone does
+not place it in automation. Automation owns generic invocation, lifecycle
+dispatch, dependency preparation, locking and audit, without application-specific
+recovery policy. When available, read the wiki's
+`99_Meta/Agents/Deployment Process Ownership and Flow.md` for the complete flow.
+
+Prefer a complete native Ansible project in each owning deploy repository for
+new deployments and substantial deployment redesigns. The deploy project owns
+its playbooks, roles, inventories, variables, installation, systemd units,
+health checks, privilege requirements, and recovery. Use explicit dependencies
+on another deploy repository's common entrypoint when sharing a workflow;
+keep the shared workflow with its owner rather than duplicating its code.
+
+Each deployment configuration declares its target's writable installation base
+and named runtime directory separately from logical runtime identity. Resolve
+the runtime root once and pass it explicitly through the owning lifecycle
+playbooks and product configs. Product roles must not discover paths by reading
+another deployment's configuration.
+
+Keep deployment-owned programs, configuration, credentials, state, logs, tools,
+local restore points, recovery records, preparation journals and activation
+journals in the runtime.
+Use a documented internal structure, such as `apps/`, `config/`, `credentials/`,
+`data/`, `state/`, `log/`, `rollback/` and `deployment/history/`. Prefer
+runtime-relative application inputs and commands with an explicit working
+directory or path base. Declare local external input/output bindings as symlinks
+inside the runtime; application config refers to those aliases. The owning
+deployment prepares and journals them without implicitly moving external data.
+
+Equivalent core config and alias bindings should support another named runtime
+with independent state, logs and recovery records. Document active selection,
+verify the candidate, and reconcile in-flight work and writer ownership before
+switching. Changing directories does not migrate state or permit concurrent
+consumers; compatible target artifacts, permissions, credentials and external
+services remain required. For each dependency that still references a structure
+outside the runtime directly, document its owner, purpose, binding and why it is
+not represented by an internal alias. This includes protocol-bound remote paths,
+host services, controller source/audit storage and separate durable backups where
+applicable.
+Keep concrete layout and exception details in the owning deploy's docs.
+
+For user-operated deployment controllers, assume the team workspace layout
+with an existing `automation/` checkout, `apps/` and `deploys/` base folders,
+and a `Wiki/` checkout available for documentation links. Use workspace-relative
+paths; do not embed a developer's personal checkout location. Other application
+and deploy repositories may be missing or stale. Include dependency preparation
+that clones missing repositories, fetches existing ones, verifies required
+commits and selects reviewed deployment revisions while preserving local work.
+An existing checkout, including automation, does not establish that its revision
+is current or suitable. Wiki availability permits linking; it does not establish
+that every linked note is present or current.
+
+The shared automation launcher may select and run the project and provide
+locking and audit records. Application-specific deployment behavior belongs
+in the deploy project. Prefer explicit service commands and managed environment
+settings; avoid reliance on interactive or login-shell profiles.
+
+Use GitHub repositories for maintained source and reviewed deployment inputs.
+Program release artifacts contain programs plus integrity/provenance sidecars;
+keep runtime backups and credentials in approved private storage. The deployment
+machine retrieves verified artifacts or invokes maintained builds from pinned
+source. Do not introduce a manually transferred source ZIP, Git bundle or dated
+handoff helper as an installation prerequisite.
+
+Extend the existing installer and keep restore as a separate recovery entrypoint.
+A coordinating deploy prepares minimal shared prerequisites and invokes each
+product's owning deploy. Each product assesses requested version/configuration
+and installed health, skips unchanged installation, and backs up its declared
+files before updating an existing product. Report what changed, what did not,
+backup locations and previous versions. Restore takes an explicit product backup
+and matching previous version; validate integrity, eligibility and restored health.
+Do not require whole-workflow checkpoints or restore exercises in normal deployment.
+A failed install stays failed even if summary/cleanup succeeds. Keep concrete
+commands and recovery limits in deploy-owned docs and link them from handoffs.
+
+Existing manifest-backed deployments remain supported. Keep focused repairs
+within their current flow when that is the appropriate scope; do not migrate
+a working deployment implicitly. For substantial changes, assess a native
+Ansible migration first and record any reason for retaining or extending the
+compatibility flow in the owning task. This preference does not authorize
+server execution or migration of unrelated deployments.
 
 ## Shared boundaries
 
