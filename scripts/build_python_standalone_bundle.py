@@ -15,6 +15,12 @@ import platform
 from pathlib import Path
 
 
+# Verified bootstrap published by the Python eMudhra security advisory.
+MINIMUM_PIP = (26, 2, 2)
+PIP_WHEEL = "pip-26.2.2-py3-none-any.whl"
+PIP_WHEEL_URL = "https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl"
+PIP_WHEEL_SHA256 = "fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+
 APP_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BUILD_ROOT = APP_ROOT / "packaging" / "build" / "python-standalone"
 DEFAULT_DIST_ROOT = APP_ROOT / "packaging" / "dist" / "landingzones-standalone"
@@ -165,7 +171,7 @@ def extract_archive(archive, target_dir):
 def find_python_bin(root):
     """Find the Python executable inside an extracted standalone runtime."""
     candidates = []
-    for pattern in ("python3.12", "python3.11", "python3", "python"):
+    for pattern in ("python3.12", "python3.13", "python3.14", "python3", "python"):
         candidates.extend(root.glob("**/bin/{0}".format(pattern)))
     for candidate in candidates:
         if candidate.is_file() and os.access(candidate, os.X_OK):
@@ -201,6 +207,9 @@ def validate_runtime_matches_host(python_bin):
             "or OS target does not match the machine running the build.".format(exc)
         )
 
+    if tuple(int(part) for part in metadata['version'].split('.')[:2]) < (3, 12):
+        raise SystemExit('Landing Zones requires Python 3.12 or newer; instrument Python versions no longer constrain the controller')
+
     host_system = platform.system()
     host_machine = platform.machine()
     print(
@@ -212,7 +221,7 @@ def validate_runtime_matches_host(python_bin):
     if metadata["system"] != host_system:
         raise SystemExit(
             "Runtime OS mismatch: selected {0}, build host is {1}. Build the "
-            "Linux lab bundle on Linux, or pass a Linux python-build-standalone "
+            "Linux controller bundle on Linux, or pass a Linux python-build-standalone "
             "archive to a Linux build job.".format(metadata["system"], host_system)
         )
     if metadata["machine"] != host_machine:
@@ -224,17 +233,44 @@ def validate_runtime_matches_host(python_bin):
     return metadata
 
 
-def ensure_pip(python_bin):
-    """Ensure pip is available in the bundled runtime."""
+# Reject old and prerelease pip before it can download application packages.
+def pip_is_current(python_bin):
     result = subprocess.run(
         [str(python_bin), "-m", "pip", "--version"],
         capture_output=True,
         text=True,
         check=False,
     )
-    if result.returncode == 0:
+    match = re.match(r"^pip (\d+)\.(\d+)(?:\.(\d+))? ", result.stdout)
+    return result.returncode == 0 and match is not None and tuple(
+        int(part or 0) for part in match.groups()
+    ) >= MINIMUM_PIP
+
+
+# Keep offline builds offline; an old runtime needs the verified wheel in its wheelhouse.
+def ensure_pip(python_bin, wheelhouse=""):
+    if pip_is_current(python_bin):
         return
-    run([str(python_bin), "-m", "ensurepip", "--upgrade"])
+    wheel_url = PIP_WHEEL_URL
+    if wheelhouse:
+        wheel = Path(wheelhouse).resolve() / PIP_WHEEL
+        if not wheel.is_file():
+            raise SystemExit("Offline bootstrap requires the verified wheel: " + str(wheel))
+        wheel_url = wheel.as_uri()
+    available = subprocess.run(
+        [str(python_bin), "-m", "pip", "--version"],
+        capture_output=True, text=True, check=False,
+    )
+    if available.returncode:
+        run([str(python_bin), "-m", "ensurepip", "--upgrade"])
+    command = [str(python_bin), "-m", "pip", "--isolated", "--disable-pip-version-check",
+               "install", "--no-cache-dir", "--no-deps", "--upgrade"]
+    if wheelhouse:
+        command.append("--no-index")
+    command.append("pip @ " + wheel_url + "#sha256=" + PIP_WHEEL_SHA256)
+    run(command)
+    if not pip_is_current(python_bin):
+        raise SystemExit("Bootstrap did not provide pip >=26.2.2; use a supported Python runtime")
 
 
 def install_application(python_bin, site_packages, wheelhouse, source_root=None):
@@ -441,7 +477,7 @@ def main(argv=None):
     if not python3_link.exists():
         python3_link.symlink_to(bundle_python.name)
 
-    ensure_pip(bundle_python)
+    ensure_pip(bundle_python, args.wheelhouse)
     install_application(bundle_python, dist_root / "site-packages", args.wheelhouse, source_root)
     packages = describe_application(bundle_python, dist_root / "site-packages")
     metadata = write_bundle_metadata(dist_root, runtime, source, packages)

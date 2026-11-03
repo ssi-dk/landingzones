@@ -18,11 +18,11 @@ build:
 
 requirements:
   host:
-    - python >=3.8
-    - pip
+    - python >=3.12
+    - pip >=26.2.2
     - hatchling
   run:
-    - python >=3.8
+    - python >=3.12
     - pandas >=1.0.0
     - pyyaml >=5.0.0
 

@@ -2,6 +2,13 @@
 
 The Landing Zones app provides operator-facing commands for building, validating, and activating transfer runtimes.
 
+## Python support
+
+Python 3.12+ is the supported application runtime. The central transfer
+controller executes Landing Zones; sequencing-instrument Python versions no
+longer constrain its dependency or CI versions. Standalone builds carry their
+own Python runtime, and CI checks Python 3.12, 3.13 and 3.14.
+
 ## Language
 
 **Landing Zone Runtime**:

@@ -385,6 +385,10 @@ For remote transfers, debug output should show `startup delay ...` before
 
 ## Installation
 
+Use Python 3.12+ and pip 26.2.2+. For an existing installer, follow the
+[Python security advisory's verified bootstrap](https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576)
+before downloading packages.
+
 ```bash
 # Development mode
 pip install -e ".[report]"
@@ -396,11 +400,13 @@ pip install -e ".[test]"
 pip install .
 ```
 
-### Lab Sequencer Bundle
+### Standalone Controller Bundle
 
-For lab machines where a managed Python environment is awkward, build a
-relocatable bundle using a `python-build-standalone` runtime. Build it on a
-machine that matches the lab sequencer OS, architecture, and libc family.
+Landing Zones requires Python 3.12 or newer. Transfers execute on the central
+controller; the Python versions on sequencing instruments no longer constrain
+this application. A relocatable `python-build-standalone` bundle provides its
+own runtime. Build it on a machine matching the execution controller's OS,
+architecture, and libc family.
 
 Download or provide a python-build-standalone `install_only` archive, then run:
 
@@ -423,22 +429,21 @@ cd app
 pixi run build-standalone
 ```
 
-Build the lab Linux artifact on Linux. A bundle built on macOS contains a macOS
-Python runtime and will fail on the sequencer with `cannot execute binary file`.
-Before copying a tarball to the lab host, verify the bundled runtime:
+Build the Linux artifact on Linux. A bundle built on macOS contains a macOS
+Python runtime and will fail on Linux with `cannot execute binary file`.
+Before installing a tarball on the controller, verify the bundled runtime:
 
 ```bash
 file packaging/dist/landingzones-standalone/python/bin/python3
 packaging/dist/landingzones-standalone/python/bin/python3 -c "import platform; print(platform.system(), platform.machine())"
 ```
 
-Expected for the current lab machines is Linux/x86_64.
+Select the architecture of the execution controller, independently of the instruments.
 
 The standalone bundle includes the operator CLI, the Paramiko SFTP backend,
 and ENA upload/submission support. ENA is activated only by configured ENA
 routes; other routes do not need ENA credentials. It excludes pandas, so it is
-intended for runtime execution, `build`, `validate`, and `deploy` on locked-down
-lab machines.
+intended for runtime execution, `build`, `validate`, and `deploy` on the controller.
 `landingzones report transfers` remains a reporting extra and should run from
 an environment with `landingzones[report]` installed.
 
@@ -519,7 +524,7 @@ digest as well as its commit. Consumers should verify the digest, platform and
 embedded provenance before activation. GitHub Actions artifacts have retention
 limits; retain the tested candidate or publish it as a release before its expiry.
 
-Copy the tarball to the lab machine, extract it, and run it like the normal CLI:
+Install the tarball on the execution controller, extract it, and run it like the normal CLI:
 
 ```bash
 ./landingzones --config config/config.yaml build
@@ -527,7 +532,12 @@ Copy the tarball to the lab machine, extract it, and run it like the normal CLI:
 ```
 
 For offline builds, pass `--wheelhouse /path/to/wheels` so dependencies are
-installed from local wheels. The legacy shell wrapper still works:
+installed from local wheels. If the supplied runtime has pip older than 26.2.2,
+include `pip-26.2.2-py3-none-any.whl` in that wheelhouse. The builder verifies
+the SHA-256 from the
+[Python security advisory](https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576)
+before installing it; an offline build never downloads the bootstrap wheel.
+The legacy shell wrapper still works:
 
 ```bash
 ./scripts/build_python_standalone_bundle.sh --python-archive /path/to/cpython-*-install_only.tar.*
@@ -748,7 +758,7 @@ landingzones --help
 
 ## Requirements
 
-- Python >= 3.8
+- Python >= 3.12
 - PyYAML >= 5.0.0
 - pandas >= 1.0.0 only for `landingzones report transfers` / `landingzones[report]`
 - SQLAlchemy >= 2.0,<3 for schema-version-1 SQLite monitoring
