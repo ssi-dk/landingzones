@@ -9,6 +9,7 @@ import shutil
 import shlex
 import stat
 import subprocess
+from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 
 from .model import local_root
@@ -91,6 +92,19 @@ def cleanup(root, accepted):
         os.close(descriptor)
 
 
+def _rename_noreplace(source, destination):
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'darwin' and hasattr(libc, 'renamex_np'):
+        result = libc.renamex_np(os.fsencode(source), os.fsencode(destination), 4)  # RENAME_EXCL
+    elif sys.platform.startswith('linux') and hasattr(libc, 'renameat2'):
+        result = libc.renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1)  # RENAME_NOREPLACE
+    else:
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS), str(destination))
+    if result:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(destination))
+
+
 class LocalAdapter:
     def __init__(self, step, settings):
         self.step = step
@@ -99,6 +113,7 @@ class LocalAdapter:
             raise ValueError('Destination root must already exist')
         if self.root == self.root.parent:
             raise ValueError('Destination must have a private sibling staging location')
+        self.exclusive_destination = str(self.root) in settings.get('exclusive_local_destinations', [])
 
     def __enter__(self):
         return self
@@ -153,22 +168,41 @@ class LocalAdapter:
             finally:
                 os.close(descriptor)
 
+    def _rename(self, source, destination):
+        try:
+            _rename_noreplace(source, destination)
+            return
+        except OSError as exc:
+            if exc.errno not in (errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
+            if not self.exclusive_destination:
+                raise OSError(exc.errno, 'Atomic no-overwrite rename unsupported for local destination',
+                              str(self.root)) from exc
+        # The executor holds its state lock. Every publisher to this root must share it.
+        try:
+            destination.lstat()
+        except FileNotFoundError:
+            os.rename(source, destination)
+        else:
+            raise FileExistsError(errno.EEXIST, 'Destination already exists', str(destination))
+
+    def check_move_publication(self, relative, final):
+        if self.exists(final):
+            raise FileExistsError('Destination already exists')
+        stage_parent = Path(local_root(os.path.normpath(str(self.root / relative)))).parent
+        if stage_parent.stat().st_dev != self.root.stat().st_dev:
+            raise ValueError('Staging and destination must be on the same filesystem')
+        # Keep the capability probe private and separate from the staged package.
+        with TemporaryDirectory(prefix='.rename-probe-', dir=stage_parent) as directory:
+            probe = Path(directory)
+            source = probe / 'source'
+            source.mkdir()
+            self._rename(source, probe / 'destination')
+
     def promote(self, relative, final):
         source = Path(local_root(os.path.normpath(str(self.root / relative))))
         destination = Path(local_root(str(self.root / final)))
-        if destination.exists():
-            raise FileExistsError('Destination already exists')
-        # Refuse an existing target atomically, including competing publishers.
-        libc = ctypes.CDLL(None, use_errno=True)
-        if sys.platform == 'darwin':
-            result = libc.renamex_np(os.fsencode(source), os.fsencode(destination), 4)  # RENAME_EXCL
-        elif sys.platform.startswith('linux') and hasattr(libc, 'renameat2'):
-            result = libc.renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1)  # NOREPLACE
-        else:
-            raise ValueError('Atomic non-overwriting rename unsupported on this platform')
-        if result:
-            code = ctypes.get_errno()
-            raise OSError(code, os.strerror(code), str(destination))
+        self._rename(source, destination)
         for directory in (source.parent, destination.parent):
             descriptor = os.open(str(directory), os.O_RDONLY)
             try:

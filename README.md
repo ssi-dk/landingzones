@@ -77,6 +77,23 @@ State remains private to each executor. An intake request's `input_root` may use
 the configured alias; its user-supplied `source_path` still requires an absolute
 physical path.
 
+If a filesystem rejects atomic no-overwrite rename, a local destination can
+use a checked rename when all publishers share the same executor state
+directory and lock. Declare each such destination in `exclusive_local_destinations`.
+Entries use the same path resolution as local transfer-table endpoints.
+
+```yaml
+local_path_base: ..
+exclusive_local_destinations:
+  - data/output
+```
+
+Landing Zones tries atomic no-overwrite rename first. For a declared destination
+on a filesystem that rejects it, Landing Zones checks that the final name is
+free and renames the complete staged directory while holding the execution
+lock. Every publisher to that destination must honor the same lock. A conflict
+leaves the package staged for recovery. See the [publication contract](docs/adr/0004-independent-package-handoffs.md#publication-and-recovery).
+
 ## Quick Start
 
 ```bash

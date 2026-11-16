@@ -311,8 +311,11 @@ class Executor:
             return
         def clean():
             with adapter(step, self.settings) as transport, Source(step, self.settings) as source:
-                if not matches(transport.inspect(transport.stage_name(work['step_id'])), state['manifest'], step.verification):
+                stage = transport.stage_name(work['step_id'])
+                if not matches(transport.inspect(stage), state['manifest'], step.verification):
                     raise ValueError('Staging changed; cleanup refused')
+                if hasattr(transport, 'check_move_publication'):
+                    transport.check_move_publication(stage, payload)
                 source.remove(payload, state['manifest'])
                 work['cleaned'] = True
                 self.store.save(state)

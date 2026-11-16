@@ -101,6 +101,13 @@ def load_settings(config_file, *, resolve_credentials=True, validate_context=Tru
         if not base.is_dir():
             raise ValueError('local_path_base must name an existing directory')
         settings['local_path_base'] = str(base)
+    destinations = settings.get('exclusive_local_destinations', [])
+    if not isinstance(destinations, list):
+        raise ValueError('exclusive_local_destinations must be a list of local destination paths')
+    settings['exclusive_local_destinations'] = [
+        str(Path(resolve_local_endpoint(destination, settings.get('local_path_base'))))
+        for destination in destinations
+    ]
     for key in ('transfers_file', 'state_dir', 'event_spool'):
         value = Path(settings[key])
         settings[key] = str((path.parent / value).resolve()) if not value.is_absolute() else str(value)

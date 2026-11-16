@@ -1,5 +1,6 @@
 """Independent-center identity, retention and consumer handoff contracts."""
 import csv
+import errno
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ import yaml
 
 from landingzones.execution.engine import Executor
 from landingzones.execution.adapters import LocalAdapter
-from landingzones.execution import source as source_module
+from landingzones.execution import adapters, source as source_module
 from landingzones.execution.package import LABEL
 from landingzones.execution.storage import StateStore
 
@@ -127,6 +128,59 @@ def test_publication_failure_after_cleanup_recovers_on_discovery(setup, monkeypa
     result = executor.discover('a')
     assert result['results'][0]['status'] == 'completed'
     assert (root / 'a/run-123/data.txt').read_text() == 'accepted data'
+
+
+@pytest.mark.parametrize('previously_cleaned', [False, True])
+def test_exclusive_local_rename_recovers_unsupported_atomic_move(setup, monkeypatch, previously_cleaned):
+    root, payload, rows, write, config, request = setup
+    rows[0]['operation'] = 'move'
+    write()
+
+    def unsupported(source, destination):
+        raise OSError(errno.EINVAL, 'Invalid argument', str(destination))
+
+    monkeypatch.setattr(adapters, '_rename_noreplace', unsupported)
+    with monkeypatch.context() as previous_version:
+        if previously_cleaned:
+            previous_version.setattr(LocalAdapter, 'check_move_publication', lambda *args: None)
+        state = Executor(config).submit(request)
+
+    assert state['status'] == 'blocked'
+    assert payload.exists() == (not previously_cleaned)
+    assert step(state)['attempts'][-1]['phase'] == ('promotion' if previously_cleaned else 'cleanup')
+    stage = root / '.landingzones-staging-a' / step(state)['step_id']
+    assert (stage / 'data.txt').read_text() == 'accepted data'
+
+    settings = yaml.safe_load(config.read_text())
+    settings.update(local_path_base='.', exclusive_local_destinations=['a'])
+    config.write_text(yaml.safe_dump(settings))
+    executor = Executor(config)
+    completed = executor.submit(request)
+    assert completed['request_id'] == state['request_id']
+    assert completed['status'] == 'completed'
+    assert (root / 'a/run-123/data.txt').read_text() == 'accepted data'
+    assert not stage.exists() and not payload.exists()
+    assert sum(attempt['phase'] == 'transfer' for attempt in step(completed)['attempts']) == 1
+    assert executor.submit(request) == completed
+
+
+def test_checked_rename_preserves_a_destination_found_at_fallback(setup, monkeypatch):
+    root, payload, rows, write, config, request = setup
+    settings = yaml.safe_load(config.read_text())
+    settings['exclusive_local_destinations'] = [str(root / 'a')]
+    config.write_text(yaml.safe_dump(settings))
+
+    def unsupported(source, destination):
+        destination.mkdir()
+        raise OSError(errno.EINVAL, 'Invalid argument', str(destination))
+
+    monkeypatch.setattr(adapters, '_rename_noreplace', unsupported)
+    state = Executor(config).submit(request)
+    assert step(state)['status'] == 'parked'
+    assert 'Destination already exists' in step(state)['attempts'][-1]['error']
+    assert list((root / 'a/run-123').iterdir()) == []
+    assert (root / '.landingzones-staging-a' / step(state)['step_id'] / 'data.txt').is_file()
+    assert payload.is_dir()
 
 
 def test_independent_centers_preserve_identity_and_itinerary(setup):

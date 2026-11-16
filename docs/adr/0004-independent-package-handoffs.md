@@ -27,7 +27,7 @@ does not establish readiness or processing lineage.
 
 For local destinations, transfer into a private sibling staging directory,
 verify, durably record staging, finish required source cleanup, persist publication
-intent, and atomically rename without overwriting into the consumer's input.
+intent, and publish the staged directory with a rename into the consumer's input.
 Flush files and directories before cleanup. A failed rename retains staging even
 when the original has been removed. Consumers can immediately take the output;
 subsequent events and local bookkeeping do not inspect that published package.
@@ -38,9 +38,25 @@ executor ownership of staging and state: consumers, other executors and cleanup
 jobs must never remove stages. Manual deletion, state loss, filesystem rollback
 or violated ownership invalidate that inference and require operator recovery.
 This is not an exactly-once guarantee across arbitrary host/storage failure.
-Local storage must implement fsync and atomic non-overwriting rename; network
-filesystem durability must be established before using these paths for moves.
-The macOS and Linux rename implementations explicitly refuse existing targets.
+Local storage must support `fsync`. Establish network filesystem durability
+before using it for moves. The default publication path uses atomic
+non-overwriting rename on macOS and Linux. A local move checks publication
+support in private staging before removing the source.
+
+An execution configuration may list `exclusive_local_destinations` for storage
+that rejects atomic no-overwrite rename. For those destinations only, the
+executor can check that the final name is free and use a plain directory rename
+while holding its state-directory lock. All publishers must share that lock.
+An independent writer can still race the check, including one on another host
+or in another runtime. An existing destination leaves the package staged for
+operator recovery. Retained requests use the current policy for their stored
+physical destination and can resume publication after cleanup.
+
+**Future database coordination.** A shared database could let participating
+publishers claim the destination and final package name with a unique constraint.
+Retain the request and publication phase with the claim so another worker can
+recover an interrupted publication. Direct filesystem writers would still need
+to follow the same coordination rules.
 
 SFTP copies use the same stage/intent reconciliation for process interruptions,
 but SFTP persistence through server power loss is unverified. Remote-destination
