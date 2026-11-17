@@ -258,6 +258,16 @@ def parse_transfers_file(
         for index, row in enumerate(rows, start=1):
             row['identifiers'] = "transfer_{0:03d}".format(index)
 
+    # Executor ownership is explicit: never generate destructive shell scripts
+    # for Python copy/SFTP rows from a mixed authoritative table.
+    if require_runtime_files:
+        rows = [row for row in rows if row.get('executor', 'legacy') != 'python']
+        for row in rows:
+            if row.get('executor', 'legacy') not in ('', 'legacy'):
+                raise ValueError('Unknown transfer executor')
+            if row.get('operation', 'move') not in ('', 'move'):
+                raise ValueError('Legacy executor cannot implement explicit copy policy')
+
     ensure_runtime_id_column(rows, columns)
     validate_runtime_ids(rows)
 

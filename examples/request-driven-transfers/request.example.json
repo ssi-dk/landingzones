@@ -1,0 +1,6 @@
+{
+  "idempotency_key": "demo-package-123-analysis",
+  "payload_name": "run-123",
+  "connection": "analysis",
+  "itinerary": ["analysis", "analysis_publish"]
+}

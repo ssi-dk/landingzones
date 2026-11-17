@@ -28,14 +28,14 @@ jobs:
         uses: conda-incubator/setup-miniconda@v3
         with:
           auto-update-conda: true
-          python-version: '3.11'
+          python-version: '3.12'
           channels: conda-forge,defaults
           channel-priority: strict
 
       - name: Install conda-build
         shell: bash -el {0}
         run: |
-          conda install -y conda-build anaconda-client
+          conda install -y 'conda>=26.9.4' 'certifi>=2026.10.19' 'pip>=26.2.2' conda-build anaconda-client
 
       - name: Verify version
         id: version

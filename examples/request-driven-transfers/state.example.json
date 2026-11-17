@@ -1,0 +1,29 @@
+{
+  "description": "Schema-2 field guide, not a resumable state file",
+  "schema_version": 2,
+  "package_fields": [
+    "payload_id",
+    "payload_version",
+    "manifest",
+    "label"
+  ],
+  "connection_fields": [
+    "receipt_key",
+    "deliveries[0].steps[0].definition"
+  ],
+  "recovery_fields": [
+    "staged",
+    "cleaned",
+    "promotion_intent",
+    "status",
+    "attempts"
+  ],
+  "portable_label_fields": [
+    "schema_version",
+    "package_id",
+    "content_version",
+    "manifest",
+    "itinerary",
+    "history"
+  ]
+}

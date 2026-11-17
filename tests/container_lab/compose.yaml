@@ -11,6 +11,10 @@ x-node: &node
     timeout: 5s
     retries: 30
 services:
+  sftp-target:
+    <<: *node
+    hostname: sftp-target
+    environment: {LAB_ROLE: sftp-target}
   lab:
     <<: *node
     hostname: lab

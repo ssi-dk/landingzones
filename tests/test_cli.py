@@ -508,8 +508,10 @@ class TestOperatorCli:
             '--tag', 'lab',
         ]
 
-    def test_monitor_commands_route_ingestion_definition_sync_and_service(self, monkeypatch, capsys):
+    def test_monitor_commands_route_ingestion_definition_sync_and_service(self, monkeypatch, capsys, request):
         """Monitoring processes should receive resolved operator configuration."""
+        snapshot = cli.config.snapshot_state()
+        request.addfinalizer(lambda: cli.config.restore_state(snapshot))
         captured = {
             "ingest": [],
             "load_definitions": [],

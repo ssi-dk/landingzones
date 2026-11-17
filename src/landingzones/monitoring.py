@@ -25,6 +25,7 @@ from sqlalchemy.engine import make_url
 from landingzones.transfer_events import (
     EVENT_COLUMNS,
     EVENT_HEADER,
+    UnsupportedEventSchema,
     event_from_tsv_row,
     new_identifier,
     utc_now_text,
@@ -106,7 +107,7 @@ class UnsupportedDatabaseBackend(ValueError):
 
 
 class UnsupportedEventSpool(ValueError):
-    """Raised when a live spool is not the exact schema-version-1 format."""
+    """Raised when a live spool has an unsupported layout or event schema."""
 
 
 @dataclass(frozen=True)
@@ -156,7 +157,7 @@ def _read_spool_chunk(spool_path, checkpoint_offset):
             raise UnsupportedEventSpool("Event Spool header is not UTF-8")
         if header != EVENT_HEADER:
             raise UnsupportedEventSpool(
-                "unsupported Event Spool header; live ingestion requires schema version 1"
+                "unsupported Event Spool header; live ingestion requires schema version 1 or 2 columns"
             )
         header_offset = len(header_bytes)
         offset = checkpoint_offset or header_offset
@@ -247,6 +248,10 @@ def ingest_event_spool(database_url, spool_path, spool_id=None):
             else:
                 try:
                     event = event_from_tsv_row(line)
+                except UnsupportedEventSchema as exc:
+                    # Roll back this chunk and retain its checkpoint for an upgrade.
+                    # Unknown contracts are not malformed rows safe to discard.
+                    raise UnsupportedEventSpool(str(exc)) from exc
                 except (ValueError, csv.Error) as exc:
                     warning = (
                         "skipped malformed Event Spool row at line {0}, "
@@ -482,10 +487,14 @@ def _run_state(events, definitions_by_key, definitions):
     if latest["status"] == "failed":
         if latest["phase"] == "cleanup" and route_delivered:
             return "delivered with cleanup failed"
+        if latest["phase"] == "submission" and route_delivered:
+            return "delivered with submission failed"
         return "failed before delivery"
     if latest["status"] == "delivered":
         return "delivered with cleanup pending"
     if latest["status"] == "started":
+        if latest["phase"] == "submission" and route_delivered:
+            return "delivered with submission pending"
         return "in progress"
     if latest["status"] == "waiting":
         return "waiting"

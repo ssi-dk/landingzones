@@ -2,6 +2,98 @@
 
 Automated data transfer system using rsync with cron job generation.
 
+## Independent Python connections (feature branch)
+
+Python rows use `executor=python`, an explicit `adapter` and `operation`, and
+one connection per selected `flow_group`. Each execution context owns its local
+receipts and retries; a package's portable label links independent centers.
+No shared execution database or end-to-end request coordinator is required.
+Legacy generated-script routes remain available and are not silently migrated.
+
+`landingzones transfer preflight/run/status/resume` accepts one connection per
+request. `landingzones transfer discover --connection NAME` scans a configured
+input and resumes interrupted work; cron can call it directly. Requests and
+scans share admission, copy receipts and execution behavior. Python cron artifact
+creation is not automatic yet.
+
+Local copies/moves, local rsync, configured remote pulls through SFTP, rsync
+pushes and SFTP copies are supported. Remote-destination moves are rejected until
+an adapter can guarantee durable staging before source deletion. Local moves
+verify private staging, finish cleanup, then publish atomically. Consumers may
+immediately take published packages. The private staging root and local state
+must remain exclusively owned by their executor for recovery to be valid.
+
+Configuration uses `execution_schema_version: 1`; the revised local state uses
+schema 2 and rejects old request state rather than guessing a migration. Current
+portable labels, supported schema-0 equivalents and unlabelled input have explicit
+admission rules. Legacy archive bundles remain on the legacy executor.
+
+See the [connection examples and contract](examples/request-driven-transfers/README.md)
+and [handoff ADR](docs/adr/0004-independent-package-handoffs.md) for label formats,
+readiness, recovery assumptions and limitations. The
+[local lab](tests/container_lab/README.md) provides opt-in integration scenarios.
+
+[ENA transfers](docs/ena.md) support verified uploads and optional prepared Webin
+V2 metadata submission, with returned accessions in the local receipt. ENA is
+optional and adds no third-party dependency. SFTP uses one Paramiko backend,
+available through `landingzones[sftp]` and included in the Pixi environment and
+standalone bundle. Upgrade monitoring ingestors before enabling ENA submission
+events; the ENA guide describes the schema compatibility boundary.
+
+[Test each layer separately](docs/testing-transfers.md) to check the transport,
+adapter, request processing and account permissions independently. A disposable
+local SFTP lab needs no production credentials; live ENA checks can be deferred.
+
+[Validate runtime credentials](docs/credential-validation.md) before activation
+with `transfer validate-credentials`. It checks enabled connections through their
+configured transports and reports failures without moving payloads.
+
+### Local endpoint paths
+
+Set `local_path_base` to anchor local transfer-table endpoints independently of
+where the command is invoked. The base itself resolves relative to the directory
+containing the execution configuration. For `config/execution.yaml` inside an
+application runtime:
+
+```yaml
+local_path_base: ..
+transfers_file: transfers.tsv
+state_dir: ../state
+event_spool: ../log/events.tsv
+```
+
+A local connection can then use `source=data/input` and
+`destination=data/output`. Deployment creates those queue directories or symlinks.
+Landing Zones resolves configured local root aliases to physical absolute paths
+before overlap/shared-source checks and execution. Accepted work and Transfer
+Events retain those physical endpoints; changing a link cannot redirect an
+unfinished transfer. The configured transfer table keeps its readable logical
+paths. Existing absolute endpoints remain supported; relative endpoints require
+an explicit base. SSH/SFTP and ENA URLs retain their remote meaning.
+
+Links inside payloads remain rejected. Deployment must provision private sibling
+staging on the resolved destination's filesystem, rather than beside its alias.
+State remains private to each executor. An intake request's `input_root` may use
+the configured alias; its user-supplied `source_path` still requires an absolute
+physical path.
+
+If a filesystem rejects atomic no-overwrite rename, a local destination can
+use a checked rename when all publishers share the same executor state
+directory and lock. Declare each such destination in `exclusive_local_destinations`.
+Entries use the same path resolution as local transfer-table endpoints.
+
+```yaml
+local_path_base: ..
+exclusive_local_destinations:
+  - data/output
+```
+
+Landing Zones tries atomic no-overwrite rename first. For a declared destination
+on a filesystem that rejects it, Landing Zones checks that the final name is
+free and renames the complete staged directory while holding the execution
+lock. Every publisher to that destination must honor the same lock. A conflict
+leaves the package staged for recovery. See the [publication contract](docs/adr/0004-independent-package-handoffs.md#publication-and-recovery).
+
 ## Quick Start
 
 ```bash
@@ -310,6 +402,10 @@ For remote transfers, debug output should show `startup delay ...` before
 
 ## Installation
 
+Use Python 3.12+ and pip 26.2.2+. For an existing installer, follow the
+[Python security advisory's verified bootstrap](https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576)
+before downloading packages.
+
 ```bash
 # Development mode
 pip install -e ".[report]"
@@ -321,11 +417,13 @@ pip install -e ".[test]"
 pip install .
 ```
 
-### Lab Sequencer Bundle
+### Standalone Controller Bundle
 
-For lab machines where a managed Python environment is awkward, build a
-relocatable bundle using a `python-build-standalone` runtime. Build it on a
-machine that matches the lab sequencer OS, architecture, and libc family.
+Landing Zones requires Python 3.12 or newer. Transfers execute on the central
+controller; the Python versions on sequencing instruments no longer constrain
+this application. A relocatable `python-build-standalone` bundle provides its
+own runtime. Build it on a machine matching the execution controller's OS,
+architecture, and libc family.
 
 Download or provide a python-build-standalone `install_only` archive, then run:
 
@@ -348,32 +446,50 @@ cd app
 pixi run build-standalone
 ```
 
-Build the lab Linux artifact on Linux. A bundle built on macOS contains a macOS
-Python runtime and will fail on the sequencer with `cannot execute binary file`.
-Before copying a tarball to the lab host, verify the bundled runtime:
+Build the Linux artifact on Linux. A bundle built on macOS contains a macOS
+Python runtime and will fail on Linux with `cannot execute binary file`.
+Before installing a tarball on the controller, verify the bundled runtime:
 
 ```bash
 file packaging/dist/landingzones-standalone/python/bin/python3
 packaging/dist/landingzones-standalone/python/bin/python3 -c "import platform; print(platform.system(), platform.machine())"
 ```
 
-Expected for the current lab machines is Linux/x86_64.
+Select the architecture of the execution controller, independently of the instruments.
 
-The standalone bundle installs the core operator CLI without pandas, so it is
-intended for `build`, `validate`, and `deploy` on locked-down lab machines.
+The standalone bundle includes the operator CLI, the Paramiko SFTP backend,
+and ENA upload/submission support. ENA is activated only by configured ENA
+routes; other routes do not need ENA credentials. It excludes pandas, so it is
+intended for runtime execution, `build`, `validate`, and `deploy` on the controller.
 `landingzones report transfers` remains a reporting extra and should run from
 an environment with `landingzones[report]` installed.
 
 The same bundle can be produced by the GitHub Actions workflow
-`Build Standalone Bundle`. Run it manually from Actions, or push a `v*` tag.
-It uploads `landingzones-standalone-linux-x86_64` containing:
+`Build Standalone Bundle`. Run it manually from Actions, or push a `v*` or
+`test-*` tag. It builds the exact commit selected by GitHub and uploads
+`landingzones-standalone-linux-<architecture>-<commit>`. Stable `v*` tags keep
+building Linux/x86_64. Test tags build both Linux/x86_64 and Linux/aarch64 on
+matching GitHub runners; one publication job waits for both builds before
+publishing their assets. Each architecture provides:
 
 ```text
-landingzones-standalone-linux-x86_64.tar.gz
+landingzones-standalone-linux-<architecture>.tar.gz
+landingzones-standalone-linux-<architecture>.tar.gz.manifest.json
+landingzones-standalone-linux-<architecture>.tar.gz.sha256
 ```
 
 For `v*` tags, the workflow also creates or updates the matching GitHub Release
-and uploads `landingzones-standalone-linux-x86_64.tar.gz` as a release asset.
+and uploads the tarball, manifest and checksum as release assets.
+
+For a feature candidate, point a tag such as `test-request-driven-transfers-001`
+at the reviewed feature commit and push that tag. The same build publishes the
+same asset names to a GitHub prerelease, explicitly excluded from Latest. The
+tag selects a fixed commit; later changes to the feature branch do not move it.
+Use a new test tag for another candidate. Test tags do not trigger the existing
+PyPI or Conda publication workflows, which remain restricted to `v*` tags.
+The CLI still reports the application version; the manifest's source commit
+and archive digest distinguish test builds. Before promotion, pin and validate
+the published artifact itself through the paired test environments.
 
 To release a version, update `src/landingzones/__init__.py` and `pixi.toml`
 to the same version and merge the changes into `main`. Tag that commit with
@@ -382,17 +498,50 @@ that tag, verifies the bundle CLI, and publishes the matching release asset.
 A version bump on `main` alone does not create a tag or release.
 
 For recovery or rebuilds, manually dispatch `Build Standalone Bundle` against
-the version tag. This replaces the existing standalone release asset. A manual
-run against a branch uploads an Actions artifact only.
+a `v*` or `test-*` tag. This replaces that tag's standalone assets; test tags
+remain prereleases and never become Latest. Rebuilt bytes require a new reviewed
+digest and repeat acceptance. A manual run against a branch uploads an Actions
+artifact only and lets you select `x86_64` (the default) or `aarch64`. Tag
+runs always use their predefined platform set. Choose the artifact matching the
+local test runtime; each architecture has its own digest and validation evidence.
 
 The bundle is written to:
 
 ```text
 app/packaging/dist/landingzones-standalone/
 app/packaging/dist/landingzones-standalone.tar.gz
+app/packaging/dist/landingzones-standalone.tar.gz.manifest.json
+app/packaging/dist/landingzones-standalone.tar.gz.sha256
 ```
 
-Copy the tarball to the lab machine, extract it, and run it like the normal CLI:
+For a local candidate that can later be tested from a published artifact, select
+an exact committed source revision:
+
+```bash
+pixi run build-standalone --source-revision "$(git rev-parse HEAD)"
+```
+
+The builder packages a fresh `git archive` of that commit. Uncommitted source
+changes are excluded. Without `--source-revision`, the builder packages the local
+working tree for standalone installation testing; its manifest identifies it as
+`local-working-tree`, which deployment consumers must not promote to servers.
+`--archive-name` can set a platform-specific tarball basename without changing
+the bundle directory layout.
+
+Each archive contains `bundle.json` with schema version `1`, application/version,
+full source revision, source kind, OS/architecture, Python version, capabilities,
+and the resolved package versions. GitHub Actions builds additionally record
+`publication` with the producing repository, run ID/attempt and run URL; local
+builds omit it. The adjacent manifest repeats these fields
+and adds `archive.filename`, `archive.sha256`, `archive.root` and
+`archive.launcher`. The SHA-256 file uses the standard `sha256sum --check` format.
+The manifest and digest identify the built bytes: rebuilding a commit can resolve
+different dependencies, so promotion must reuse the tested archive and pin its
+digest as well as its commit. Consumers should verify the digest, platform and
+embedded provenance before activation. GitHub Actions artifacts have retention
+limits; retain the tested candidate or publish it as a release before its expiry.
+
+Install the tarball on the execution controller, extract it, and run it like the normal CLI:
 
 ```bash
 ./landingzones --config config/config.yaml build
@@ -400,7 +549,12 @@ Copy the tarball to the lab machine, extract it, and run it like the normal CLI:
 ```
 
 For offline builds, pass `--wheelhouse /path/to/wheels` so dependencies are
-installed from local wheels. The legacy shell wrapper still works:
+installed from local wheels. If the supplied runtime has pip older than 26.2.2,
+include `pip-26.2.2-py3-none-any.whl` in that wheelhouse. The builder verifies
+the SHA-256 from the
+[Python security advisory](https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576)
+before installing it; an offline build never downloads the bootstrap wheel.
+The legacy shell wrapper still works:
 
 ```bash
 ./scripts/build_python_standalone_bundle.sh --python-archive /path/to/cpython-*-install_only.tar.*
@@ -621,7 +775,7 @@ landingzones --help
 
 ## Requirements
 
-- Python >= 3.8
+- Python >= 3.12
 - PyYAML >= 5.0.0
 - pandas >= 1.0.0 only for `landingzones report transfers` / `landingzones[report]`
 - SQLAlchemy >= 2.0,<3 for schema-version-1 SQLite monitoring

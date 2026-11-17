@@ -10,17 +10,21 @@ This project is managed with Pixi. Prefer the commands already defined in
 
 ## Agent skills
 
-### Issue tracker
+### Task tracking
 
-GitHub issues in `ssi-dk/landingzones`; keep issues public-safe and link
-private deploy details from the relevant deploy repo. See
-`docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Use the default triage label vocabulary. See `docs/agents/triage-labels.md`.
+Read [shared workflow](docs/agents/shared-workflow.md) first, then
+[repository tracker settings](docs/agents/issue-tracker.md). Both wiki and
+GitHub are supported. Triage labels apply to GitHub-owned tasks only; see
+`docs/agents/triage-labels.md` when using that tracker.
 
 ### Domain docs
 
 Single-context repo with `CONTEXT.md` and `docs/adr/` at the repo root. See
 `docs/agents/domain.md`.
+
+## Shared workflow
+
+Before routing work, read [Shared Repository Workflow](docs/agents/shared-workflow.md)
+for preferences, wiki/GitHub tracking, authorship, and execution boundaries.
+Read [repository tracker settings](docs/agents/issue-tracker.md) for local mappings.
+The shared file is wiki-owned and hardlinked here; see [the link contract](docs/HARDLINKS.md).
