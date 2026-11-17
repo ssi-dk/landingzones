@@ -63,7 +63,11 @@ def resolve_local_endpoint(value, base=None):
             raise ValueError('Relative local endpoints require local_path_base')
         path = Path(base) / path
     try:
-        resolved = path.resolve()
+        try:
+            resolved = path.resolve(strict=True)
+        except (FileNotFoundError, NotADirectoryError):
+            # Keep unresolved tails for the caller's existence checks.
+            resolved = path.resolve()
         local_root(str(resolved))
     except (OSError, RuntimeError) as exc:
         raise ValueError('Configured local endpoint cannot be resolved') from exc
