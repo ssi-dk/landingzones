@@ -52,11 +52,22 @@ are in `docs/agents/issue-tracker.md` when present.
 
 ## Wiki tracking — default
 
+Before editing a wiki note, check its frontmatter. `document_status: Archived`
+(including lowercase `archived`) prohibits changes to the whole file, including
+metadata, formatting and appended updates, unless the user explicitly requests
+editing or unarchiving that particular record. Done task records are also
+read-only by default. This is an agent instruction, not a filesystem or editor
+lock. Put later work in an active task or current runbook and link the historical
+record; a stale owning-task pointer does not authorize changing it.
+
 Paths here are relative to the wiki root:
 
 - Product work: `20_Products/<Product>/Tasks/`.
-- Work without a product owner: `40_Tasks/Current/`.
-- Server instructions and execution evidence: `40_Tasks/Deployment Handoffs/`.
+- Work without a product owner: `40_Tasks/Records/`.
+- Operator runbooks and playbooks, including reusable procedures and dated
+  execution/evidence records: under `40_Tasks/Records/`. Keep the canonical
+  runbook in the wiki; repositories link to it and retain implementation,
+  inventories and technical reference.
 
 Use the repository's product mapping when supplied; otherwise inspect the wiki
 for an appropriate owner. Keep task paths stable and update status. The wiki
@@ -109,6 +120,63 @@ instruction to create GitHub issues when wiki tracking is selected.
 
 ## Deployment architecture default
 
+Server deployments enter through a named `rit-ansible-*` flow. The flow owns
+server `prod`/`test` inventories, their `docker_prod`/`docker_test` rehearsals,
+operational payloads, runtime identity and service ordering. Product
+`rit-deploy-*` repositories provide reusable installation/lifecycle entrypoints
+and local software development/testing inventories; flows call those entrypoints
+through explicit pinned dependencies. A flow may operate a single product.
+Existing repository names can remain during transition; broader renaming is
+lower priority and must not trigger an implicit migration of unrelated workflows.
+
+Deployment runbooks use each machine's configured Ansible deployment account
+without a username-selection prompt. Application tasks become the runtime user
+declared in configuration. Root-required tasks use the deployment account's
+approved sudo; runtime accounts do not gain root rights. Keep those identities
+separate and validate existing access before application mutation.
+
+Each Ansible flow and reusable product playbook documents its scope in the
+associated README and links a separate `docs/<flow>-inputs-and-flow.md`. State owned
+work, external prerequisites/setup owners, execution identity/privileges and
+results. List independently invoked entrypoints when they share a page. Include
+an input table and a simple Mermaid flow diagram: amber for supplied inputs and
+setup requirements, blue for owned work, purple for external/admin handoffs,
+with a legend and text labels. Keep current behavior and pending corrections
+distinct. Mirror both pages through the repository's documentation hardlink
+contract. Missing prerequisites stop dependent work and identify the owning
+setup procedure; they do not expand a consuming flow's scope.
+
+Keep `test` and `prod` on the same lifecycle playbooks, product roles,
+configuration schema and path-building rules. Declare environment differences
+as configuration: runtime identity/directory, source and recipient bindings,
+routes and policies, ports, credentials, product pins, and service/schedule
+capabilities. Shared capabilities may execute different tasks when enabled;
+a disabled capability has not been exercised. Keep fixture provisioning and
+data seeding in explicit preparation, and retain isolation and privilege guards.
+Use the shared lifecycle rather than separate test and production installers.
+
+Keep concrete hosts, accounts, source identities, runtime locations and physical
+data paths in deployment configuration. Shared code enforces structural rules
+against those supplied values, including path containment and declared source
+membership. Fixed synthetic values can belong to a fixture definition or its
+specific acceptance checks; keep them out of shared lifecycle validation.
+
+Pair `docker_test` with `test` and `docker_prod` with `prod`. Docker preparation
+recreates the selected target-visible runtime layout, logical endpoint roles,
+runtime-relative aliases and symlink target paths; data at those targets may
+differ. Docker host storage/mount sources, transport, network addresses/ports
+and credentials are explicit bindings. After preparation, use the same selected
+application configuration and lifecycle. Preserve processing rules, mapping,
+QC/view configuration and protocol path/query contracts when substituting
+endpoints. Record unavoidable platform or binding exceptions. Review Docker/server
+parity and test/production configuration differences separately, including
+production capabilities not exercised by the test configuration.
+
+For flows with all four inventories, rehearse `docker_test`, obtain operator
+acceptance in server `test`, rehearse production configuration in `docker_prod`,
+then perform user-operated `prod` cutover and acceptance. Carry the reviewed
+candidate forward and record checks for the changed configuration/capabilities.
+
 Assign the process owner before selecting implementation files. App repositories
 own software behavior, data formats, supported interfaces, packaging and tests.
 Deploy repositories own installation, runtime configuration, data preparation,
@@ -130,6 +198,26 @@ health checks, privilege requirements, and recovery. Use explicit dependencies
 on another deploy repository's common entrypoint when sharing a workflow;
 keep the shared workflow with its owner rather than duplicating its code.
 
+New managed process runtimes use `<process>_<environment>` in lower snake case,
+for example `webservices_prod`, `lab_machines_prod` and `data_movement_test`.
+The process name normalizes repository hyphens to underscores. Target machine,
+SSH account and product names are separate configuration fields. Each machine
+can have its own `lab_machines_prod` runtime; its endpoint distinguishes it from
+the same logical process runtime on another machine. Instrument/source IDs stay
+in inventory and evidence, not automatically in the process runtime name.
+Only use an explicit instance qualifier when multiple independently operated
+instances of the same process/environment share an endpoint.
+
+Declare logical `runtime_id` and physical `runtime_directory` independently in
+configuration, even when their default strings match. Resolve
+`<managed_root>/runtimes/<runtime_directory>` once and pass product destinations
+under that root. Changing an account or target binding must not derive a new
+runtime directory. Docker uses the same logical names with isolated target/storage
+bindings. Existing installed names are migration references or explicit legacy
+bindings; changing configuration never moves their data, transfers state or
+activates a replacement. A reviewed cutover must quiesce prior writers and verify
+the new runtime before switching services or schedules.
+
 Each deployment configuration declares its target's writable installation base
 and named runtime directory separately from logical runtime identity. Resolve
 the runtime root once and pass it explicitly through the owning lifecycle
@@ -146,6 +234,33 @@ directory or path base. Declare local external input/output bindings as symlinks
 inside the runtime; application config refers to those aliases. The owning
 deployment prepares and journals them without implicitly moving external data.
 
+Keep disposable fixtures invented solely for a standalone component test under
+that test runtime's `fixtures/`, with `data/` aliases pointing into it. Their
+source queues, intermediate queues and recipient data share the owning runtime's
+explicit reset/removal lifecycle; a separate top-level test-data tree is not the
+default. Independent producer output and shared queues/datasets keep their own
+owner, bindings and retention policy. Shared host fixtures and infrastructure
+storage belong to their infrastructure owner and survive consumer reset.
+Operational controller temporary work belongs inside its associated runtime
+alongside its environment, sources, cache, credentials, state, logs and evidence.
+
+SSH/SFTP connections and authorization belong to user accounts. A server
+runtime consumes existing account access through explicitly configured key and
+trusted-host paths. It may validate permissions, trust and connectivity, but
+ordinary installation, verification and removal must not generate keys, copy
+account key/trust files into the runtime, enroll/revoke account authorization or
+change account trust. Setting up or changing account access is a separate task.
+Keep only references and access-check outcomes in runtime config/evidence.
+Local synthetic Docker keys and grants remain part of explicit infrastructure
+fixture preparation; they do not authorize changing real server account access.
+
+Systemd units, crontab blocks and Docker resources use their required host/account
+locations. Keep exact ownership and cleanup receipts in the owning runtime;
+stop/drain callers and unregister only those resources before deleting that
+runtime and its receipts. Preserve existing account SSH/SFTP access, peer runtimes
+and shared resources. Removing a directory does not unregister services or
+change account access. Account-access changes remain separately owned.
+
 Equivalent core config and alias bindings should support another named runtime
 with independent state, logs and recovery records. Document active selection,
 verify the candidate, and reconcile in-flight work and writer ownership before
@@ -154,9 +269,80 @@ consumers; compatible target artifacts, permissions, credentials and external
 services remain required. For each dependency that still references a structure
 outside the runtime directly, document its owner, purpose, binding and why it is
 not represented by an internal alias. This includes protocol-bound remote paths,
-host services, controller source/audit storage and separate durable backups where
-applicable.
+host services, existing account-owned SSH/SFTP key and trust files, independently
+owned read-only bootstrap sources and separate durable backups where applicable.
+Process-owned controller sources, caches and
+audits remain inside the associated runtime.
 Keep concrete layout and exception details in the owning deploy's docs.
+
+### Shared hosts and runtime ownership
+
+Flows targeting one host share its declared host identity, filesystem, accounts
+and infrastructure preparation. Matching Docker rehearsals use one reusable
+host fixture and the same common structure. A fresh isolated scenario may use
+another instance of that host baseline; selecting a different flow must not
+silently select a different filesystem model of the same host.
+
+Each flow remains independently runnable and owns a separate runtime below the
+host's managed root. Contain its deployment-owned controller environments,
+reviewed workspaces, artifact caches, configuration, credentials, locks, state,
+logs, evidence and recovery material in that runtime as well as its target
+programs. Shared host prerequisites and account/service changes have one
+explicit infrastructure owner and declared exceptions; another flow must not
+replace or reset them. A per-flow install or cleanup must preserve other runtimes.
+
+Declare the operator-visible managed root and any physical backing/alias
+bindings explicitly. Reproduce approved root symlinks in Docker and validate
+resolved containment at that declared boundary. Continue refusing unexpected
+symlink escapes below it. Do not require an unrelated fixture-specific storage
+root for controller state or silently migrate existing data when paths change.
+
+Treat linked input/output folders as declared resources: record their owner,
+allowed readers/writers, copy/move/delete policy, readiness and caller holds.
+Runtime cleanup removes only its owned links and state by default; following a
+link to clear external/shared data requires that resource's explicit operation.
+Reconcile writers and requests before changing or retiring a binding.
+
+Verify each flow alone from a clean common host baseline, then supported
+co-installation orders and stable reapply without damage to another runtime.
+Keep source/dependency workspaces and locks scoped to their owning runtime;
+coordinate shared host/resource mutations separately. A combined acceptance
+must exercise the actual producer-to-consumer handoff through declared links
+and transports; separately seeded queues do not establish that integration.
+
+An external approved source checkout may supply read-only bootstrap code and
+reviewed inputs. Prepare and run the operational controller workspace and its
+mutable caches, temporary files, Git configuration and audit state inside the
+flow runtime. Existing account SSH services and independently trusted bootstrap
+authentication may be declared host inputs; avoid silently changing their trust
+or another flow's source selections. Runtime separation expresses lifecycle
+ownership; document the effective account permissions without claiming an OS
+sandbox or a queue-confined credential when those are not enforced.
+
+### Quick local startup and disposable runtimes
+
+Normal Docker startup checks the selected owned runtime and a compact successful
+source/configuration/program fingerprint. If current, reuse its environment,
+workspace and caches; resume the selected services, reconcile declared links
+and run small smoke checks. If stale, update only that flow in place by default.
+An explicit Docker reset can rebuild an incompatible or deliberately fresh
+runtime. A fingerprint match is a reuse decision, not a full drift audit.
+
+Keep install/reapply, independent-baseline matrices, both installation orders,
+full integrity checks, generated data and comprehensive handoff acceptance as
+explicit opt-in operations. They are appropriate for initial validation or a
+changed capability, not prerequisites for every image start or status query.
+Record the successful desired-state receipt only after convergence succeeds;
+exclude secrets, transient operation IDs and exported evidence destinations.
+
+Contain the material needed to manage and disable a flow in its runtime. Host
+service registrations may be declared links or minimal host-owned facilities.
+Before removing a runtime, stop its services and unregister its owned service
+entries/access grants. Remove only the claimed runtime; never follow its data
+symlinks, remove a peer runtime or stop a shared host as incidental cleanup.
+Keep linked input/output data under its separately declared resource lifecycle.
+Report dependent-resource effects explicitly. Disposable Docker reset is not
+an authorization to erase server runtime state or bypass migration/recovery.
 
 For user-operated deployment controllers, assume the team workspace layout
 with an existing `automation/` checkout, `apps/` and `deploys/` base folders,
@@ -175,11 +361,36 @@ in the deploy project. Prefer explicit service commands and managed environment
 settings; avoid reliance on interactive or login-shell profiles.
 
 Use GitHub repositories for maintained source and reviewed deployment inputs.
+Product delivery and DevOps deployment are separate flows. Developers own
+software changes, packaging, candidate publication and product acceptance;
+they do not run DevOps Ansible scripts as part of product delivery. Products
+provide a stable, tested install/update and runtime contract so ordinary
+software releases work with the existing deployment playbooks. Product-specific
+upgrade behavior belongs behind maintained product interfaces; DevOps consumes
+them rather than repairing packages, resolving application dependencies or
+implementing release-specific software update logic. Deploy repositories retain
+installation and operational lifecycle ownership. Coordinate intentional
+changes to the product/deployment contract explicitly.
+
+For products, publish a uniquely identified candidate artifact with checksums
+and provenance. Validate those published bytes through the product release
+flow, then add the final version tag/label to the existing accepted
+release/artifact. The version tag points to the same reviewed source commit;
+each platform's artifact checksum remains unchanged. Promotion reuses the
+accepted assets without rebuilding, repackaging or overwriting them. Preserve
+the mapping from candidate to version, actual embedded package version and
+product acceptance evidence; a changed program or embedded version requires a
+new candidate and acceptance. App-owned release workflows implement explicit
+promotion without a tag-triggered replacement build. Consuming deploy flows pin
+the exact source, platform and digest; their environment-specific acceptance is
+separate from product release acceptance.
+
 Program release artifacts contain programs plus integrity/provenance sidecars;
 keep runtime backups and credentials in approved private storage. The deployment
-machine retrieves verified artifacts or invokes maintained builds from pinned
-source. Do not introduce a manually transferred source ZIP, Git bundle or dated
-handoff helper as an installation prerequisite.
+machine retrieves verified program artifacts. Explicitly supported source-build
+paths are context-specific workflows rather than a routine deployment
+requirement. Do not introduce a manually transferred source ZIP, Git bundle or
+dated handoff helper as an installation prerequisite.
 
 Extend the existing installer and keep restore as a separate recovery entrypoint.
 A coordinating deploy prepares minimal shared prerequisites and invokes each
