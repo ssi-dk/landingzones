@@ -346,7 +346,7 @@ an authorization to erase server runtime state or bypass migration/recovery.
 
 For user-operated deployment controllers, assume the team workspace layout
 with an existing `automation/` checkout, `apps/` and `deploys/` base folders,
-and a `Wiki/` checkout available for documentation links. Use workspace-relative
+and a `wiki/` checkout available for documentation links. Use workspace-relative
 paths; do not embed a developer's personal checkout location. Other application
 and deploy repositories may be missing or stale. Include dependency preparation
 that clones missing repositories, fetches existing ones, verifies required
