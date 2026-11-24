@@ -29,11 +29,17 @@ class Step:
     max_attempts: int = 3
     admission_policy: str = 'strict'
     publication_group: str = ''
+    publication_directory_mode: str = ''
+
+    def publication_mode_for(self, directory):
+        return int(self.publication_directory_mode or '0770', 8) if directory else 0o660
 
     def record(self):
         value = asdict(self)
         if not self.publication_group:
             del value['publication_group']
+        if not self.publication_directory_mode:
+            del value['publication_directory_mode']
         return value
 
 
@@ -172,6 +178,9 @@ def load_steps(settings, *, validate_credentials=True):
                 raise ValueError('Only destination_exists=fail is supported')
             if step.admission_policy not in ('strict', 'relabel'):
                 raise ValueError('Unsupported admission policy')
+            if step.publication_directory_mode and (not step.publication_group or
+                                                    step.publication_directory_mode not in ('0770', '2770')):
+                raise ValueError('publication_directory_mode requires a publication group and mode 0770 or 2770')
             if step.readiness_policy not in ('producer_marker', 'managed_ready'):
                 raise ValueError('Unsupported readiness policy; archive routes must remain legacy')
             if step.publication_group and (step.adapter not in ('local', 'rsync', 'sftp') or step.destination.startswith('ssh://')

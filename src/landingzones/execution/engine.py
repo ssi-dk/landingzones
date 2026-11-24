@@ -69,7 +69,7 @@ class Executor:
             if source != Path(step.source) / payload:
                 intake_step = replace(step, identifiers='intake:' + step.identifiers, source=str(source.parent), destination=step.source,
                                       adapter='local', operation=intake['operation'], readiness_policy='producer_marker',
-                                      publication_group='')
+                                      publication_group='', publication_directory_mode='')
                 admission_step = intake_step
         for work in ([intake_step] if intake_step else []) + [step]:
             if not work.source.startswith(('ssh://', 'sftp://')) and not work.destination.startswith(('ssh://', 'sftp://', 'ena://')):
@@ -94,6 +94,11 @@ class Executor:
         identity = previous.get('package_id') if isinstance(previous, dict) and previous.get('content_version') == label['content_version'] else None
         receipt_parts = [step.runtime_id, step.identifiers, step.source, step.destination, step.operation,
                          identity, label['content_version'], payload]
+        # Retained copies already delivered by an ungrouped route must not be
+        # submitted again just because new deliveries now inherit a group.
+        previous_copy_key = None
+        if step.operation == 'copy' and step.publication_directory_mode and not adapter_request:
+            previous_copy_key = json.dumps(receipt_parts, sort_keys=True)
         if step.publication_group:
             receipt_parts.append({'publication_group': step.publication_group})
         # Preserve existing receipt identities for routes without external submissions.
@@ -101,7 +106,8 @@ class Executor:
             receipt_parts.append(adapter_request)
         receipt_key = json.dumps(receipt_parts, sort_keys=True)
         return {'payload_name': payload, 'manifest': contents, 'label': label,
-                'receipt_key': receipt_key, 'connection': step.record(), 'adapter_request': adapter_request,
+                'receipt_key': receipt_key, 'previous_copy_key': previous_copy_key,
+                'connection': step.record(), 'adapter_request': adapter_request,
                 'intake': intake_step.record() if intake_step else None}
 
     def submit(self, request):
@@ -120,7 +126,9 @@ class Executor:
                 plan = self.preflight(request)
                 for path in self.store.root.glob('*.json'):
                     existing = json.loads(path.read_text())
-                    if existing.get('receipt_key') == plan['receipt_key']:
+                    previous_copy = (plan['previous_copy_key'] is not None and existing.get('status') == 'completed'
+                                     and existing.get('receipt_key') == plan['previous_copy_key'])
+                    if previous_copy or existing.get('receipt_key') == plan['receipt_key']:
                         self._validate_state(existing)
                         return self._execute(existing)
                 def work(definition):

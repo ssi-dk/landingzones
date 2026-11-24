@@ -72,11 +72,13 @@ def test_copy_receipt_retains_source_and_deduplicates_other_callers(setup):
     assert executor.discover('a')['results'][0]['request_id'] == state['request_id']
 
 
-def test_ready_on_discovery_publishes_the_configured_group_before_handoff(setup):
+@pytest.mark.parametrize('directory_mode', ['', '2770'])
+def test_ready_on_discovery_publishes_the_configured_group_before_handoff(setup, directory_mode):
     root, payload, rows, write, config, _ = setup
     (payload / '.ready').unlink()
     group = grp.getgrgid(os.getegid())
-    rows[0].update(operation='move', readiness_policy='managed_ready', publication_group=group.gr_name)
+    rows[0].update(operation='move', readiness_policy='managed_ready', publication_group=group.gr_name,
+                   publication_directory_mode=directory_mode)
     write()
     executor = Executor(config)
     result, = executor.discover('a')['results']
@@ -86,7 +88,7 @@ def test_ready_on_discovery_publishes_the_configured_group_before_handoff(setup)
     assert (published / 'data.txt').read_text() == 'accepted data'
     for path in (published, *published.rglob('*')):
         assert path.stat().st_gid == group.gr_gid
-        assert stat.S_IMODE(path.stat().st_mode) == (0o770 if path.is_dir() else 0o660)
+        assert stat.S_IMODE(path.stat().st_mode) == (int(directory_mode or '0770', 8) if path.is_dir() else 0o660)
     assert (published / LABEL).is_file()
     assert executor.discover('a')['results'] == []
 
@@ -439,6 +441,36 @@ def openssh_pipe(monkeypatch):
     monkeypatch.setattr(SFTPAdapter, '__exit__', lambda self, *args: self.stack.close())
 
 
+def test_sftp_copy_publishes_inheritable_directories_and_keeps_source(setup, openssh_pipe):
+    root, payload, rows, write, config, request = setup
+    gid = (root / 'a').stat().st_gid
+    (payload / 'empty-directory' / 'nested.txt').write_text('nested')
+    rows[0].update(destination='sftp://receiver@example.invalid' + str(root / 'a'),
+                   adapter='sftp', credential_ref='test', publication_group=grp.getgrgid(gid).gr_name,
+                   publication_directory_mode='2770')
+    write()
+    credentials(config)
+    assert Executor(config).submit(request)['status'] == 'completed'
+    published = root / 'a' / payload.name
+    for path in (published, *published.rglob('*')):
+        assert path.stat().st_gid == gid
+        assert stat.S_IMODE(path.stat().st_mode) == (0o2770 if path.is_dir() else 0o660)
+    assert payload.is_dir()
+    assert stat.S_IMODE((root / '.landingzones-staging-a').stat().st_mode) & 0o077 == 0
+
+
+def test_inheritance_upgrade_preserves_receipts_for_collected_copies(setup):
+    root, payload, rows, write, config, _ = setup
+    first, = Executor(config).discover('a')['results']
+    assert first['status'] == 'completed'
+    shutil.rmtree(root / 'a' / payload.name)
+    rows[0].update(publication_group=grp.getgrgid(os.getegid()).gr_name, publication_directory_mode='2770')
+    write()
+    repeat, = Executor(config).discover('a')['results']
+    assert repeat['request_id'] == first['request_id']
+    assert not (root / 'a' / payload.name).exists()
+
+
 @pytest.mark.parametrize('fault', ['none', 'wrong_group', 'sync_failed', 'lost_rename_reply', 'lost_and_collected'])
 def test_remote_move_receipt_precedes_source_cleanup(setup, openssh_pipe, monkeypatch, fault):
     root, payload, rows, write, config, request = setup
@@ -446,7 +478,8 @@ def test_remote_move_receipt_precedes_source_cleanup(setup, openssh_pipe, monkey
     group = grp.getgrgid(gid).gr_name
     rows[0].update(destination='sftp://receiver@example.invalid' + str(root / 'a'),
                    adapter='sftp', operation='move', credential_ref='test',
-                   publication_group='missing-group' if fault == 'wrong_group' else group)
+                   publication_group='missing-group' if fault == 'wrong_group' else group,
+                   publication_directory_mode='2770')
     write()
     credentials(config)
     published = root / 'a' / payload.name
@@ -477,7 +510,7 @@ def test_remote_move_receipt_precedes_source_cleanup(setup, openssh_pipe, monkey
         return
     assert result['status'] == 'completed' and not payload.exists()
     assert (published / 'data.txt').read_text() == 'accepted data'
-    assert all(p.stat().st_gid == gid and stat.S_IMODE(p.stat().st_mode) == (0o770 if p.is_dir() else 0o660)
+    assert all(p.stat().st_gid == gid and stat.S_IMODE(p.stat().st_mode) == (0o2770 if p.is_dir() else 0o660)
                for p in (published, *published.rglob('*')))
     assert step(result)['published'] and step(result)['cleaned']
 

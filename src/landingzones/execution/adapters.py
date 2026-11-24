@@ -160,7 +160,7 @@ class LocalAdapter:
                 before = os.fstat(fd)
                 if not (stat.S_ISDIR(before.st_mode) if directory else stat.S_ISREG(before.st_mode)):
                     raise ValueError('Unexpected publication entry type')
-                mode = 0o770 if directory else 0o660
+                mode = self.step.publication_mode_for(directory)
                 group_changed = before.st_gid != self.publication_gid
                 if group_changed:
                     os.fchown(fd, -1, self.publication_gid)
@@ -431,7 +431,7 @@ class SFTPAdapter:
                 raise ValueError('Unexpected staged SFTP entry type')
             with self.sftp.open(path, 'rb') as handle:
                 if gid is not None:
-                    mode = 0o770 if directory else 0o660
+                    mode = self.step.publication_mode_for(directory)
                     if attrs.st_gid != gid:
                         handle.chown(attrs.st_uid, gid)
                     handle.chmod(mode)

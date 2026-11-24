@@ -107,6 +107,10 @@ connection with a local destination can set `publication_group` in its transfer
 table. The executor applies the group and modes `0770` for directories and
 `0660` for files, including the package label, inside private staging. A failure
 blocks source cleanup. The execution account must be able to assign the group.
+A local or SFTP handoff with a configured group can set the optional TSV
+column `publication_directory_mode` to `2770`. The executor verifies setgid on
+the package root and nested directories before publication. Regular files,
+including the transfer label, use `0660`; the sibling staging root stays private.
 Discovery is callable from cron; automatic Python cron generation remains
 out of scope. Each configured connection must have one authoritative local store.
 Remote accounts require SFTP access, and rsync push additionally requires rsync/SSH.
