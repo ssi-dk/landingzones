@@ -28,9 +28,13 @@ class Step:
     readiness_policy: str = 'producer_marker'
     max_attempts: int = 3
     admission_policy: str = 'strict'
+    publication_group: str = ''
 
     def record(self):
-        return asdict(self)
+        value = asdict(self)
+        if not self.publication_group:
+            del value['publication_group']
+        return value
 
 
 def name(value):
@@ -170,6 +174,9 @@ def load_steps(settings, *, validate_credentials=True):
                 raise ValueError('Unsupported admission policy')
             if step.readiness_policy not in ('producer_marker', 'managed_ready'):
                 raise ValueError('Unsupported readiness policy; archive routes must remain legacy')
+            if step.publication_group and (step.adapter not in ('local', 'rsync') or '://' in step.destination
+                                          or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', step.publication_group)):
+                raise ValueError('publication_group must name a local group for a local destination')
             if row.get('rsync_options') or any(row.get(field, '').upper() == 'TRUE' for field in ('is_entry_point', 'is_end_point')):
                 raise ValueError('Python paths do not accept legacy archive preparation or rsync options')
             if row.get('trigger', '') not in ('', 'request', 'discovery'):

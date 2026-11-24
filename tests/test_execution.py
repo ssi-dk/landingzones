@@ -1,12 +1,14 @@
 """Independent-center identity, retention and consumer handoff contracts."""
 import csv
 import errno
+import grp
 import json
 import os
 from pathlib import Path
 import pwd
 import shutil
 import socket
+import stat
 
 import pytest
 import yaml
@@ -68,6 +70,41 @@ def test_copy_receipt_retains_source_and_deduplicates_other_callers(setup):
     assert executor.submit(dict(request, idempotency_key='another')) == state
     assert not (root / 'a/run-123').exists()
     assert executor.discover('a')['results'][0]['request_id'] == state['request_id']
+
+
+def test_ready_on_discovery_publishes_the_configured_group_before_handoff(setup):
+    root, payload, rows, write, config, _ = setup
+    (payload / '.ready').unlink()
+    group = grp.getgrgid(os.getegid())
+    rows[0].update(operation='move', readiness_policy='managed_ready', publication_group=group.gr_name)
+    write()
+    executor = Executor(config)
+    result, = executor.discover('a')['results']
+    assert result['status'] == 'completed'
+    assert not payload.exists()
+    published = root / 'a/run-123'
+    assert (published / 'data.txt').read_text() == 'accepted data'
+    for path in (published, *published.rglob('*')):
+        assert path.stat().st_gid == group.gr_gid
+        assert stat.S_IMODE(path.stat().st_mode) == (0o770 if path.is_dir() else 0o660)
+    assert (published / LABEL).is_file()
+    assert executor.discover('a')['results'] == []
+
+
+def test_move_keeps_source_when_publication_permissions_cannot_be_applied(setup, monkeypatch):
+    root, payload, rows, write, config, request = setup
+    rows[0].update(operation='move', publication_group=grp.getgrgid(os.getegid()).gr_name)
+    write()
+
+    def denied(fd, mode):
+        raise PermissionError('group publication denied')
+
+    monkeypatch.setattr(adapters.os, 'fchmod', denied)
+    state = Executor(config).submit(request)
+    assert state['status'] != 'completed'
+    assert 'group publication denied' in step(state)['attempts'][-1]['error']
+    assert payload.exists()
+    assert not (root / 'a/run-123').exists()
 
 
 def test_move_cleanup_failure_keeps_output_private_and_resumes(setup, monkeypatch):

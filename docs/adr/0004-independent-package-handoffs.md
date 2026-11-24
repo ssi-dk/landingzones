@@ -97,8 +97,12 @@ consumer publication. Transfer Attempts represent actual phase execution; timest
 allow duration inspection. Portable prepared history is not proof of publication.
 Actual completion is recorded in local state and emitted as immutable events.
 
-Legacy archive preparation, extraction and access-mode tuning remain on the legacy
-executor. Discovery is callable from cron; automatic Python cron generation remains
+Legacy archive preparation and extraction remain on the legacy executor. A Python
+connection with a local destination can set `publication_group` in its transfer
+table. The executor applies the group and modes `0770` for directories and
+`0660` for files, including the package label, inside private staging. A failure
+blocks source cleanup. The execution account must be able to assign the group.
+Discovery is callable from cron; automatic Python cron generation remains
 out of scope. Each configured connection must have one authoritative local store.
 Remote accounts require SFTP access, and rsync push additionally requires rsync/SSH.
 The sibling staging root must be writable exclusively by the executor and on the

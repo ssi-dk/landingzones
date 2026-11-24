@@ -66,7 +66,8 @@ class Executor:
                 raise ValueError('Intake folder basename must equal payload_name')
             if source != Path(step.source) / payload:
                 intake_step = replace(step, identifiers='intake:' + step.identifiers, source=str(source.parent), destination=step.source,
-                                      adapter='local', operation=intake['operation'], readiness_policy='producer_marker')
+                                      adapter='local', operation=intake['operation'], readiness_policy='producer_marker',
+                                      publication_group='')
                 admission_step = intake_step
         for work in ([intake_step] if intake_step else []) + [step]:
             if not work.source.startswith(('ssh://', 'sftp://')) and not work.destination.startswith(('ssh://', 'sftp://', 'ena://')):
@@ -91,6 +92,8 @@ class Executor:
         identity = previous.get('package_id') if isinstance(previous, dict) and previous.get('content_version') == label['content_version'] else None
         receipt_parts = [step.runtime_id, step.identifiers, step.source, step.destination, step.operation,
                          identity, label['content_version'], payload]
+        if step.publication_group:
+            receipt_parts.append({'publication_group': step.publication_group})
         # Preserve existing receipt identities for routes without external submissions.
         if adapter_request:
             receipt_parts.append(adapter_request)
@@ -300,6 +303,8 @@ class Executor:
                 work['itinerary_status'] = ('unspecified' if not itinerary else
                     'on_plan' if observed == itinerary[:len(observed)] else 'discrepancy')
                 transport.write_label(stage, label)
+                if step.publication_group:
+                    transport.prepare_publication(stage, state['manifest'])
                 work['output_label'] = label
                 if cache.exists():
                     import shutil
@@ -314,6 +319,8 @@ class Executor:
                 stage = transport.stage_name(work['step_id'])
                 if not matches(transport.inspect(stage), state['manifest'], step.verification):
                     raise ValueError('Staging changed; cleanup refused')
+                if step.publication_group:
+                    transport.prepare_publication(stage, state['manifest'])
                 if hasattr(transport, 'check_move_publication'):
                     transport.check_move_publication(stage, payload)
                 source.remove(payload, state['manifest'])
@@ -330,6 +337,8 @@ class Executor:
                         raise ValueError('Staging changed; publication refused')
                     if rename_publication and transport.exists(payload):
                         raise FileExistsError('Destination conflict')
+                    if step.publication_group:
+                        transport.prepare_publication(stage, state['manifest'])
                     work['promotion_intent'] = True
                     self.store.save(state)
                     receipt = transport.promote(stage, payload)

@@ -1,6 +1,7 @@
 """Transport operations; lifecycle decisions belong to the executor."""
 import errno
 import ctypes
+import grp
 import sys
 import hashlib
 import os
@@ -114,6 +115,13 @@ class LocalAdapter:
         if self.root == self.root.parent:
             raise ValueError('Destination must have a private sibling staging location')
         self.exclusive_destination = str(self.root) in settings.get('exclusive_local_destinations', [])
+        self.publication_gid = None
+        publication_group = getattr(step, 'publication_group', '')
+        if publication_group:
+            try:
+                self.publication_gid = grp.getgrnam(publication_group).gr_gid
+            except KeyError as exc:
+                raise ValueError('Unknown publication group: ' + publication_group) from exc
 
     def __enter__(self):
         return self
@@ -134,6 +142,37 @@ class LocalAdapter:
 
     def inspect(self, relative):
         return manifest(local_root(os.path.normpath(str(self.root / relative))))
+
+    def prepare_publication(self, relative, accepted):
+        if self.publication_gid is None:
+            return
+        stage = Path(local_root(os.path.normpath(str(self.root / relative))))
+        entries = {**accepted, LABEL: {'kind': 'file'}, '': {'kind': 'directory'}}
+        for name, item in entries.items():
+            path = stage / name
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            directory = item['kind'] == 'directory'
+            if directory:
+                flags |= os.O_DIRECTORY
+            fd = os.open(path, flags)
+            try:
+                before = os.fstat(fd)
+                if not (stat.S_ISDIR(before.st_mode) if directory else stat.S_ISREG(before.st_mode)):
+                    raise ValueError('Unexpected publication entry type')
+                mode = 0o770 if directory else 0o660
+                group_changed = before.st_gid != self.publication_gid
+                if group_changed:
+                    os.fchown(fd, -1, self.publication_gid)
+                mode_changed = stat.S_IMODE(os.fstat(fd).st_mode) != mode
+                if mode_changed:
+                    os.fchmod(fd, mode)
+                after = os.fstat(fd)
+                if after.st_gid != self.publication_gid or stat.S_IMODE(after.st_mode) != mode:
+                    raise PermissionError('Publication group or permissions could not be set')
+                if group_changed or mode_changed:
+                    os.fsync(fd)
+            finally:
+                os.close(fd)
 
     def copy(self, source, relative, accepted):
         path = Path(local_root(os.path.normpath(str(self.root / relative))))
