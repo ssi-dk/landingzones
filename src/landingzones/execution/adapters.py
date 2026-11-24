@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import shlex
 import stat
+import struct
 import subprocess
 from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
@@ -390,6 +391,61 @@ class SFTPAdapter:
                     if not stat.S_ISREG(self.check_path(self.path(target)).st_mode):
                         raise ValueError('Unexpected staging file type')
                 self.sftp.put(str(Path(source) / key), self.path(target), confirm=True)
+
+    def receiving_gid(self):
+        """Resolve the receiver directory group in the SFTP server's namespace."""
+        from paramiko.message import Message
+        from paramiko.sftp import CMD_EXTENDED, CMD_EXTENDED_REPLY
+        gid = self.check_path(self.root).st_gid
+        kind, reply = self.sftp._request(CMD_EXTENDED, 'users-groups-by-id@openssh.com',
+                                         b'', struct.pack('>I', gid))
+        if kind != CMD_EXTENDED_REPLY or reply.get_string() != b'':
+            raise ValueError('SFTP server could not identify the receiving directory group')
+        if Message(reply.get_string()).get_text() != self.step.publication_group:
+            raise ValueError('Receiving directory group differs from the configured publication group')
+        return gid
+
+    @staticmethod
+    def sync_handle(sftp, handle):
+        from paramiko.sftp import CMD_EXTENDED, CMD_STATUS
+        kind, _ = sftp._request(CMD_EXTENDED, 'fsync@openssh.com', handle.handle)
+        if kind != CMD_STATUS:
+            raise OSError('SFTP did not acknowledge fsync')
+
+    def sync_directory(self, path):
+        if not stat.S_ISDIR(self.check_path(path).st_mode):
+            raise ValueError('Expected a directory for durable SFTP publication')
+        with self.sftp.open(path, 'rb') as handle:
+            self.sync_handle(self.sftp, handle)
+
+    def prepare_publication(self, stage, accepted):
+        """Apply group access and flush a private package before exposing it."""
+        gid = self.receiving_gid() if self.step.publication_group else None
+        root = self.path(stage)
+        entries = {**accepted, LABEL: {'kind': 'file'}, '': {'kind': 'directory'}}
+        for key in sorted(entries, key=lambda key: (key.count('/') + 1 if key else 0, key), reverse=True):
+            path = root + '/' + key if key else root
+            attrs = self.check_path(path)
+            directory = entries[key]['kind'] == 'directory'
+            if not (stat.S_ISDIR(attrs.st_mode) if directory else stat.S_ISREG(attrs.st_mode)):
+                raise ValueError('Unexpected staged SFTP entry type')
+            with self.sftp.open(path, 'rb') as handle:
+                if gid is not None:
+                    mode = 0o770 if directory else 0o660
+                    if attrs.st_gid != gid:
+                        handle.chown(attrs.st_uid, gid)
+                    handle.chmod(mode)
+                    result = handle.stat()
+                    if result.st_gid != gid or stat.S_IMODE(result.st_mode) != mode:
+                        raise ValueError('SFTP publication permissions differ from the requested group or mode')
+                self.sync_handle(self.sftp, handle)
+        self.sync_directory(root.rsplit('/', 1)[0])
+        # Establish support on the destination filesystem before attempting rename.
+        self.sync_directory(self.root)
+
+    def confirm_publication(self, stage):
+        self.sync_directory(self.root)
+        self.sync_directory(self.path(stage).rsplit('/', 1)[0])
 
     def promote(self, relative, final):
         if self.exists(final):

@@ -402,12 +402,84 @@ def test_sftp_copy_receipt_and_remote_move_capability_gate(setup, filesystem_sft
     state = executor.submit(request)
     assert state['status'] == 'completed' and payload.exists()
     assert json.loads((root / 'a/run-123' / LABEL).read_text())['package_id'] == state['payload_id']
-    rows[0]['operation'] = 'move'
+    rows[0].update(operation='move', adapter='rsync', destination='ssh://receiver@example.invalid' + str(root / 'a'))
     write()
     with pytest.raises(ValueError, match='durable publication support'):
         executor.preflight(dict(request, idempotency_key='move'))
     assert payload.exists()
 
+
+
+@pytest.fixture
+def openssh_pipe(monkeypatch):
+    """Speak SFTP to a child process over a Unix socketpair on the test machine."""
+    from contextlib import ExitStack
+    import subprocess
+    from landingzones.execution.adapters import SFTPAdapter
+    paramiko = pytest.importorskip('paramiko')
+    binary = next((p for p in ('/usr/libexec/sftp-server', '/usr/lib/openssh/sftp-server')
+                   if Path(p).is_file()), None)
+    if not binary:
+        pytest.skip('OpenSSH SFTP test program unavailable')
+
+    class Channel(socket.socket):
+        def get_name(self):
+            return 'local-test'
+
+    def enter(self):
+        self.stack = ExitStack()
+        child, client = socket.socketpair()
+        with child:
+            self.stack.enter_context(subprocess.Popen([binary], stdin=child, stdout=child))
+        channel = self.stack.enter_context(Channel(fileno=client.detach()))
+        self.sftp = self.stack.enter_context(paramiko.SFTPClient(channel))
+        return self
+
+    monkeypatch.setattr(SFTPAdapter, '__enter__', enter)
+    monkeypatch.setattr(SFTPAdapter, '__exit__', lambda self, *args: self.stack.close())
+
+
+@pytest.mark.parametrize('fault', ['none', 'wrong_group', 'sync_failed', 'lost_rename_reply', 'lost_and_collected'])
+def test_remote_move_receipt_precedes_source_cleanup(setup, openssh_pipe, monkeypatch, fault):
+    root, payload, rows, write, config, request = setup
+    gid = (root / 'a').stat().st_gid
+    group = grp.getgrgid(gid).gr_name
+    rows[0].update(destination='sftp://receiver@example.invalid' + str(root / 'a'),
+                   adapter='sftp', operation='move', credential_ref='test',
+                   publication_group='missing-group' if fault == 'wrong_group' else group)
+    write()
+    credentials(config)
+    published = root / 'a' / payload.name
+
+    with monkeypatch.context() as patch:
+        if fault == 'sync_failed':
+            def unavailable(*args):
+                raise OSError('receiver cannot flush the stage')
+            patch.setattr(adapters.SFTPAdapter, 'sync_directory', unavailable)
+        if fault in ('lost_rename_reply', 'lost_and_collected'):
+            promote = adapters.SFTPAdapter.promote
+            def interrupted(transport, stage, final):
+                promote(transport, stage, final)
+                if fault == 'lost_and_collected':
+                    shutil.rmtree(published)
+                raise OSError('lost rename reply')
+            patch.setattr(adapters.SFTPAdapter, 'promote', interrupted)
+        result = Executor(config).submit(request)
+
+    if fault != 'none':
+        assert result['status'] == 'blocked' and payload.is_dir()
+    if fault == 'wrong_group':
+        assert not published.exists()
+        return
+    result = Executor(config).submit(request)
+    if fault == 'lost_and_collected':
+        assert result['status'] == 'blocked' and payload.is_dir()
+        return
+    assert result['status'] == 'completed' and not payload.exists()
+    assert (published / 'data.txt').read_text() == 'accepted data'
+    assert all(p.stat().st_gid == gid and stat.S_IMODE(p.stat().st_mode) == (0o770 if p.is_dir() else 0o660)
+               for p in (published, *published.rglob('*')))
+    assert step(result)['published'] and step(result)['cleaned']
 
 def test_archive_transport_is_not_silently_excluded_as_metadata(setup):
     root, payload, rows, write, config, request = setup

@@ -58,9 +58,14 @@ Retain the request and publication phase with the claim so another worker can
 recover an interrupted publication. Direct filesystem writers would still need
 to follow the same coordination rules.
 
-SFTP copies use the same stage/intent reconciliation for process interruptions,
-but SFTP persistence through server power loss is unverified. Remote-destination
-moves are rejected before transfer because durable remote staging is not guaranteed.
+An SFTP move flushes the staged files, label and directories using the receiver's
+OpenSSH fsync extension. For group-editable delivery the receiving directory must
+have the configured group. The executor verifies its name with the receiver,
+sets the group and modes on the private package and checks the results. It then
+renames the package, flushes both parent directories and persists the publication
+receipt before cleaning up the source. If a rename reply is lost, recovery
+requires the matching published package and label. An ambiguous delivery leaves
+the source available for reconciliation. Remote rsync and ENA destinations support copies.
 Configured remote-source pulls may move into a durable local destination; source
 cleanup is resumable and checks remaining content. Producers must stop writing.
 

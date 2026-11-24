@@ -10,7 +10,7 @@ import warnings
 from landingzones.transfer_events import EVENT_HEADER, create_transfer_event, event_to_tsv_row, new_identifier
 from .adapters import adapter, manifest, matches
 from .model import Step, load_settings, load_steps, local_root, name, resolve_local_endpoint
-from .package import admit
+from .package import LABEL, admit
 from .source import Source
 from .storage import StateStore
 
@@ -45,8 +45,10 @@ class Executor:
             raise ValueError('Unknown configured connection')
         step = groups[group][0]
         remote_destination = step.destination.startswith(('ssh://', 'sftp://', 'ena://'))
-        if remote_destination and step.operation == 'move':
+        if remote_destination and step.operation == 'move' and step.adapter != 'sftp':
             raise ValueError('Remote destination move requires durable publication support; use copy or a legacy route')
+        if step.adapter == 'sftp' and step.operation == 'move' and step.source.startswith(('ssh://', 'sftp://')):
+            raise ValueError('SFTP destination moves require a local source')
         if not remote_destination:
             local_root(step.destination)
             if not Path(step.destination).is_dir():
@@ -280,6 +282,7 @@ class Executor:
             return
         step = Step(**work['definition'])
         payload = state['payload_name']
+        remote_move = step.adapter == 'sftp' and step.operation == 'move'
         # Each phase opens its own transport so connectivity failures are recorded.
         def transfer():
             with adapter(step, self.settings) as transport, Source(step, self.settings) as source:
@@ -303,7 +306,7 @@ class Executor:
                 work['itinerary_status'] = ('unspecified' if not itinerary else
                     'on_plan' if observed == itinerary[:len(observed)] else 'discrepancy')
                 transport.write_label(stage, label)
-                if step.publication_group:
+                if step.publication_group and step.adapter != 'sftp':
                     transport.prepare_publication(stage, state['manifest'])
                 work['output_label'] = label
                 if cache.exists():
@@ -326,7 +329,7 @@ class Executor:
                 source.remove(payload, state['manifest'])
                 work['cleaned'] = True
                 self.store.save(state)
-        if step.operation == 'move' and not work.get('cleaned') and not self._phase(state, work, 'cleanup', clean):
+        if step.operation == 'move' and not remote_move and not work.get('cleaned') and not self._phase(state, work, 'cleanup', clean):
             return
         def publish():
             with adapter(step, self.settings) as transport:
@@ -337,7 +340,7 @@ class Executor:
                         raise ValueError('Staging changed; publication refused')
                     if rename_publication and transport.exists(payload):
                         raise FileExistsError('Destination conflict')
-                    if step.publication_group:
+                    if step.publication_group or remote_move:
                         transport.prepare_publication(stage, state['manifest'])
                     work['promotion_intent'] = True
                     self.store.save(state)
@@ -348,6 +351,16 @@ class Executor:
                     raise ValueError('Verified upload directory is missing; completion cannot be inferred')
                 elif not work.get('promotion_intent'):
                     raise ValueError('Private staging missing without publication intent')
+                elif remote_move:
+                    # Losing a rename acknowledgement is ambiguous if the consumer
+                    # already collected the output. Retain the source for reconciliation.
+                    if not transport.exists(payload) or transport.inspect(payload) != state['manifest']:
+                        raise ValueError('Remote delivery cannot be confirmed after interruption; source retained')
+                    with transport.sftp.open(transport.path(payload) + '/' + LABEL, 'rb') as label:
+                        if json.load(label) != work['output_label']:
+                            raise ValueError('Remote publication label changed; source retained')
+                if remote_move:
+                    transport.confirm_publication(stage)
                 # Only this executor may remove its private stage. With durable intent,
                 # its disappearance proves rename, even if the consumer removed output.
                 work.update(status='published', published=True, verified=True)
@@ -357,6 +370,14 @@ class Executor:
                 return
             attempt = work['attempts'][-1]
             self._event(state, work, attempt, 'delivered', 'promotion')
+        if remote_move and not work.get('cleaned'):
+            def clean_published():
+                with Source(step, self.settings) as source:
+                    source.remove(payload, state['manifest'])
+                work['cleaned'] = True
+                self.store.save(state)
+            if not self._phase(state, work, 'cleanup', clean_published):
+                return
         plan = state.get('adapter_request', {}) if work is not state.get('intake') else {}
         if plan and work.get('submission', {}).get('status') == 'accepted':
             # The service receipt can be durable even if the process stopped before
