@@ -252,7 +252,7 @@ def test_manifest_binds_tar_bytes_to_embedded_provenance(builder, tmp_path, monk
         embedded = json.load(handle.extractfile("landingzones-standalone/bundle.json"))
     assert embedded == {key: value for key, value in manifest.items() if key != "archive"}
     assert "publication" not in embedded
-    assert embedded["capabilities"] == ["sftp", "ena", "local-publication-group", "durable-sftp-move", "size-only-transfers", "rsync-source-pull"]
+    assert embedded["capabilities"] == ["sftp", "ena", "local-publication-group", "durable-sftp-move", "size-only-transfers", "rsync-source-pull", "rsync-destination-push"]
 
 
 def test_ci_publication_requires_source_to_match_run(builder, monkeypatch):

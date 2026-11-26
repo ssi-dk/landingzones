@@ -457,25 +457,29 @@ def test_rsync_pull_uses_private_stage_and_preserves_source_on_failure(setup, fi
     assert not payload.exists() and (root / 'a/run-123/data.txt').read_text() == 'accepted data'
 
 
-def test_real_rsync_pull_over_local_shell_fixture(setup, filesystem_sftp, monkeypatch):
+def local_rsync_shell(root, monkeypatch):
     # Simulate only SSH transport: both sides execute the installed rsync locally.
     rsync = shutil.which('rsync')
     help_text = subprocess.check_output([rsync, '--help'], text=True) if rsync else ''
     if '--protect-args' not in help_text and '--secluded-args' not in help_text:
         pytest.skip('Requires rsync with protected arguments')
+    bin_dir = root / 'bin'
+    bin_dir.mkdir()
+    ssh = bin_dir / 'ssh'
+    ssh.write_text('#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != rsync ]; do shift; done\n'
+                   '[ "$1" = rsync ] && [ "$2" = --server ] || exit 2\n'
+                   'exec "$@"\n')
+    ssh.chmod(0o700)
+    monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
+
+
+def test_real_rsync_pull_over_local_shell_fixture(setup, filesystem_sftp, monkeypatch):
     root, payload, executor, request = configure_rsync_pull(setup, setup[0] / 'input [ab]')
     # A generator using an unescaped source glob would read this other queue.
     shadow = root / 'input a' / payload.name
     shadow.mkdir(parents=True)
     (shadow / 'data.txt').write_text('wrong queue')
-    bin_dir = root / 'bin'
-    bin_dir.mkdir()
-    ssh = bin_dir / 'ssh'
-    ssh.write_text('#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != rsync ]; do shift; done\n'
-                   '[ "$1" = rsync ] && [ "$2" = --server ] && [ "$3" = --sender ] || exit 2\n'
-                   'exec "$@"\n')
-    ssh.chmod(0o700)
-    monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
+    local_rsync_shell(root, monkeypatch)
     (payload / 'nested files').mkdir()
     special = Path('nested files') / 'data [part 1]; a.fastq'
     (payload / special).write_bytes(b'sequence')
@@ -680,13 +684,17 @@ def test_inheritance_upgrade_preserves_receipts_for_collected_copies(setup):
     assert not (root / 'a' / payload.name).exists()
 
 
+@pytest.mark.parametrize('transfer_adapter', ['sftp', 'rsync'])
 @pytest.mark.parametrize('fault', ['none', 'wrong_group', 'sync_failed', 'lost_rename_reply', 'lost_and_collected'])
-def test_remote_move_receipt_precedes_source_cleanup(setup, openssh_pipe, monkeypatch, fault):
+def test_remote_move_receipt_precedes_source_cleanup(setup, openssh_pipe, monkeypatch, fault, transfer_adapter):
     root, payload, rows, write, config, request = setup
+    if transfer_adapter == 'rsync':
+        local_rsync_shell(root, monkeypatch)
     gid = (root / 'a').stat().st_gid
     group = grp.getgrgid(gid).gr_name
     rows[0].update(destination='sftp://receiver@example.invalid' + str(root / 'a'),
-                   adapter='sftp', operation='move', credential_ref='test',
+                   adapter=transfer_adapter, operation='move', credential_ref='test',
+                   verification='size' if transfer_adapter == 'rsync' else 'checksum',
                    publication_group='missing-group' if fault == 'wrong_group' else group,
                    publication_directory_mode='2770')
     write()
@@ -722,6 +730,45 @@ def test_remote_move_receipt_precedes_source_cleanup(setup, openssh_pipe, monkey
     assert all(p.stat().st_gid == gid and stat.S_IMODE(p.stat().st_mode) == (0o2770 if p.is_dir() else 0o660)
                for p in (published, *published.rglob('*')))
     assert step(result)['published'] and step(result)['cleaned']
+
+@pytest.mark.parametrize('fault', ['partial', 'wrong_size'])
+def test_rsync_push_keeps_source_private_until_stage_is_verified(setup, filesystem_sftp, monkeypatch, fault):
+    root, payload, rows, write, config, request = setup
+    rows[0].update(destination='sftp://receiver@example.invalid' + str(root / 'a'),
+                   adapter='rsync', operation='copy', credential_ref='test', verification='size')
+    write()
+    credentials(config)
+    (payload / '.landing_zones').mkdir()
+    (payload / '.landing_zones' / 'user-metadata').touch()
+    local_rsync_shell(root, monkeypatch)
+    executor = Executor(config)
+    published = root / 'a' / payload.name
+    real_copy = adapters.RemoteRsyncAdapter.copy_manifest
+
+    def broken(self, source, destination, scratch, accepted, execution_lock):
+        assert set(accepted) == {'empty-directory', 'empty.txt', 'data.txt'}
+        assert execution_lock.fileno() >= 0
+        if fault == 'partial':
+            (Path(scratch) / '.interrupted').touch()
+            raise OSError('interrupted rsync')
+        real_copy(self, source, destination, scratch, accepted, execution_lock)
+        (Path(destination.split(':', 1)[1]) / 'data.txt').write_bytes(b'short')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(adapters.RemoteRsyncAdapter, 'copy_manifest', broken)
+        state = executor.submit(request)
+    assert state['status'] == 'blocked' and not published.exists() and payload.exists()
+    work = step(state)
+    assert work['attempts'][-1]['phase'] == 'transfer' and not work.get('staged')
+    if fault == 'wrong_size':
+        assert work['attempts'][-1]['error'] == 'Staging verification failed'
+    result = executor.resume(state['request_id'], retry_parked=True)
+    assert result['status'] == 'completed' and payload.is_dir()
+    assert (published / 'data.txt').read_text() == 'accepted data'
+    assert (published / 'empty-directory').is_dir()
+    assert not (published / '.ready').exists() and not (published / '.landing_zones').exists()
+    assert not list((root / '.landingzones-staging-a').iterdir())
+
 
 def test_archive_transport_is_not_silently_excluded_as_metadata(setup):
     root, payload, rows, write, config, request = setup

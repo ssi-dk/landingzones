@@ -36,6 +36,14 @@ class Step:
         return (self.adapter == 'rsync' and self.source.startswith('ssh://')
                 and '://' not in self.destination)
 
+    @property
+    def rsync_destination_push(self):
+        return self.adapter == 'rsync' and self.destination.startswith('sftp://')
+
+    @property
+    def sftp_publication(self):
+        return self.adapter == 'sftp' or self.rsync_destination_push
+
     def publication_mode_for(self, directory):
         return int(self.publication_directory_mode or '0770', 8) if directory else 0o660
 
@@ -203,13 +211,15 @@ def load_steps(settings, *, validate_credentials=True):
                 step = replace(step, source=resolve_local_endpoint(step.source, settings.get('local_path_base')))
             if step.adapter == 'ena':
                 pass  # ENA URL validation is lazy and belongs to the selected adapter.
-            elif step.adapter == 'sftp' or step.destination.startswith('ssh://'):
-                remote_url(step.destination, 'sftp' if step.adapter == 'sftp' else 'ssh')
+            elif step.sftp_publication or step.destination.startswith('ssh://'):
+                remote_url(step.destination, 'sftp' if step.sftp_publication else 'ssh')
+                if step.rsync_destination_push and '://' in step.source:
+                    raise ValueError('An rsync push requires a local source')
                 if step.adapter not in ('sftp', 'rsync'):
                     raise ValueError('Remote destination requires sftp or rsync')
             else:
                 step = replace(step, destination=resolve_local_endpoint(step.destination, settings.get('local_path_base')))
-            if validate_credentials and (step.adapter == 'sftp' or step.destination.startswith('ssh://')) and step.credential_ref not in settings.get('credentials', {}):
+            if validate_credentials and (step.sftp_publication or step.destination.startswith('ssh://')) and step.credential_ref not in settings.get('credentials', {}):
                 raise ValueError('Missing SFTP credential reference')
             selected.append(step)
     groups = {}

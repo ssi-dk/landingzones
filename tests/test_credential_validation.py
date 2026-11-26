@@ -4,6 +4,7 @@ import csv
 from dataclasses import fields
 import json
 import os
+import shlex
 from pathlib import Path
 import pwd
 import socket
@@ -71,6 +72,11 @@ def remote(monkeypatch):
 
         def __exit__(self, *args):
             calls.append(('close', self.step.destination))
+
+        def receiving_gid(self):
+            calls.append(('group', self.step.publication_group))
+            if self.step.publication_group != 'receivers':
+                raise ValueError('wrong receiver group')
 
         def listdir_attr(self, root):
             assert root == self.root
@@ -157,25 +163,41 @@ def test_disabled_unselected_runtime_and_unused_malformed_credentials_are_ignore
     assert all(item['credential_check'] == 'not_required' for item in report['connections'][0]['checks'])
 
 
-@pytest.mark.parametrize('direction', ['source', 'destination'])
-def test_rsync_checks_product_openssh_options_remote_capability_and_local_binary(config, remote, direction):
+@pytest.mark.parametrize(('scheme', 'direction'), [('ssh', 'source'), ('sftp', 'destination'), ('ssh', 'destination')])
+def test_rsync_checks_product_openssh_options_remote_capability_and_local_binary(config, remote, scheme, direction):
     row = config.row('rsync', adapter='rsync', credential_ref='one',
-                     **{direction: 'ssh://writer@remote.invalid:2222/root'})
+                     **{direction: scheme + '://writer@remote.invalid:2222/root'})
+    if scheme == 'sftp':
+        row['publication_group'] = 'receivers'
     report = validation.validate_credentials(config.write([row], credentials('one')))
-    assert report['status'] == 'passed'
-    assert len(remote.processes) == 2
-    argv, options = remote.processes[0]
-    assert argv[:3] == ['ssh', '-p', '2222']
-    assert argv[argv.index('-i') + 1] == str(config.root / 'one.key')
-    assert 'IdentitiesOnly=yes' in argv and 'StrictHostKeyChecking=yes' in argv
-    assert 'UserKnownHostsFile=' + str(config.root / 'one.hosts') in argv
-    if direction == 'source':
-        assert argv[argv.index('-F') + 1] == '/dev/null'
-        assert 'IdentityAgent=none' in argv and 'GlobalKnownHostsFile=/dev/null' in argv
-    assert argv[-3:] == ['--', 'writer@remote.invalid', 'rsync --version']
-    assert options == dict(check=True, capture_output=True, text=True, timeout=30)
+    assert report['status'] == 'passed' and len(remote.processes) == 2
+    command, options = remote.processes[0]
+    if scheme == 'ssh' and direction == 'destination':
+        ssh = command
+        assert ssh[-3:] == ['--', 'writer@remote.invalid', 'rsync --version']
+    else:
+        ssh = shlex.split(command[command.index('-e') + 1])
+        assert command[:2] == ['rsync', '--dry-run'] and '--files-from=-' in command
+        assert command[-2 if direction == 'source' else -1] == 'writer@remote.invalid:/root/'
+        assert options['input'] == b''
+        assert ssh[ssh.index('-F') + 1] == '/dev/null'
+        assert 'IdentityAgent=none' in ssh and 'GlobalKnownHostsFile=/dev/null' in ssh
+    assert ssh[:3] == ['ssh', '-p', '2222']
+    assert ssh[ssh.index('-i') + 1] == str(config.root / 'one.key')
+    assert 'IdentitiesOnly=yes' in ssh and 'StrictHostKeyChecking=yes' in ssh
+    assert 'UserKnownHostsFile=' + str(config.root / 'one.hosts') in ssh
+    assert options['check'] and options['capture_output'] and options['timeout'] == 30
     assert remote.processes[1][0] == ['rsync', '--version']
     assert len([item for item in remote.calls if item[0] == 'enter']) == 1
+    assert (('group', 'receivers') in remote.calls) == (scheme == 'sftp')
+
+
+def test_rsync_push_fails_preflight_on_wrong_receiver_group(config, remote):
+    row = config.row('rsync', adapter='rsync', credential_ref='one', publication_group='wrong',
+                     destination='sftp://writer@remote.invalid/root')
+    report = validation.validate_credentials(config.write([row], credentials('one')))
+    failed, = failed_checks(report)
+    assert failed['phase'] == 'authentication_host_key_root_listing_and_publication_group'
 
 
 def test_rsync_does_not_confuse_sftp_success_with_shell_or_binary_success(config, remote, monkeypatch):

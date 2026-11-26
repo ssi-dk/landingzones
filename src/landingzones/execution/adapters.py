@@ -6,6 +6,7 @@ import grp
 import sys
 import hashlib
 import os
+import posixpath
 from pathlib import Path
 import shutil
 import shlex
@@ -483,33 +484,50 @@ class RemoteRsyncAdapter(SFTPAdapter):
             raise ValueError('Invalid rsync SSH endpoint')
         if ':' in host:
             host = '[' + host + ']'
-        path = self.path(relative)
+        path = posixpath.normpath(self.path(relative)).rstrip('/')
         if literal_source:
             # With protected arguments rsync expands source globs on the sender.
             # Escape its glob grammar independently of shell argument protection.
             path = ''.join('\\' + c if c in '\\[*?' else c for c in path)
         return self.target.username + '@' + host + ':' + path + '/'
 
-    def pull_ssh_command(self):
+    def pinned_ssh_command(self):
         return self.ssh_command() + ['-F', '/dev/null', '-o', 'IdentityAgent=none',
                                      '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'UpdateHostKeys=no']
 
     def pull_directory(self, payload, path, accepted, execution_lock):
-        # --files-from implies --dirs and disables recursive descent. Only admitted
-        # entries are requested, including empty directories and ordinary dotfiles.
-        entries = b''.join(os.fsencode(key) + b'\0' for key in sorted(accepted))
         # Interrupted receiver temporary files must not become inventory entries.
         scratch = Path(local_root(str(path.with_name('.rsync-' + path.name))))
         scratch.mkdir(mode=0o700, exist_ok=True)
+        self.copy_manifest(self.remote_directory(payload, literal_source=True), str(path) + '/',
+                           str(scratch), accepted, execution_lock)
+        shutil.rmtree(scratch)
+
+    def push_directory(self, source, relative, accepted, execution_lock):
+        self.prepare_stage(relative)
+        parent, token = relative.rsplit('/', 1)
+        scratch = parent + '/.rsync-' + token
+        self.mkdir(scratch)
+        scratch_path = posixpath.normpath(self.path(scratch))
+        self.copy_manifest(str(source) + '/', self.remote_directory(relative),
+                           scratch_path, accepted, execution_lock)
+        # A previous interrupted receiver can leave its temporary file here.
+        for entry in self.sftp.listdir_attr(scratch_path):
+            if not stat.S_ISREG(entry.st_mode) or '/' in entry.filename:
+                raise ValueError('Unexpected entry in private rsync scratch directory')
+            self.sftp.remove(scratch_path + '/' + entry.filename)
+        self.sftp.rmdir(scratch_path)
+
+    def copy_manifest(self, source, destination, scratch, accepted, execution_lock):
+        # --files-from implies --dirs and disables recursive descent. Only admitted
+        # entries are requested, including empty directories and ordinary dotfiles.
+        entries = b''.join(os.fsencode(key) + b'\0' for key in sorted(accepted))
         argv = ['rsync', '--dirs', '--times', '--chmod=Du+rwx,Fu+rw', '--from0', '--files-from=-',
-                '--temp-dir=' + str(scratch),
-                '--protect-args', '--timeout=300', '-e', shlex.join(self.pull_ssh_command()),
-                '--', self.remote_directory(payload, literal_source=True), str(path) + '/']
-        # Keep the existing runtime lock across worker termination while a child
-        # can still write the private stage. The last descriptor close releases it.
+                '--temp-dir=' + scratch, '--protect-args', '--timeout=300',
+                '-e', shlex.join(self.pinned_ssh_command()), '--', source, destination]
+        # Retain the worker's lock while a surviving rsync can write private staging.
         subprocess.run(argv, input=entries, check=True, capture_output=True,
                        pass_fds=(execution_lock.fileno(),))
-        shutil.rmtree(scratch)
 
     def copy(self, source, relative, accepted):
         self.prepare_stage(relative)
@@ -525,6 +543,6 @@ def adapter(step, settings):
         return ENAAdapter(step, settings)
     if step.adapter == 'sftp':
         return SFTPAdapter(step, settings)
-    if step.adapter == 'rsync' and step.destination.startswith('ssh://'):
+    if step.rsync_destination_push or (step.adapter == 'rsync' and step.destination.startswith('ssh://')):
         return RemoteRsyncAdapter(step, settings)
     return LocalAdapter(step, settings)

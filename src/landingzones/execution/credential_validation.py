@@ -9,9 +9,11 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shlex
 import socket
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 
 from .adapters import RemoteRsyncAdapter, SFTPAdapter
 from .model import load_settings, load_steps, local_root
@@ -98,6 +100,8 @@ def _sftp_directory(step, settings, endpoint):
     with SFTPAdapter(probe, settings) as transport:
         # __enter__ validates authentication, pinned host key and directory type.
         transport.sftp.listdir_attr(transport.root)
+        if step.rsync_destination_push and step.publication_group:
+            transport.receiving_gid()
 
 
 def _rsync_version(command):
@@ -108,10 +112,19 @@ def _rsync_version(command):
 
 def _remote_rsync(step, settings, endpoint):
     transport = RemoteRsyncAdapter(replace(step, destination=endpoint), settings)
-    host = transport.target.username + '@' + transport.target.hostname
-    # The remote command is constant. Local argv is never passed to a shell.
-    ssh = transport.pull_ssh_command() if step.rsync_source_pull else transport.ssh_command()
-    _rsync_version(ssh + ['--', host, 'rsync --version'])
+    if step.rsync_source_pull or step.rsync_destination_push:
+        # Exercise the selected rsync sender or receiver even with a restricted
+        # login. An empty manifest and dry-run leave the endpoint untouched.
+        remote = transport.remote_directory('', literal_source=step.rsync_source_pull)
+        with TemporaryDirectory() as directory:
+            local = directory + '/'
+            paths = [remote, local] if step.rsync_source_pull else [local, remote]
+            subprocess.run(['rsync', '--dry-run', '--dirs', '--from0', '--files-from=-', '--protect-args',
+                            '-e', shlex.join(transport.pinned_ssh_command()), '--', *paths],
+                           input=b'', check=True, capture_output=True, timeout=30)
+    else:
+        host = transport.target.username + '@' + transport.target.hostname
+        _rsync_version(transport.ssh_command() + ['--', host, 'rsync --version'])
 
 
 def _ena_directory(step, settings):
@@ -142,7 +155,10 @@ def _endpoint(checks, step, settings, config_dir, direction):
         _check(checks, direction, 'authentication_and_root_listing', transport,
                step.credential_ref, lambda: _ena_directory(step, resolved))
     else:
-        _check(checks, direction, 'authentication_host_key_and_root_listing', transport,
+        phase = ('authentication_host_key_root_listing_and_publication_group'
+                 if step.rsync_destination_push and step.publication_group
+                 else 'authentication_host_key_and_root_listing')
+        _check(checks, direction, phase, transport,
                step.credential_ref, lambda: _sftp_directory(step, resolved, endpoint))
         if step.adapter == 'rsync' and (direction == 'destination' or step.rsync_source_pull):
             _check(checks, direction, 'ssh_authentication_and_rsync_capability', 'rsync_ssh',

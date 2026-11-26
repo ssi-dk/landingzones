@@ -146,3 +146,10 @@ directly into the receipt's private stage and flushes it before cleanup.
 A retry can reuse complete staged files. The rsync inactivity timeout allows
 a continuously progressing large package to run for longer than an hour.
 An existing receipt resumes with its recorded adapter.
+
+An rsync connection with a local source and an `sftp://` destination sends
+the accepted paths over one pinned rsync-over-SSH connection directly into
+the receiver's private stage. SFTP owns inventory, publication groups, flushes
+and non-overwriting rename. A move confirms durable publication and records
+the receipt before cleaning its source. Existing `ssh://` destination copies
+continue to use their recorded adapter behavior.

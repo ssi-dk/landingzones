@@ -66,7 +66,7 @@ class Executor:
             raise ValueError('Unknown configured connection')
         step = groups[group][0]
         remote_destination = step.destination.startswith(('ssh://', 'sftp://', 'ena://'))
-        if remote_destination and step.operation == 'move' and step.adapter != 'sftp':
+        if remote_destination and step.operation == 'move' and not step.sftp_publication:
             raise ValueError('Remote destination move requires durable publication support; use copy or a legacy route')
         if step.adapter == 'sftp' and step.operation == 'move' and step.source.startswith(('ssh://', 'sftp://')):
             raise ValueError('SFTP destination moves require a local source')
@@ -314,7 +314,7 @@ class Executor:
             # Older size-copy receipts still accepted a full source checksum manifest.
             source_step = replace(step, verification='checksum')
         payload = state['payload_name']
-        remote_move = step.adapter == 'sftp' and step.operation == 'move'
+        remote_move = step.sftp_publication and step.operation == 'move'
         # Each phase opens its own transport so connectivity failures are recorded.
         def transfer():
             with adapter(step, self.settings) as transport, Source(source_step, self.settings) as source:
@@ -327,6 +327,8 @@ class Executor:
                 if step.rsync_source_pull:
                     with transport.staging_directory(stage) as path:
                         source.transport.pull_directory(payload, path, state['manifest'], self.store.execution_lock)
+                elif step.rsync_destination_push:
+                    transport.push_directory(source.root / payload, stage, state['manifest'], self.store.execution_lock)
                 else:
                     local = source.materialize(payload, cache, state['manifest'])
                     transport.copy(local, stage, state['manifest'])
@@ -342,7 +344,7 @@ class Executor:
                 work['itinerary_status'] = ('unspecified' if not itinerary else
                     'on_plan' if observed == itinerary[:len(observed)] else 'discrepancy')
                 transport.write_label(stage, label)
-                if step.publication_group and step.adapter != 'sftp':
+                if step.publication_group and not step.sftp_publication:
                     transport.prepare_publication(stage, state['manifest'])
                 work['output_label'] = label
                 if cache.exists():
