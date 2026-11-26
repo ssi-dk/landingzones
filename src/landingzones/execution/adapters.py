@@ -512,6 +512,10 @@ class RemoteRsyncAdapter(SFTPAdapter):
         root = '/' + posixpath.normpath(self.root).lstrip('/')
         request = dict(root=root, group=self.step.publication_group, **evidence)
         lock = getattr(self, 'execution_lock', None)
+        if lock is not None and action == 'prepare':
+            # OpenSSH closes non-stdio descriptors on startup. An orphaned local
+            # SSH session must still exclude maintenance and same-queue retries.
+            ssh = [sys.executable, '-I', '-S', str(Path(__file__).with_name('guard_process.py')), *ssh]
         try:
             result = subprocess.run(ssh, input=json.dumps(request), text=True, capture_output=True,
                                     check=True, timeout=30 if action == 'probe' else None,

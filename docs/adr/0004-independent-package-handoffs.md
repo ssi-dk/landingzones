@@ -166,7 +166,11 @@ the bundled, standard-library Python receiver helper. It checks the private
 stage owner, receipt label, manifest, file kinds and sizes, applies the
 configured group and modes, and flushes all files and directories bottom-up.
 Checksum routes also verify payload digests. Recovery retains a failed stage
-for retry. The receiver's `python3` must be available to that account; its
+for retry. A local supervisor retains the transfer locks until the publication SSH
+client exits, including after a worker interruption. A lost SSH connection can
+leave the helper running on the receiver. Its private stage label lock excludes
+a second preparation there, and publication still requires a successful reply.
+The receiver's `python3` must be available to that account; its
 read-only helper probe is part of credential validation. A move confirms durable publication and records
 the receipt before cleaning its source. Existing `ssh://` destination copies
 continue to use their recorded adapter behavior.
