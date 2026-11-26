@@ -428,7 +428,11 @@ def test_run_state_uses_route_delivery_flow_position_and_run_creation_age(tmp_pa
         )
     }
 
-    assert summaries[between_hops_run_id]["state"] == "in progress"
+    between = summaries[between_hops_run_id]
+    assert between["state"] == "awaiting downstream observation"
+    assert between["current_phase"] is None and between["current_status"] == "completed"
+    assert between["last_event_phase"] == "cleanup"
+    assert between["run_age_seconds"] == between["age_seconds"] == 172800
     assert summaries[failed_run_id]["state"] == "failed before delivery"
     assert summaries[failed_run_id]["latest_failure_phase"] == "transfer"
     assert summaries[failed_run_id]["age_seconds"] == 172800
@@ -1486,3 +1490,64 @@ def test_bad_scheduler_sidecar_keeps_existing_package_report_available(tmp_path)
     snapshot.unlink()
     os.mkfifo(snapshot)
     assert json.loads(app.respond('/api/scheduler')[2])['scheduler']['observation'] == 'unavailable'
+
+
+def test_completed_handoff_stays_out_of_active_attempts_until_downstream_observed(tmp_path):
+    database = 'sqlite:///' + str(tmp_path/'report.sqlite')
+    app = MonitoringApplication(database, scheduler_runtime_ids=['lab'])
+    definitions = [
+        TransferDefinition(identifier='collect', runtime_id='lab', system='host', user='worker',
+                           source='/incoming', destination='/handoff/', flow_group='collect'),
+        TransferDefinition(identifier='archive', runtime_id='lab', system='host', user='worker',
+                           source='/handoff', destination='/archive/', flow_group='archive', is_end_point=True),
+    ]
+    sync_transfer_definitions(database, definitions)
+    run, upstream, downstream = (str(uuid.uuid4()) for _ in range(3))
+    spool = tmp_path/'events.tsv'
+    spool.write_text(EVENT_HEADER + '\n')
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    def record(route, attempt, status, phase, offset):
+        event = create_transfer_event(route, 'host', 'lab', 'worker', status, phase,
+            event_time_utc=(now + timedelta(seconds=offset)).isoformat().replace('+00:00', 'Z'),
+            run_id=run, attempt_id=attempt, run_name='panel_A')
+        with spool.open('a') as stream:
+            stream.write(event_to_tsv_row(event) + '\n')
+        ingest_event_spool(database, str(spool))
+
+    def summary():
+        return next(row for row in json.loads(app.respond('/api/runs')[2])['runs'] if row['run_id'] == run)
+
+    record('collect', upstream, 'started', 'transfer', -65)
+    record('collect', upstream, 'completed', 'cleanup', -30)
+    # An otherwise matching disabled consumer does not create a pending handoff.
+    from dataclasses import replace
+    sync_transfer_definitions(database, [definitions[0], replace(definitions[1], enabled=False),
+                                        replace(definitions[1], identifier='foreign', system='other')])
+    assert summary()['state'] == 'completed'
+    sync_transfer_definitions(database, definitions)
+    waiting = summary()
+    assert waiting['state'] == 'awaiting downstream observation'
+    assert waiting['current_phase'] is None and waiting['last_event_phase'] == 'cleanup'
+    assert waiting['run_age_seconds'] >= 65
+    assert all(a['ended_at_utc'] for a in waiting['activity'])
+    html = app.respond('/')[2]
+    current, history = html.split('<section id="history">')
+    assert 'panel_A' not in current and 'No current attempts reported' in current
+    assert '<th>Run age</th>' in history and 'route complete · awaiting downstream observation' in history
+    assert 'in progress (cleanup)' not in history
+
+    # Late ingestion of a downstream observation just before upstream cleanup.
+    record('archive', downstream, 'started', 'transfer', -31)
+    active = summary()
+    assert active['transfer_identifier'] == 'collect'
+    assert active['state'] == 'route completed' and active['current_phase'] is None
+    assert active['last_event_phase'] == 'cleanup'
+    live = [a for a in active['activity'] if a['ended_at_utc'] is None]
+    assert [(a['transfer_identifier'], a['phase']) for a in live] == [('archive', 'transfer')]
+    record('archive', downstream, 'started', 'transfer', -20)
+    assert summary()['state'] == 'in progress' and summary()['current_phase'] == 'transfer'
+    assert 'panel_A' in app.respond('/')[2].split('<section id="attention">')[0]
+    record('archive', downstream, 'completed', 'cleanup', -10)
+    assert summary()['state'] == 'completed' and summary()['run_age_seconds'] is None
+    assert 'No current attempts reported' in app.respond('/')[2]

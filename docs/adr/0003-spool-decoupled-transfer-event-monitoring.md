@@ -54,3 +54,18 @@ runtime. With an enabled dispatcher, an observation more than two minutes old
 is stale; route states and PIDs are historical at that observation. A persisted
 hold with no dispatcher or running workers remains held. New writer fields
 are ignored. A malformed or inaccessible snapshot is reported as unavailable.
+
+When an intermediate route finishes and the catalog identifies an enabled
+downstream route, a run with no downstream observation is marked
+`awaiting downstream observation`. Its completed phase appears in history.
+The `current_phase` is null, `last_event_phase` preserves the last recorded
+phase, and `run_age_seconds` (also available as `age_seconds`) measures the
+unfinished run from its creation or earliest observation. The dashboard counts
+active phase attempts separately. If a downstream attempt is already open when
+upstream cleanup finishes, the history reports the upstream route as completed
+and the downstream attempt continues to appear under its own phase.
+
+For a native execution catalog, a downstream handoff requires an enabled
+consumer on the same runtime and system with the exact local destination queue
+as its source. Native flow groups identify individual connections. A disabled
+consumer or a similarly named directory on another host establishes no handoff.

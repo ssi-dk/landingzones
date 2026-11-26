@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlsplit
 
 from landingzones.scheduler_status import read_scheduler_status
-from landingzones.monitoring import _message_fields, ingest_event_spool, query_run_detail, query_run_summaries
+from landingzones.monitoring import AWAITING_DOWNSTREAM, _message_fields, ingest_event_spool, query_run_detail, query_run_summaries
 
 
 FILTER_ARGUMENTS = {
@@ -157,7 +157,9 @@ Auto-refreshes every {AUTO_REFRESH_SECONDS} seconds. <a href="">Refresh now</a><
 def _progress_text(run):
     """Return the operator-facing state and current or failed lifecycle step."""
     state = run["state"]
-    if state == "completed":
+    if state == AWAITING_DOWNSTREAM:
+        return "route complete · " + state
+    if state in ("completed", "route completed"):
         return state
     phase = (
         run["latest_failure_phase"]
@@ -394,7 +396,7 @@ def _render_runs(
                     escape(_progress_text(run)),
                 ),
                 escape(run["last_event_time_utc"] or ""),
-                escape(_format_age(run["age_seconds"])),
+                escape(_format_age(run["run_age_seconds"])),
                 (
                     str(run["attempt_count"])
                     if run["attempt_count"] is not None
@@ -409,7 +411,7 @@ def _render_runs(
     table = (
         "<table><thead><tr><th>Directory</th><th>Runtime ID</th><th>System</th>"
         "<th>Execution user</th><th>Route</th><th>Enabled</th><th>Progress / step</th>"
-        "<th>Last event</th><th>Age</th><th>Attempts</th><th>Latest failure</th><th>Last payload</th>"
+        "<th>Last event</th><th>Run age</th><th>Attempts</th><th>Latest failure</th><th>Last payload</th>"
         "</tr></thead><tbody>{0}</tbody></table>"
     ).format("".join(rows))
     if show_without_directory:
@@ -535,6 +537,7 @@ class MonitoringApplication:
         if path == "/api/runs":
             runs = query_run_summaries(
                 self.database_url,
+                native_runtime_ids=self.scheduler_runtime_ids,
                 **_query_filters(query_string)
             )
             result = {"queried_at_utc": queried_at_utc, "runs": runs}
@@ -569,6 +572,7 @@ class MonitoringApplication:
         if path == "/":
             runs = query_run_summaries(
                 self.database_url,
+                native_runtime_ids=self.scheduler_runtime_ids,
                 **_query_filters(query_string)
             )
             return (

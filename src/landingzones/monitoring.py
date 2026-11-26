@@ -607,49 +607,54 @@ def _transfer_paths_connect(source_path, destination_path):
     )
 
 
-def _definition_is_terminal(definition, definitions):
-    if definition is None or definition["is_end_point"]:
-        return True
-    if not normalize_transfer_path(definition["destination_path"]):
-        return True
-    return not any(
-        candidate["enabled"]
-        and (
-            candidate["runtime_id"],
-            candidate["transfer_identifier"],
-        )
-        != (
-            definition["runtime_id"],
-            definition["transfer_identifier"],
-        )
-        and (
-            not definition["flow_group"]
-            or not candidate["flow_group"]
-            or definition["flow_group"] == candidate["flow_group"]
-        )
-        and _transfer_paths_connect(
-            candidate["source_path"],
-            definition["destination_path"],
-        )
+AWAITING_DOWNSTREAM = "awaiting downstream observation"
+
+
+def _downstream_routes(definition, definitions, native_runtime_ids):
+    if definition is None or definition["is_end_point"] or not definition["destination_path"]:
+        return set()
+    key = (definition["runtime_id"], definition["transfer_identifier"])
+    def connected(candidate):
+        if definition["runtime_id"] in native_runtime_ids:
+            # Native flow_group identifies one connection. A handoff across
+            # connections is proven only by the same configured local queue.
+            destination = normalize_transfer_path(definition["destination_path"])
+            return (destination.startswith("/")
+                    and candidate["runtime_id"] == definition["runtime_id"]
+                    and candidate["system"] == definition["system"]
+                    and normalize_transfer_path(candidate["source_path"]) == destination)
+        return ((not definition["flow_group"] or not candidate["flow_group"]
+                 or definition["flow_group"] == candidate["flow_group"])
+                and _transfer_paths_connect(candidate["source_path"], definition["destination_path"]))
+
+    return {
+        (candidate["runtime_id"], candidate["transfer_identifier"])
         for candidate in definitions
-    )
+        if candidate["enabled"]
+        and (candidate["runtime_id"], candidate["transfer_identifier"]) != key
+        and connected(candidate)
+    }
 
 
-def _run_state(events, definitions_by_key, definitions):
+def _run_state(events, definition, definitions, activity, native_runtime_ids):
     latest = events[-1]
+    if latest["status"] == "completed":
+        downstream = _downstream_routes(definition, definitions, native_runtime_ids)
+        if not downstream:
+            return "completed"
+        # Summarize the observed route. A linked worker may already be active
+        # during upstream cleanup; its own activity record gives its phase.
+        if any(row["ended_at_utc"] is None
+               and (row["runtime_id"], row["transfer_identifier"]) in downstream
+               for row in activity):
+            return "route completed"
+        return AWAITING_DOWNSTREAM
     route_key = (latest["runtime_id"], latest["transfer_identifier"])
     route_delivered = any(
         (event["runtime_id"], event["transfer_identifier"]) == route_key
         and event["status"] in ("delivered", "completed")
         for event in events
     )
-    if latest["status"] == "completed":
-        if not _definition_is_terminal(
-            definitions_by_key.get(route_key),
-            definitions,
-        ):
-            return "in progress"
-        return "completed"
     if latest["status"] == "failed":
         if latest["phase"] == "cleanup" and route_delivered:
             return "delivered with cleanup failed"
@@ -667,11 +672,13 @@ def _run_state(events, definitions_by_key, definitions):
     return latest["status"]
 
 
-def _event_summary(events, definitions_by_key, definitions, now):
+def _event_summary(events, definitions_by_key, definitions, now, native_runtime_ids):
     latest = events[-1]
     definition = definitions_by_key.get(
         (latest["runtime_id"], latest["transfer_identifier"])
     )
+    activity = [row for row in _attempt_activity(events, now) if row["is_current"]]
+    state = _run_state(events, definition, definitions, activity, native_runtime_ids)
     latest_failure = next(
         (event for event in reversed(events) if event["status"] == "failed"),
         None,
@@ -679,7 +686,6 @@ def _event_summary(events, definitions_by_key, definitions, now):
     attempts = set(
         event["attempt_id"] for event in events if event["attempt_id"] is not None
     )
-    state = _run_state(events, definitions_by_key, definitions)
     age_candidates = [
         _parse_event_time(event["created_at_utc"] or event["event_time_utc"])
         for event in events
@@ -696,7 +702,7 @@ def _event_summary(events, definitions_by_key, definitions, now):
     if not tags_value and definition is not None:
         tags_value = definition["tags"]
     return {
-        "activity": [row for row in _attempt_activity(events, now) if row["is_current"]],
+        "activity": activity,
         "run_id": latest["run_id"],
         "run_name": latest["run_name"],
         "runtime_id": latest["runtime_id"],
@@ -705,13 +711,15 @@ def _event_summary(events, definitions_by_key, definitions, now):
         "transfer_identifier": latest["transfer_identifier"],
         "directory": latest["directory"],
         "current_status": latest["status"],
-        "current_phase": latest["phase"],
+        "current_phase": None if state in (AWAITING_DOWNSTREAM, "route completed") else latest["phase"],
+        "last_event_phase": events[-1]["phase"],
         "enabled": definition["enabled"] if definition is not None else None,
         "flow_group": latest["flow_group"],
         "tags": list(normalize_tags(tags_value)),
         "frequency": definition["frequency"] if definition is not None else None,
         "state": state,
-        "last_event_time_utc": latest["event_time_utc"],
+        "last_event_time_utc": events[-1]["event_time_utc"],
+        "run_age_seconds": age_seconds,
         "age_seconds": age_seconds,
         "attempt_count": len(attempts) if attempts else None,
         "latest_failure_phase": (
@@ -741,12 +749,14 @@ def _never_observed_summary(definition):
         "directory": None,
         "current_status": None,
         "current_phase": None,
+        "last_event_phase": None,
         "enabled": definition["enabled"],
         "flow_group": definition["flow_group"],
         "tags": list(normalize_tags(definition["tags"])),
         "frequency": definition["frequency"],
         "state": "configured but never observed",
         "last_event_time_utc": None,
+        "run_age_seconds": None,
         "age_seconds": None,
         "attempt_count": None,
         "latest_failure_phase": None,
@@ -792,6 +802,7 @@ def query_run_summaries(
     states=None,
     reason_codes=None,
     now=None,
+    native_runtime_ids=(),
 ):
     """Query current Transfer Run state plus configured routes never observed."""
     engine = create_monitoring_schema(database_url)
@@ -833,7 +844,7 @@ def query_run_summaries(
         grouped.setdefault(group_key, []).append(event)
 
     summaries = [
-        _event_summary(group_events, definitions_by_key, definitions, now_value)
+        _event_summary(group_events, definitions_by_key, definitions, now_value, native_runtime_ids)
         for group_events in grouped.values()
     ]
     summaries.extend(
