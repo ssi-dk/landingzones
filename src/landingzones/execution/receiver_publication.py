@@ -12,6 +12,9 @@ import uuid
 
 
 LABEL = '.landingzones-package.json'
+# Intermediate directories are lookup anchors only. Shared receivers can grant
+# search permission on a parent while keeping its directory listing private.
+TRAVERSE = getattr(os, 'O_PATH', os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW
 DIRECTORY = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
 FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 
@@ -30,10 +33,10 @@ def queue_parent(path):
     parts = path.split('/')
     if parts[0] or not parts[1:] or any(p in ('', '.', '..') for p in parts[1:]):
         raise ValueError('Expected an absolute receiver queue without traversal')
-    fd = os.open('/', DIRECTORY)
+    fd = os.open('/', TRAVERSE)
     try:
         for part in parts[1:-1]:
-            child = os.open(part, DIRECTORY, dir_fd=fd)
+            child = os.open(part, TRAVERSE, dir_fd=fd)
             os.close(fd)
             fd = child
         yield fd, parts[-1]

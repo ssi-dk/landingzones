@@ -110,3 +110,33 @@ def test_ungrouped_move_flushes_without_changing_access_and_retries(stage, monke
     receiver.execute('prepare', request)
     assert stat.S_IMODE(data.stat().st_mode) == 0o640
     assert data.read_bytes() == b'abc'
+
+
+@pytest.mark.parametrize('operation', ['probe', 'prepare'])
+@pytest.mark.skipif(not hasattr(os, 'O_PATH') or os.geteuid() == 0,
+                    reason='requires Linux search-permission checks under an unprivileged receiver')
+def test_receiver_accepts_search_only_ancestors_and_requires_traverse(stage, operation):
+    package, request = stage
+    ancestor = package.parent.parent
+    original_mode = stat.S_IMODE(ancestor.stat().st_mode)
+    try:
+        ancestor.chmod(0o100)
+        with pytest.raises(PermissionError):
+            os.listdir(ancestor)
+        receiver.execute(operation, request)
+        ancestor.chmod(0o400)
+        with pytest.raises(PermissionError):
+            receiver.execute(operation, request)
+    finally:
+        ancestor.chmod(original_mode)
+
+
+@pytest.mark.parametrize('operation', ['probe', 'prepare'])
+def test_receiver_rejects_symlink_in_queue_ancestors(stage, operation):
+    package, request = stage
+    ancestor = package.parent.parent
+    alias = ancestor / 'alias'
+    alias.symlink_to(ancestor, target_is_directory=True)
+    request['root'] = str(alias / Path(request['root']).name)
+    with pytest.raises(OSError):
+        receiver.execute(operation, request)
