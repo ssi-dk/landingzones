@@ -157,8 +157,10 @@ def test_disabled_unselected_runtime_and_unused_malformed_credentials_are_ignore
     assert all(item['credential_check'] == 'not_required' for item in report['connections'][0]['checks'])
 
 
-def test_rsync_checks_product_openssh_options_remote_capability_and_local_binary(config, remote):
-    row = config.row('rsync', adapter='rsync', destination='ssh://writer@remote.invalid:2222/root', credential_ref='one')
+@pytest.mark.parametrize('direction', ['source', 'destination'])
+def test_rsync_checks_product_openssh_options_remote_capability_and_local_binary(config, remote, direction):
+    row = config.row('rsync', adapter='rsync', credential_ref='one',
+                     **{direction: 'ssh://writer@remote.invalid:2222/root'})
     report = validation.validate_credentials(config.write([row], credentials('one')))
     assert report['status'] == 'passed'
     assert len(remote.processes) == 2
@@ -167,6 +169,9 @@ def test_rsync_checks_product_openssh_options_remote_capability_and_local_binary
     assert argv[argv.index('-i') + 1] == str(config.root / 'one.key')
     assert 'IdentitiesOnly=yes' in argv and 'StrictHostKeyChecking=yes' in argv
     assert 'UserKnownHostsFile=' + str(config.root / 'one.hosts') in argv
+    if direction == 'source':
+        assert argv[argv.index('-F') + 1] == '/dev/null'
+        assert 'IdentityAgent=none' in argv and 'GlobalKnownHostsFile=/dev/null' in argv
     assert argv[-3:] == ['--', 'writer@remote.invalid', 'rsync --version']
     assert options == dict(check=True, capture_output=True, text=True, timeout=30)
     assert remote.processes[1][0] == ['rsync', '--version']

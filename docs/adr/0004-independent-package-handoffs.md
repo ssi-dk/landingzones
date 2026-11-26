@@ -136,3 +136,13 @@ Local fault-injection tests cover partial cleanup, failed publication and a cras
 after rename followed by immediate consumer removal. Filesystem-backed SFTP tests
 exercise pull/copy APIs without server connections; they do not establish server
 or remote filesystem behavior. Server rollout and evidence remain user-owned.
+
+## Bulk pulls into local staging
+
+Select `adapter=rsync` with an `ssh://` source and a local destination to use
+one rsync invocation per accepted package. SFTP still provides discovery,
+inventory and verified source cleanup. The receiver writes admitted paths
+directly into the receipt's private stage and flushes it before cleanup.
+A retry can reuse complete staged files. The rsync inactivity timeout allows
+a continuously progressing large package to run for longer than an hour.
+An existing receipt resumes with its recorded adapter.

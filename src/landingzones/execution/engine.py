@@ -324,8 +324,12 @@ class Executor:
                 if source.inspect(payload) != state['manifest']:
                     raise ValueError('Source changed since acceptance')
                 cache = self.store.root / 'source-cache' / work['step_id']
-                local = source.materialize(payload, cache, state['manifest'])
-                transport.copy(local, stage, state['manifest'])
+                if step.rsync_source_pull:
+                    with transport.staging_directory(stage) as path:
+                        source.transport.pull_directory(payload, path, state['manifest'], self.store.execution_lock)
+                else:
+                    local = source.materialize(payload, cache, state['manifest'])
+                    transport.copy(local, stage, state['manifest'])
                 if source.inspect(payload) != state['manifest']:
                     raise ValueError('Source changed during transfer')
                 if not matches(transport.inspect(stage), state['manifest'], step.verification):

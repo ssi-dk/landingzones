@@ -9,6 +9,7 @@ import pwd
 import shutil
 import socket
 import stat
+import subprocess
 
 import pytest
 import yaml
@@ -392,6 +393,103 @@ def test_configured_remote_pull_and_cleanup_use_local_handoff(setup, filesystem_
     assert state['status'] == 'completed'
     assert not payload.exists()
     assert (root / 'a/run-123/data.txt').read_text() == 'accepted data'
+
+
+def configure_rsync_pull(setup, source_root=None):
+    root, payload, rows, write, config, request = setup
+    if source_root:
+        payload.parent.rename(source_root)
+        payload = source_root / payload.name
+    rows[0].update(source='ssh://producer@example.invalid:2222' + str(payload.parent),
+                   adapter='rsync', operation='move', verification='size', credential_ref='test')
+    write()
+    credentials(config)
+    return root, payload, Executor(config), request
+
+
+def test_rsync_pull_uses_private_stage_and_preserves_source_on_failure(setup, filesystem_sftp, monkeypatch):
+    root, payload, executor, request = configure_rsync_pull(setup)
+    commands = []
+
+    def transfer(argv, *, input, pass_fds, **kwargs):
+        import fcntl
+        stage = Path(argv[-1])
+        assert stage.parent == root / '.landingzones-staging-a'
+        assert set(input.rstrip(b'\0').split(b'\0')) == {b'data.txt', b'empty.txt', b'empty-directory'}
+        assert argv[0] == 'rsync' and '--protect-args' in argv
+        assert argv[-2] == 'producer@example.invalid:' + str(payload) + '/'
+        assert '--checksum' not in argv and '--remove-source-files' not in argv
+        lock = root / 'state/execution.lock'
+        assert len(pass_fds) == 1 and os.fstat(pass_fds[0]).st_ino == lock.stat().st_ino
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+        assert kwargs.get('timeout') is None
+        scratch = stage.with_name('.rsync-' + stage.name)
+        assert '--temp-dir=' + str(scratch) in argv
+        commands.append(argv)
+        if len(commands) == 1:
+            (scratch / '.interrupted-file').write_text('incomplete')
+            (stage / 'data.txt').write_text('part')
+            raise subprocess.CalledProcessError(23, argv)
+        for path in payload.iterdir():
+            if path.is_dir():
+                (stage / path.name).mkdir()
+            elif path.name != '.ready':
+                shutil.copyfile(path, stage / path.name)
+
+    def no_get(*args):
+        pytest.fail('Direct rsync pulls must bypass individual SFTP downloads')
+
+    monkeypatch.setattr(filesystem_sftp, 'get', no_get)
+    monkeypatch.setattr(adapters.subprocess, 'run', transfer)
+    state = executor.submit(request)
+    assert state['status'] == 'blocked' and step(state)['attempts'][-1]['phase'] == 'transfer'
+    assert payload.is_dir() and not (root / 'a' / payload.name).exists()
+    assert not (root / 'state/source-cache').exists()
+    retry = executor.resume(state['request_id'])
+    assert retry['status'] == 'completed' and retry['request_id'] == state['request_id']
+    assert len(commands) == 2 and commands[0] == commands[1]
+    assert not list((root / '.landingzones-staging-a').iterdir())
+    assert not payload.exists() and (root / 'a/run-123/data.txt').read_text() == 'accepted data'
+
+
+def test_real_rsync_pull_over_local_shell_fixture(setup, filesystem_sftp, monkeypatch):
+    # Simulate only SSH transport: both sides execute the installed rsync locally.
+    rsync = shutil.which('rsync')
+    help_text = subprocess.check_output([rsync, '--help'], text=True) if rsync else ''
+    if '--protect-args' not in help_text and '--secluded-args' not in help_text:
+        pytest.skip('Requires rsync with protected arguments')
+    root, payload, executor, request = configure_rsync_pull(setup, setup[0] / 'input [ab]')
+    # A generator using an unescaped source glob would read this other queue.
+    shadow = root / 'input a' / payload.name
+    shadow.mkdir(parents=True)
+    (shadow / 'data.txt').write_text('wrong queue')
+    bin_dir = root / 'bin'
+    bin_dir.mkdir()
+    ssh = bin_dir / 'ssh'
+    ssh.write_text('#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != rsync ]; do shift; done\n'
+                   '[ "$1" = rsync ] && [ "$2" = --server ] && [ "$3" = --sender ] || exit 2\n'
+                   'exec "$@"\n')
+    ssh.chmod(0o700)
+    monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
+    (payload / 'nested files').mkdir()
+    special = Path('nested files') / 'data [part 1]; a.fastq'
+    (payload / special).write_bytes(b'sequence')
+    (payload / '.dotfile').write_bytes(b'hidden')
+    (payload / '.landing_zones').mkdir()
+    (payload / '.landing_zones/metadata').touch()
+    state = executor.submit(request)
+    assert state['status'] == 'completed', step(state)['attempts']
+    published = root / 'a' / payload.name
+    assert (published / special).read_bytes() == b'sequence'
+    assert (published / '.dotfile').read_bytes() == b'hidden'
+    assert (published / 'empty-directory').is_dir()
+    assert not (published / '.ready').exists() and not (published / '.landing_zones').exists()
+    assert not payload.exists() and not (root / 'state/source-cache').exists()
 
 
 @pytest.mark.parametrize('remote_source', [False, True])

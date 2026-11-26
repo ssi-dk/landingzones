@@ -106,11 +106,12 @@ def _rsync_version(command):
         raise ValueError('Endpoint did not report rsync capability')
 
 
-def _remote_rsync(step, settings):
-    transport = RemoteRsyncAdapter(step, settings)
+def _remote_rsync(step, settings, endpoint):
+    transport = RemoteRsyncAdapter(replace(step, destination=endpoint), settings)
     host = transport.target.username + '@' + transport.target.hostname
     # The remote command is constant. Local argv is never passed to a shell.
-    _rsync_version(transport.ssh_command() + ['--', host, 'rsync --version'])
+    ssh = transport.pull_ssh_command() if step.rsync_source_pull else transport.ssh_command()
+    _rsync_version(ssh + ['--', host, 'rsync --version'])
 
 
 def _ena_directory(step, settings):
@@ -143,9 +144,9 @@ def _endpoint(checks, step, settings, config_dir, direction):
     else:
         _check(checks, direction, 'authentication_host_key_and_root_listing', transport,
                step.credential_ref, lambda: _sftp_directory(step, resolved, endpoint))
-        if direction == 'destination' and step.adapter == 'rsync':
+        if step.adapter == 'rsync' and (direction == 'destination' or step.rsync_source_pull):
             _check(checks, direction, 'ssh_authentication_and_rsync_capability', 'rsync_ssh',
-                   step.credential_ref, lambda: _remote_rsync(step, resolved))
+                   step.credential_ref, lambda: _remote_rsync(step, resolved, endpoint))
 
 
 def validate_credentials(config_path, connection=None):

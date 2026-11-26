@@ -1,4 +1,5 @@
 """Transport operations; lifecycle decisions belong to the executor."""
+from contextlib import contextmanager
 import errno
 import ctypes
 import grp
@@ -182,7 +183,8 @@ class LocalAdapter:
             finally:
                 os.close(fd)
 
-    def copy(self, source, relative, accepted):
+    @contextmanager
+    def staging_directory(self, relative):
         path = Path(local_root(os.path.normpath(str(self.root / relative))))
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         path.mkdir(exist_ok=True, mode=0o700)
@@ -190,19 +192,7 @@ class LocalAdapter:
             raise ValueError('Staging and destination must be on the same filesystem')
         if path.parent.stat().st_uid != os.geteuid() or path.parent.stat().st_mode & 0o077:
             raise ValueError('Staging root must be private to the executor (mode 0700)')
-        if self.step.adapter == 'rsync':
-            subprocess.run(['rsync', '-r', '--delete', '--exclude=/.ready', '--exclude=/' + LABEL, '--exclude=/.landing_zones/', '--',
-                            str(source) + '/', str(path) + '/'], check=True, timeout=3600)
-        else:
-            # A retry replaces only the UUID-owned staging directory.
-            for key, item in accepted.items():
-                destination = path / key
-                local_root(str(destination))
-                if item['kind'] == 'directory':
-                    destination.mkdir(parents=True, exist_ok=True)
-                else:
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(Path(source) / key, destination)
+        yield path
         # Flush copied contents before publication. Directory persistence is flushed below.
         for item in path.rglob('*'):
             if item.is_file():
@@ -214,6 +204,22 @@ class LocalAdapter:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
+
+    def copy(self, source, relative, accepted):
+        with self.staging_directory(relative) as path:
+            if self.step.adapter == 'rsync':
+                subprocess.run(['rsync', '-r', '--delete', '--exclude=/.ready', '--exclude=/' + LABEL, '--exclude=/.landing_zones/', '--',
+                                str(source) + '/', str(path) + '/'], check=True, timeout=3600)
+            else:
+                # A retry replaces only the UUID-owned staging directory.
+                for key, item in accepted.items():
+                    destination = path / key
+                    local_root(str(destination))
+                    if item['kind'] == 'directory':
+                        destination.mkdir(parents=True, exist_ok=True)
+                    else:
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(Path(source) / key, destination)
 
     def _rename(self, source, destination):
         try:
@@ -471,12 +477,43 @@ class RemoteRsyncAdapter(SFTPAdapter):
                '-o', 'UserKnownHostsFile=' + self.credentials['known_hosts_file'],
                '-o', 'ConnectTimeout=10']
 
-    def copy(self, source, relative, accepted):
-        self.prepare_stage(relative)
+    def remote_directory(self, relative, *, literal_source=False):
         host = self.target.hostname
+        if host.startswith('-') or self.target.username.startswith('-'):
+            raise ValueError('Invalid rsync SSH endpoint')
         if ':' in host:
             host = '[' + host + ']'
-        remote = self.target.username + '@' + host + ':' + self.path(relative) + '/'
+        path = self.path(relative)
+        if literal_source:
+            # With protected arguments rsync expands source globs on the sender.
+            # Escape its glob grammar independently of shell argument protection.
+            path = ''.join('\\' + c if c in '\\[*?' else c for c in path)
+        return self.target.username + '@' + host + ':' + path + '/'
+
+    def pull_ssh_command(self):
+        return self.ssh_command() + ['-F', '/dev/null', '-o', 'IdentityAgent=none',
+                                     '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'UpdateHostKeys=no']
+
+    def pull_directory(self, payload, path, accepted, execution_lock):
+        # --files-from implies --dirs and disables recursive descent. Only admitted
+        # entries are requested, including empty directories and ordinary dotfiles.
+        entries = b''.join(os.fsencode(key) + b'\0' for key in sorted(accepted))
+        # Interrupted receiver temporary files must not become inventory entries.
+        scratch = Path(local_root(str(path.with_name('.rsync-' + path.name))))
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        argv = ['rsync', '--dirs', '--times', '--chmod=Du+rwx,Fu+rw', '--from0', '--files-from=-',
+                '--temp-dir=' + str(scratch),
+                '--protect-args', '--timeout=300', '-e', shlex.join(self.pull_ssh_command()),
+                '--', self.remote_directory(payload, literal_source=True), str(path) + '/']
+        # Keep the existing runtime lock across worker termination while a child
+        # can still write the private stage. The last descriptor close releases it.
+        subprocess.run(argv, input=entries, check=True, capture_output=True,
+                       pass_fds=(execution_lock.fileno(),))
+        shutil.rmtree(scratch)
+
+    def copy(self, source, relative, accepted):
+        self.prepare_stage(relative)
+        remote = self.remote_directory(relative)
         subprocess.run(['rsync', '-r', '--delete', '--protect-args', '--exclude=/.ready', '--exclude=/' + LABEL, '--exclude=/.landing_zones/',
                         '-e', shlex.join(self.ssh_command()), '--', str(source) + '/', remote],
                        check=True, capture_output=True, text=True, timeout=3600)

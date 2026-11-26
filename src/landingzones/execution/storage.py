@@ -31,13 +31,18 @@ def atomic_json(path, value):
 class StateStore:
     def __init__(self, root):
         self.root = Path(root)
+        self.execution_lock = None
 
     @contextmanager
     def locked(self):
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         with (self.root / 'execution.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            yield self
+            self.execution_lock = lock
+            try:
+                yield self
+            finally:
+                self.execution_lock = None
 
     def path(self, request_id):
         # IDs come from hashes/UUIDs; never allow an arbitrary filesystem path.

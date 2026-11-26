@@ -394,7 +394,7 @@ def write_bundle_metadata(dist_root, runtime, source, packages):
         **source,
         "platform": {"system": runtime["system"], "machine": runtime["machine"]},
         "python_version": runtime["version"],
-        "capabilities": ["sftp", "ena", "local-publication-group", "durable-sftp-move", "size-only-transfers"],
+        "capabilities": ["sftp", "ena", "local-publication-group", "durable-sftp-move", "size-only-transfers", "rsync-source-pull"],
         "packages": packages,
     }
     publication = publication_metadata(source)

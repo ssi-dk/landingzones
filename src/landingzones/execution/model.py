@@ -31,6 +31,11 @@ class Step:
     publication_group: str = ''
     publication_directory_mode: str = ''
 
+    @property
+    def rsync_source_pull(self):
+        return (self.adapter == 'rsync' and self.source.startswith('ssh://')
+                and '://' not in self.destination)
+
     def publication_mode_for(self, directory):
         return int(self.publication_directory_mode or '0770', 8) if directory else 0o660
 

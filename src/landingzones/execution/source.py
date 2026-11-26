@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import stat
 
-from .adapters import SFTPAdapter, manifest, cleanup, digest
+from .adapters import RemoteRsyncAdapter, SFTPAdapter, manifest, cleanup, digest
 from .model import local_root, name
 from .package import LABEL, is_metadata
 
@@ -14,7 +14,8 @@ class Source:
     def __init__(self, step, settings):
         self.step = step
         self.remote = step.source.startswith(('ssh://', 'sftp://'))
-        self.transport = SFTPAdapter(replace(step, destination=step.source), settings) if self.remote else None
+        adapter_type = RemoteRsyncAdapter if step.rsync_source_pull else SFTPAdapter
+        self.transport = adapter_type(replace(step, destination=step.source), settings) if self.remote else None
         self.root = None if self.remote else Path(local_root(step.source))
 
     def __enter__(self):

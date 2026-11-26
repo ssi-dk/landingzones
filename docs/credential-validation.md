@@ -31,7 +31,7 @@ landingzones --config /path/to/runtime/config/execution.yaml transfer validate-c
 | Configured access | Checks |
 | --- | --- |
 | SFTP destination or remote source (`sftp://` or `ssh://`) | Selected credential files, pinned host verification, authentication, SFTP subsystem, configured root and directory listing. |
-| Rsync over SSH destination | Required SFTP access plus the local rsync executable and a bounded `rsync --version` command through OpenSSH using the transfer's key/host options. |
+| Rsync over SSH destination or rsync pull from an `ssh://` source into a local destination | Required SFTP access plus the local rsync executable and a bounded `rsync --version` command through OpenSSH using the transfer's key/host options. |
 | ENA | Selected Webin credentials, TLS-protected FTP login and upload-root listing. |
 | Local source/destination | Directory availability and read/traverse access; local rsync connections also require a working rsync executable. There is no remote credential to authenticate. |
 
