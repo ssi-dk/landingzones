@@ -15,7 +15,7 @@ from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 
 from .model import local_root
-from .package import LABEL, is_metadata
+from .package import LABEL, is_metadata, size_inventory
 
 
 def digest(handle):
@@ -25,13 +25,14 @@ def digest(handle):
     return result.hexdigest()
 
 
-def manifest(root):
+def manifest(root, verification='checksum'):
     root = Path(local_root(str(root)))
     if not root.is_dir():
         raise ValueError('Payload must be a directory: ' + str(root))
     result = {}
     for path in sorted(root.rglob('*')):
-        mode = path.lstat().st_mode
+        attributes = path.lstat()
+        mode = attributes.st_mode
         relative = path.relative_to(root).as_posix()
         if stat.S_ISLNK(mode) or not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
             raise ValueError('Symlinks and special payload files are unsupported')
@@ -41,40 +42,46 @@ def manifest(root):
             continue
         if any(c in relative for c in '\0\n\r'):
             raise ValueError('Control characters in payload names are unsupported')
-        if path.is_dir():
+        if stat.S_ISDIR(mode):
             result[relative] = {'kind': 'directory'}
         else:
-            with path.open('rb') as handle:
-                result[relative] = {'kind': 'file', 'size': path.stat().st_size, 'sha256': digest(handle)}
+            entry = {'kind': 'file', 'size': attributes.st_size}
+            if verification == 'checksum':
+                with path.open('rb') as handle:
+                    entry['sha256'] = digest(handle)
+            result[relative] = entry
     return result
 
 
 def matches(actual, expected, verification='checksum'):
     if verification == 'size':
-        def sizes(value):
-            return {key: {k: v for k, v in item.items() if k != 'sha256'} for key, item in value.items()}
-        return sizes(actual) == sizes(expected)
+        return size_inventory(actual) == size_inventory(expected)
     return actual == expected
 
 
-def cleanup(root, accepted):
+def cleanup(root, accepted, verification='checksum'):
     """Resume partial cleanup without removing unaccepted or changed content."""
     root = Path(local_root(str(root)))
     if not root.exists():
         return
-    remaining = manifest(root)
+    remaining = manifest(root, verification)
     if any(key not in accepted or value != accepted[key] for key, value in remaining.items()):
         raise ValueError('Source changed; cleanup refused')
     for relative in sorted(remaining, key=lambda item: (item.count('/'), item), reverse=True):
         path = root / relative
         if remaining[relative]['kind'] == 'directory':
             path.rmdir()
-        else:
+            continue
+        if verification == 'checksum':
             # Producer must relinquish writes after readiness; recheck before removal.
             with path.open('rb') as handle:
                 if digest(handle) != accepted[relative]['sha256']:
                     raise ValueError('Source changed during cleanup')
-            path.unlink()
+        else:
+            attributes = path.lstat()
+            if not stat.S_ISREG(attributes.st_mode) or attributes.st_size != accepted[relative]['size']:
+                raise ValueError('Source changed during cleanup')
+        path.unlink()
     for metadata in (LABEL, '.landing_zones'):
         path = root / metadata
         if path.is_dir():
@@ -142,7 +149,7 @@ class LocalAdapter:
         return path.exists()
 
     def inspect(self, relative):
-        return manifest(local_root(os.path.normpath(str(self.root / relative))))
+        return manifest(local_root(os.path.normpath(str(self.root / relative))), self.step.verification)
 
     def prepare_publication(self, relative, accepted):
         if self.publication_gid is None:

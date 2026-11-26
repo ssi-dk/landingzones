@@ -19,6 +19,27 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _matches_receipt(existing, plan):
+    keys = [plan['receipt_key']]
+    if plan['previous_copy_key'] is not None and existing['status'] == 'completed':
+        keys.append(plan['previous_copy_key'])
+    previous_key = existing.get('receipt_key')
+    if previous_key in keys:
+        return True
+    if (not previous_key or plan['connection']['verification'] != 'size'
+            or not matches(existing['manifest'], plan['manifest'], 'size')):
+        return False
+    # The change from checksums to sizes can change the version of an unlabelled
+    # retained source. Do not publish it again under a different request key.
+    previous = json.loads(previous_key)
+    for key in keys:
+        candidate = json.loads(key)
+        candidate[6] = previous[6]
+        if candidate == previous:
+            return True
+    return False
+
+
 class Executor:
     def __init__(self, config_file):
         self.settings = load_settings(config_file)
@@ -88,10 +109,11 @@ class Executor:
                 raise ValueError('Producer completion marker .ready is required')
             contents = source.inspect(payload)
             previous = source.label(payload)
-            label = admit(contents, previous, step.admission_policy, request.get('itinerary'))
+            label = admit(contents, previous, step.admission_policy, request.get('itinerary'),
+                          verification=step.verification)
         adapter_request = transport.prepare_request(options, contents) if hasattr(transport, 'prepare_request') else {}
         # An unlabelled package has a stable local admission key until it receives a label.
-        identity = previous.get('package_id') if isinstance(previous, dict) and previous.get('content_version') == label['content_version'] else None
+        identity = previous.get('package_id') if isinstance(previous, dict) and previous.get('package_id') == label['package_id'] else None
         receipt_parts = [step.runtime_id, step.identifiers, step.source, step.destination, step.operation,
                          identity, label['content_version'], payload]
         # Retained copies already delivered by an ungrouped route must not be
@@ -126,9 +148,7 @@ class Executor:
                 plan = self.preflight(request)
                 for path in self.store.root.glob('*.json'):
                     existing = json.loads(path.read_text())
-                    previous_copy = (plan['previous_copy_key'] is not None and existing.get('status') == 'completed'
-                                     and existing.get('receipt_key') == plan['previous_copy_key'])
-                    if previous_copy or existing.get('receipt_key') == plan['receipt_key']:
+                    if _matches_receipt(existing, plan):
                         self._validate_state(existing)
                         return self._execute(existing)
                 def work(definition):
@@ -289,11 +309,15 @@ class Executor:
         if work['status'] == 'completed' or (work['status'] == 'parked' and not accepted):
             return
         step = Step(**work['definition'])
+        source_step = step
+        if step.verification == 'size' and any('sha256' in entry for entry in state['manifest'].values()):
+            # Older size-copy receipts still accepted a full source checksum manifest.
+            source_step = replace(step, verification='checksum')
         payload = state['payload_name']
         remote_move = step.adapter == 'sftp' and step.operation == 'move'
         # Each phase opens its own transport so connectivity failures are recorded.
         def transfer():
-            with adapter(step, self.settings) as transport, Source(step, self.settings) as source:
+            with adapter(step, self.settings) as transport, Source(source_step, self.settings) as source:
                 stage = transport.stage_name(work['step_id'])
                 if getattr(transport, 'publication_mode', 'rename') == 'rename' and transport.exists(payload):
                     raise FileExistsError('Destination conflict')
@@ -326,7 +350,7 @@ class Executor:
         if not work.get('staged') and not self._phase(state, work, 'transfer', transfer):
             return
         def clean():
-            with adapter(step, self.settings) as transport, Source(step, self.settings) as source:
+            with adapter(step, self.settings) as transport, Source(source_step, self.settings) as source:
                 stage = transport.stage_name(work['step_id'])
                 if not matches(transport.inspect(stage), state['manifest'], step.verification):
                     raise ValueError('Staging changed; cleanup refused')
@@ -380,7 +404,7 @@ class Executor:
             self._event(state, work, attempt, 'delivered', 'promotion')
         if remote_move and not work.get('cleaned'):
             def clean_published():
-                with Source(step, self.settings) as source:
+                with Source(source_step, self.settings) as source:
                     source.remove(payload, state['manifest'])
                 work['cleaned'] = True
                 self.store.save(state)

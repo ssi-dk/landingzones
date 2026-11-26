@@ -170,8 +170,6 @@ def load_steps(settings, *, validate_credentials=True):
                 if '://' in step.source or not step.destination.startswith('ena://'):
                     raise ValueError('ENA requires a local source and an ena:// destination')
                 # Credentials are required only when this optional adapter is selected.
-            if step.operation == 'move' and step.verification != 'checksum':
-                raise ValueError('Moves require checksum verification before source deletion')
             if step.verification not in ('checksum', 'size') or step.max_attempts < 1:
                 raise ValueError('Invalid verification or attempt policy')
             if row.get('destination_exists', 'fail') not in ('', 'fail'):

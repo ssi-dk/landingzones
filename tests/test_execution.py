@@ -16,7 +16,7 @@ import yaml
 from landingzones.execution.engine import Executor
 from landingzones.execution.adapters import LocalAdapter
 from landingzones.execution import adapters, source as source_module
-from landingzones.execution.package import LABEL
+from landingzones.execution.package import LABEL, admit
 from landingzones.execution.storage import StateStore
 
 
@@ -392,6 +392,117 @@ def test_configured_remote_pull_and_cleanup_use_local_handoff(setup, filesystem_
     assert state['status'] == 'completed'
     assert not payload.exists()
     assert (root / 'a/run-123/data.txt').read_text() == 'accepted data'
+
+
+@pytest.mark.parametrize('remote_source', [False, True])
+def test_size_only_move_does_not_hash_payload_and_preserves_known_label(setup, filesystem_sftp, monkeypatch, remote_source):
+    root, payload, rows, write, config, _ = setup
+    previous = admit(adapters.manifest(payload))
+    (payload / LABEL).write_text(json.dumps(previous))
+    rows[0].update(operation='move', verification='size')
+    if remote_source:
+        rows[0].update(source='sftp://producer@example.invalid' + str(payload.parent), credential_ref='test')
+        credentials(config)
+    write()
+
+    def unexpected_digest(*args):
+        pytest.fail('Size-only verification hashed payload bytes')
+
+    monkeypatch.setattr(adapters, 'digest', unexpected_digest)
+    monkeypatch.setattr(source_module, 'digest', unexpected_digest)
+    state, = Executor(config).discover('a')['results']
+    assert state['status'] == 'completed'
+    assert state['manifest']['data.txt'] == {'kind': 'file', 'size': len('accepted data')}
+    assert not payload.exists()
+    published = root / 'a' / payload.name
+    assert (published / 'data.txt').read_text() == 'accepted data'
+    label = json.loads((published / LABEL).read_text())
+    assert label['package_id'] == previous['package_id']
+    assert label['content_version'] == previous['content_version']
+    assert label['verification'] == 'size'
+
+
+def test_size_only_move_keeps_source_after_staging_size_changes(setup, monkeypatch):
+    root, payload, rows, write, config, request = setup
+    rows[0].update(operation='move', verification='size')
+    write()
+    copy = LocalAdapter.copy
+
+    def truncate_stage(transport, source, relative, accepted):
+        copy(transport, source, relative, accepted)
+        (transport.root / relative / 'data.txt').write_text('short')
+
+    monkeypatch.setattr(LocalAdapter, 'copy', truncate_stage)
+    state = Executor(config).submit(request)
+    assert state['status'] == 'blocked'
+    assert step(state)['attempts'][-1]['error'] == 'Staging verification failed'
+    assert (payload / 'data.txt').read_text() == 'accepted data'
+    assert not (root / 'a' / payload.name).exists()
+
+
+def test_size_only_copy_reuses_a_completed_checksum_receipt(setup):
+    root, payload, rows, write, config, request = setup
+    first = Executor(config).submit(request)
+    assert first['status'] == 'completed'
+    shutil.rmtree(root / 'a' / payload.name)
+    rows[0]['verification'] = 'size'
+    write()
+    repeat, = Executor(config).discover('a')['results']
+    assert repeat['request_id'] == first['request_id']
+    assert payload.exists()
+    assert not (root / 'a' / payload.name).exists()
+
+
+def test_legacy_size_copy_receipt_can_resume_with_its_checksum_manifest(setup, monkeypatch):
+    root, payload, rows, write, config, request = setup
+    rows[0]['verification'] = 'size'
+    write()
+
+    def inspect_with_checksum(source, name):
+        return adapters.manifest(source.root / name)
+
+    def unavailable(*args):
+        raise OSError('copy unavailable')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(source_module.Source, 'inspect', inspect_with_checksum)
+        patch.setattr(LocalAdapter, 'copy', unavailable)
+        saved = Executor(config).submit(request)
+    assert saved['status'] == 'blocked'
+    assert 'sha256' in saved['manifest']['data.txt']
+
+    resumed = Executor(config).resume(saved['request_id'])
+    assert resumed['status'] == 'completed'
+    assert payload.exists()
+    assert (root / 'a' / payload.name / 'data.txt').read_text() == 'accepted data'
+
+
+def test_size_only_remote_move_keeps_source_until_publication(setup, openssh_pipe, monkeypatch):
+    root, payload, rows, write, config, request = setup
+    rows[0].update(destination='sftp://receiver@example.invalid' + str(root / 'a'),
+                   adapter='sftp', operation='move', verification='size', credential_ref='test')
+    write()
+    credentials(config)
+
+    def unexpected_digest(*args):
+        pytest.fail('Size-only verification hashed payload bytes')
+
+    def unavailable(*args):
+        raise OSError('publication unavailable')
+
+    monkeypatch.setattr(adapters, 'digest', unexpected_digest)
+    monkeypatch.setattr(source_module, 'digest', unexpected_digest)
+    with monkeypatch.context() as patch:
+        patch.setattr(adapters.SFTPAdapter, 'promote', unavailable)
+        blocked = Executor(config).submit(request)
+    assert blocked['status'] == 'blocked'
+    assert payload.is_dir()
+    assert not (root / 'a' / payload.name).exists()
+    completed = Executor(config).resume(blocked['request_id'])
+    assert completed['status'] == 'completed'
+    assert step(completed)['published'] and step(completed)['cleaned']
+    assert (root / 'a' / payload.name / 'data.txt').read_text() == 'accepted data'
+    assert not payload.exists()
 
 
 def test_sftp_copy_receipt_and_remote_move_capability_gate(setup, filesystem_sftp):

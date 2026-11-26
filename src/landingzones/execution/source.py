@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import stat
 
-from .adapters import SFTPAdapter, manifest, cleanup
+from .adapters import SFTPAdapter, manifest, cleanup, digest
 from .model import local_root, name
 from .package import LABEL, is_metadata
 
@@ -14,7 +14,7 @@ class Source:
     def __init__(self, step, settings):
         self.step = step
         self.remote = step.source.startswith(('ssh://', 'sftp://'))
-        self.transport = SFTPAdapter(replace(step, destination=step.source, verification='checksum'), settings) if self.remote else None
+        self.transport = SFTPAdapter(replace(step, destination=step.source), settings) if self.remote else None
         self.root = None if self.remote else Path(local_root(step.source))
 
     def __enter__(self):
@@ -50,7 +50,7 @@ class Source:
         archive = payload + '/.landing_zones/landingzone-run-archive.tar'
         if (self.transport.exists(archive) if self.remote else (self.root / archive).exists()):
             raise ValueError('Legacy archive packages must remain on legacy routes or be unpacked before admission')
-        return self.transport.inspect(payload) if self.remote else manifest(self.root / payload)
+        return self.transport.inspect(payload) if self.remote else manifest(self.root / payload, self.step.verification)
 
     def read(self, relative):
         if self.remote:
@@ -92,7 +92,7 @@ class Source:
 
     def remove(self, payload, accepted):
         if not self.remote:
-            cleanup(self.root / payload, accepted)
+            cleanup(self.root / payload, accepted, self.step.verification)
             return
         t = self.transport
         if not t.exists(payload):
@@ -105,12 +105,16 @@ class Source:
             path = t.path(payload + '/' + key)
             if remaining[key]['kind'] == 'directory':
                 t.sftp.rmdir(path)
-            else:
-                from .adapters import digest
+                continue
+            if self.step.verification == 'checksum':
                 with t.sftp.open(path, 'rb') as handle:
                     if digest(handle) != accepted[key]['sha256']:
                         raise ValueError('Source changed during cleanup')
-                t.sftp.remove(path)
+            else:
+                attributes = t.check_path(path)
+                if not stat.S_ISREG(attributes.st_mode) or attributes.st_size != accepted[key]['size']:
+                    raise ValueError('Source changed during cleanup')
+            t.sftp.remove(path)
         def remove_metadata(relative):
             attributes = t.check_path(t.path(relative))
             if stat.S_ISDIR(attributes.st_mode):

@@ -74,6 +74,21 @@ available, accepted version and payload name. Another request key or scan reuses
 existing work. Unlabelled admissions across separate connections may assign distinct
 identities; use a managed labelled input when copies need shared identity.
 
+### Verification policy
+
+The default `checksum` policy compares file SHA-256 digests throughout admission,
+staging, publication and cleanup. A native local or SFTP connection can select
+`size` for a copy or a move. It compares relative paths, entry types and byte lengths.
+It still checks staging before source removal, refuses destination collisions and
+preserves the same publication and recovery ordering. Changes that preserve file
+size can pass size verification. ENA still requires a checksum-verified copy.
+
+Existing requests retain their accepted policy, including size-copy receipts that
+previously captured source checksums. A size-verified handoff can carry the previous
+package identity and historical checksum manifest when the size inventory matches.
+The label records `verification: size` for that handoff. A later checksum route
+can verify the carried checksum manifest or record checksums for a size-only label.
+
 ## Configured local endpoint mappings
 
 The executor supports an optional `local_path_base`, resolved relative to the

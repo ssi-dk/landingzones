@@ -14,12 +14,25 @@ def version(contents):
     return hashlib.sha256(json.dumps(contents, sort_keys=True).encode()).hexdigest()
 
 
-def admit(contents, previous=None, policy='strict', itinerary=None):
-    fingerprint = version(contents)
+def size_inventory(contents):
+    return {key: {field: value for field, value in entry.items() if field != 'sha256'}
+            for key, entry in contents.items()}
+
+
+def admit(contents, previous=None, policy='strict', itinerary=None, verification='checksum'):
+    previous_manifest = previous.get('manifest') if isinstance(previous, dict) else None
     valid = (isinstance(previous, dict) and previous.get('schema_version') in (0, 1)
              and isinstance(previous.get('package_id'), str) and previous['package_id']
-             and previous.get('content_version') == fingerprint
-             and previous.get('manifest') == contents)
+             and isinstance(previous_manifest, dict)
+             and all(isinstance(entry, dict) for entry in previous_manifest.values())
+             and previous.get('content_version') == version(previous_manifest))
+    if valid and previous_manifest != contents:
+        if verification == 'size' and size_inventory(previous_manifest) == contents:
+            # Carry the known previous digest as provenance without re-reading the source.
+            contents = previous_manifest
+        else:
+            valid = (previous.get('verification') == 'size'
+                     and previous_manifest == size_inventory(contents))
     if previous is not None and not valid and policy != 'relabel':
         raise ValueError('Unverifiable or changed package label; explicit relabel admission is required')
     if valid:
@@ -35,7 +48,9 @@ def admit(contents, previous=None, policy='strict', itinerary=None):
             raise ValueError('Invalid descriptive itinerary')
     else:
         label = {'package_id': str(uuid.uuid4())}
-    label.update(schema_version=1, content_version=fingerprint, manifest=contents)
+    label.update(schema_version=1, content_version=version(contents), manifest=contents)
+    if verification == 'size':
+        label['verification'] = 'size'
     if previous is not None and (not valid or previous.get('schema_version') != 1):
         label['source_metadata'] = previous
     elif valid and 'source_metadata' in previous:
