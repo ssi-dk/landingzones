@@ -620,6 +620,9 @@ def handle_monitor_serve(args, extra_args):
             "spools": config.monitoring_spools,
             "ingest_interval": config.monitoring_ingest_interval,
         }
+    if config.monitoring_scheduler_state_dir is not None:
+        ingestion['scheduler_state_dir'] = config.monitoring_scheduler_state_dir
+        ingestion['scheduler_runtime_ids'] = effective_runtime_ids(args) or config.runtime_ids
     monitoring_service.serve_monitoring(
         database_url,
         host=host,

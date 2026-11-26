@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlsplit
 
+from landingzones.scheduler_status import read_scheduler_status
 from landingzones.monitoring import _message_fields, ingest_event_spool, query_run_detail, query_run_summaries
 
 
@@ -135,12 +136,14 @@ td { overflow-wrap:anywhere; } td progress { min-width:5rem; }
 """
 
 
-def _page(title, content, queried_at_utc=None):
+def _page(title, content, queried_at_utc=None, discovery=False):
     stamp = escape(queried_at_utc or _queried_at_utc())
     overview = title == "Landing Zones Transfer Runs"
     nav = ('<nav aria-label="Run views"><a href="#current">Current runs</a>'
            '<a href="#attention">Needs attention</a><a href="#history">History</a></nav>'
            if overview else '<nav><a href="/">All runs</a></nav>')
+    if overview and discovery:
+        nav = nav.replace('<a href="#history">', '<a href="#discovery">Route discovery</a><a href="#history">')
     heading = 'Transfer runs' if overview else escape(title)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -284,11 +287,44 @@ def _search_form(query_string):
             f'value="{escape(current)}"><button>Search</button>{clear}</form>')
 
 
+def _scheduler_section(status):
+    if status is None:
+        return ''
+    title = '<section id="discovery"><h2>Route discovery</h2>'
+    if status['observation'] == 'unavailable':
+        return title + '<p class="empty">The scheduler status could not be read.</p></section>'
+    stamp = escape(status['observed_at_utc'])
+    if status['observation'] == 'held':
+        heading = 'Scheduler held'
+    elif status['observation'] == 'stale':
+        heading = 'Stale scheduler observation'
+    elif not status['enabled']:
+        heading = 'Scheduler held · draining active routes'
+    else:
+        heading = 'Scheduler enabled'
+    overview = (f'<p><strong>{heading}</strong> · {escape(status["runtime_id"])} · '
+                f'Last observed {stamp}</p><p class="muted">'
+                f'{status["running_routes"]} of {status["max_concurrent_transfers"]} slots in use at observation · '
+                f'Discovery interval {status["discovery_interval_seconds"]}s</p>')
+    rows = []
+    for route in status['routes']:
+        fields = (route['transfer_identifier'], route['state_label'], route['last_scanned_at_utc'],
+                  route['next_due_at_utc'], route['started_at_utc'], route['worker_pid'])
+        rows.append('<tr>' + ''.join(f'<td>{escape(str(value)) if value is not None else "—"}</td>'
+                                     for value in fields) + '</tr>')
+    if not rows:
+        rows.append('<tr><td colspan="6">No matching discovery routes.</td></tr>')
+    return (title + overview + '<div class="table-scroll"><table><thead><tr><th>Route</th>'
+            '<th>Reported state</th><th>Last scan finished</th><th>Next due</th><th>Scan started</th>'
+            '<th>Worker PID</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div></section>')
+
+
 def _render_runs(
     runs,
     query_string="",
     show_without_directory=False,
     queried_at_utc=None,
+    scheduler=None,
 ):
     now = datetime.fromisoformat((queried_at_utc or _queried_at_utc()).replace("Z", "+00:00"))
     search = parse_qs(query_string).get('q', [''])[-1].strip().casefold()
@@ -420,8 +456,9 @@ def _render_runs(
         (current or '<p class="empty">No current attempts reported.</p>') + '</div></section>' +
         '<section id="attention"><h2>Needs attention</h2><div class="run-list">' +
         (attention or '<p class="empty">No failed runs or stale attempts in this view.</p>') + '</div></section>' +
-        '<section id="history"><h2>Run history</h2>' + controls +
-        '<div class="table-scroll">' + table + '</div></section>', queried_at_utc=queried_at_utc)
+        _scheduler_section(scheduler) + '<section id="history"><h2>Run history</h2>' + controls +
+        '<div class="table-scroll">' + table + '</div></section>', queried_at_utc=queried_at_utc,
+        discovery=scheduler is not None)
 
 
 
@@ -466,20 +503,45 @@ def _render_detail(detail, queried_at_utc=None):
 class MonitoringApplication:
     """Request boundary that queries current database state for every call."""
 
-    def __init__(self, database_url):
+    def __init__(self, database_url, scheduler_state_dir=None, scheduler_runtime_ids=()):
         self.database_url = database_url
+        self.scheduler_state_dir = scheduler_state_dir
+        self.scheduler_runtime_ids = scheduler_runtime_ids
+
+    def _scheduler(self, query_string, queried_at_utc):
+        now = datetime.fromisoformat(queried_at_utc.replace('Z', '+00:00'))
+        status = read_scheduler_status(self.scheduler_state_dir, self.scheduler_runtime_ids, now)
+        if not status or 'runtime_id' not in status:
+            return status
+        query = parse_qs(query_string)
+        if query.get('runtime_id') and status['runtime_id'] not in query['runtime_id']:
+            return None
+        identifiers = query.get('transfer_identifier', [])
+        search = query.get('q', [''])[-1].strip().casefold()
+        status['routes'] = [
+            row for row in status['routes']
+            if (not identifiers or row['transfer_identifier'] in identifiers)
+            and (not search or search in row['transfer_identifier'].casefold()
+                 or search in status['runtime_id'].casefold())
+        ]
+        return status
 
     def respond(self, path, query_string=""):
         """Return an HTTP-style status, headers, and text response body."""
         queried_at_utc = _queried_at_utc()
+        if path == "/api/scheduler":
+            return _json_response({"queried_at_utc": queried_at_utc,
+                                   "scheduler": self._scheduler(query_string, queried_at_utc)})
         if path == "/api/runs":
             runs = query_run_summaries(
                 self.database_url,
                 **_query_filters(query_string)
             )
-            return _json_response(
-                {"queried_at_utc": queried_at_utc, "runs": runs}
-            )
+            result = {"queried_at_utc": queried_at_utc, "runs": runs}
+            scheduler = self._scheduler(query_string, queried_at_utc)
+            if scheduler is not None:
+                result["scheduler"] = scheduler
+            return _json_response(result)
         if path.startswith("/api/runs/"):
             run_id = unquote(path[len("/api/runs/") :])
             detail = query_run_detail(self.database_url, run_id)
@@ -516,6 +578,7 @@ class MonitoringApplication:
                     runs,
                     query_string=query_string,
                     show_without_directory=_show_without_directory(query_string),
+                    scheduler=self._scheduler(query_string, queried_at_utc),
                     queried_at_utc=queried_at_utc,
                 ),
             )
@@ -552,11 +615,11 @@ class SpoolIngestion:
 
 
 def serve_monitoring(database_url, host="127.0.0.1", port=8080,
-                     spools=(), ingest_interval=60):
+                     spools=(), ingest_interval=60, scheduler_state_dir=None, scheduler_runtime_ids=()):
     """Serve live monitoring pages until interrupted."""
     ingestor = SpoolIngestion(database_url, spools, ingest_interval)
     ingestor.poll(startup=True)
-    application = MonitoringApplication(database_url)
+    application = MonitoringApplication(database_url, scheduler_state_dir, scheduler_runtime_ids)
 
     class RequestHandler(BaseHTTPRequestHandler):
         def do_GET(self):

@@ -714,3 +714,37 @@ runtime_ids: [server1_prod.user1]
                      '--host', '127.0.0.1', '--port', '9002']) == 0
     assert calls[-1][1]['host'] == '127.0.0.1'
     assert calls[-1][1]['port'] == 9002
+
+
+def test_monitor_serve_finds_rolling_scheduler_relative_to_execution_config(tmp_path, monkeypatch, request):
+    import json
+    from datetime import datetime, timezone
+    original = cli.config.snapshot_state()
+    request.addfinalizer(lambda: cli.config.restore_state(original))
+    runtime = tmp_path / 'runtime'
+    cfg = runtime / 'config' / 'execution.yaml'
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text('''execution_schema_version: 1
+transfers_file: transfers.tsv
+state_dir: ../private-state
+event_spool: ../log/events.tsv
+runtime_ids: [alpha]
+execution_context: {system: fixture, user: receiver}
+''')
+    (cfg.parent / 'transfers.tsv').write_text('identifiers\truntime_id\tsystem\tusers\texecutor\n')
+    folder = runtime / 'private-state' / 'scheduler'
+    folder.mkdir(parents=True)
+    (folder / 'status.json').write_text(json.dumps(dict(schema_version=1, runtime_id='alpha',
+        observed_at_utc=datetime.now(timezone.utc).isoformat(), enabled=True,
+        dispatcher_pid=100, max_concurrent_transfers=5, discovery_interval_seconds=120, routes=[])))
+    received = []
+
+    def capture_listener(database_url, host, port, **options):
+        app = cli.monitoring_service.MonitoringApplication(database_url, **options)
+        received.append(json.loads(app.respond('/api/scheduler')[2])['scheduler'])
+
+    monkeypatch.setattr(cli.monitoring_service, 'serve_monitoring', capture_listener)
+    monkeypatch.chdir(tmp_path)
+    args = ['--config', str(cfg), 'monitor', 'serve', '--database-url', 'sqlite:///test.sqlite']
+    assert cli.main(args) == 0 and received[-1]['runtime_id'] == 'alpha'
+    assert cli.main(args + ['--runtime-id', 'other']) == 0 and received[-1] is None

@@ -38,3 +38,19 @@ detail exposes all phase attempts in `attempts` and the original events in
 attempt. A retry starts its own counters. A subsequent publication or cleanup
 phase may report the previous payload's measured bytes and sample time. Those
 phases have their own elapsed time and receive no payload rate or ETA.
+
+A native runtime can also expose an atomic version-1 route-discovery snapshot
+in `scheduler/status.json` under its configured `state_dir`. The report reads
+this optional file on each request. The Route discovery section and
+`GET /api/scheduler` expose the dispatcher observation, slot limit, discovery
+interval and each route's last finished scan, next due time, current scan start
+and reported worker PID. The scheduler's stated wait reason distinguishes a
+slot wait from an overlapping queue or contention outside the dispatcher.
+A successful scan can find zero packages. Package delivery and byte counts
+continue to come from the Transfer Event Spool.
+
+The API returns `scheduler: null` when no snapshot is present for the selected
+runtime. With an enabled dispatcher, an observation more than two minutes old
+is stale; route states and PIDs are historical at that observation. A persisted
+hold with no dispatcher or running workers remains held. New writer fields
+are ignored. A malformed or inaccessible snapshot is reported as unavailable.

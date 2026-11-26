@@ -45,6 +45,7 @@ Example config.yaml:
 """
 
 import os
+from pathlib import Path
 try:
     import yaml
     YAML_AVAILABLE = True
@@ -127,6 +128,15 @@ def _normalize_string_list(value):
     return normalized
 
 
+def _default_config_file():
+    for search_dir in CONFIG_SEARCH_DIRS:
+        for name in CONFIG_FILE_NAMES:
+            candidate = Path.cwd() / search_dir / name
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def _load_yaml_config(config_file=None):
     """Load configuration from a YAML file.
     
@@ -147,15 +157,10 @@ def _load_yaml_config(config_file=None):
                 return yaml.safe_load(f) or {}
         return {}
     
-    # Search for default config file names in CWD and config/ subdirectory
-    cwd = os.getcwd()
-    for search_dir in CONFIG_SEARCH_DIRS:
-        for name in CONFIG_FILE_NAMES:
-            config_path = os.path.join(cwd, search_dir, name)
-            if os.path.exists(config_path):
-                with open(config_path, 'r') as f:
-                    return yaml.safe_load(f) or {}
-    
+    default = _default_config_file()
+    if default:
+        with default.open() as handle:
+            return yaml.safe_load(handle) or {}
     return {}
 
 
@@ -326,6 +331,17 @@ class Config:
         return [_expand_path(path) for path in _normalize_string_list(
             self._get_setting('monitoring_spools', 'LZ_MONITORING_SPOOLS', [])
         )]
+
+    @property
+    def monitoring_scheduler_state_dir(self):
+        """Anchor native scheduler status to the same configured state directory as execution."""
+        if self._yaml_config.get('execution_schema_version') != 1:
+            return None
+        configured = self._yaml_config.get('state_dir')
+        origin = self._config_file or _default_config_file()
+        if not origin or not isinstance(configured, str) or not configured:
+            return None
+        return Path(_expand_path(str(origin))).resolve().parent.joinpath(configured).resolve()
 
     @property
     def monitoring_ingest_interval(self):

@@ -1410,3 +1410,79 @@ def test_monitoring_does_not_borrow_measurements_from_prior_attempt_or_request(t
     assert reset["attempt_id"] == rows[1].attempt_id
     assert reset["progress"]["bytes_done"] is None and reset["measurement"] == "unmeasured"
     assert malformed["progress"] is None and malformed["observation"] == "stale"
+
+
+def test_scheduler_snapshot_drives_index_and_api_without_transfer_events(tmp_path):
+    state = tmp_path / 'state'
+    folder = state / 'scheduler'
+    folder.mkdir(parents=True)
+    snapshot = folder / 'status.json'
+    app = MonitoringApplication('sqlite:///' + str(tmp_path/'report.sqlite'), state, ['runtime-A'])
+    assert json.loads(app.respond('/api/scheduler')[2])['scheduler'] is None
+    assert 'id="discovery"' not in app.respond('/')[2]
+    assert 'scheduler' not in json.loads(app.respond('/api/runs')[2])
+
+    now = datetime.now(timezone.utc)
+    stamp = now.isoformat()
+    old = (now - timedelta(hours=1)).isoformat()
+    future = (now + timedelta(seconds=120)).isoformat()
+
+    def route(name, status, reason=None, **changes):
+        row = dict(transfer_identifier=name, state=status, wait_reason=reason, worker_pid=None,
+                   last_scanned_at_utc=old, next_due_at_utc=future, started_at_utc=None)
+        return dict(row, **changes)
+
+    report = dict(schema_version=1, runtime_id='runtime-A', observed_at_utc=stamp, enabled=True,
+                  dispatcher_pid=21, max_concurrent_transfers=1, discovery_interval_seconds=120,
+                  routes=[route('pull', 'running', started_at_utc=stamp, worker_pid=22),
+                          route('held-by-queue', 'due', 'overlapping_queue'),
+                          route('ready<&', 'due', 'slots'), route('empty', 'scheduled'),
+                          route('needs retry', 'deferred', 'external_contention'),
+                          route('broken', 'failed'), route('pending', 'due')])
+    snapshot.write_text(json.dumps(report))
+    current = json.loads(app.respond('/api/scheduler')[2])['scheduler']
+    assert current == json.loads(app.respond('/api/runs')[2])['scheduler']
+    assert current['observation'] == 'recent' and current['running_routes'] == 1
+    assert current['routes'][0]['worker_pid'] == 22 and current['routes'][3]['last_scanned_at_utc'] == old
+    assert current['routes'][3]['next_due_at_utc'] == future
+    html = app.respond('/')[2]
+    assert 'href="#discovery"' in html and 'Waiting for a shared queue' in html
+    assert 'Waiting for a slot' in html and 'ready&lt;&amp;' in html and 'ready<&' not in html
+    assert 'Queued for discovery' in html and 'Deferred by another lock holder' in html
+    selected = json.loads(app.respond('/api/scheduler', 'transfer_identifier=empty')[2])['scheduler']
+    assert [r['transfer_identifier'] for r in selected['routes']] == ['empty']
+    assert json.loads(app.respond('/api/scheduler', 'runtime_id=unrelated')[2])['scheduler'] is None
+    assert 'held-by-queue' not in app.respond('/', 'q=empty')[2]
+    assert 'runtime-A' in app.respond('/', 'q=empty')[2]
+
+    report['observed_at_utc'] = old
+    snapshot.write_text(json.dumps(report))
+    assert 'Stale scheduler observation' in app.respond('/')[2]
+    report.update(enabled=False, dispatcher_pid=None, routes=[route('empty', 'held')])
+    snapshot.write_text(json.dumps(report))
+    assert json.loads(app.respond('/api/scheduler')[2])['scheduler']['observation'] == 'held'
+    report.update(runtime_id='unselected')
+    snapshot.write_text(json.dumps(report))
+    assert json.loads(app.respond('/api/scheduler')[2])['scheduler'] is None
+
+
+def test_bad_scheduler_sidecar_keeps_existing_package_report_available(tmp_path):
+    state = tmp_path / 'state'
+    folder = state / 'scheduler'
+    folder.mkdir(parents=True)
+    snapshot = folder / 'status.json'
+    app = MonitoringApplication('sqlite:///' + str(tmp_path/'report.sqlite'), state)
+    for value in ('invalid', '{"schema_version":77}', '{"schema_version":1,"runtime_id":"A","routes":[]}'):
+        snapshot.write_text(value)
+        status, _, text = app.respond('/api/scheduler')
+        assert status == 200 and json.loads(text)['scheduler']['observation'] == 'unavailable'
+        assert 'Run history' in app.respond('/')[2]
+    snapshot.unlink()
+    secret = tmp_path / 'other-file'
+    secret.write_text('Unrelated private text')
+    snapshot.symlink_to(secret)
+    assert 'Unrelated private text' not in app.respond('/')[2]
+    assert json.loads(app.respond('/api/scheduler')[2])['scheduler']['observation'] == 'unavailable'
+    snapshot.unlink()
+    os.mkfifo(snapshot)
+    assert json.loads(app.respond('/api/scheduler')[2])['scheduler']['observation'] == 'unavailable'
