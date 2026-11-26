@@ -17,6 +17,7 @@ import subprocess
 from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 
+from .progress import rsync_progress
 from .model import local_root
 from .package import LABEL, is_metadata, size_inventory
 
@@ -211,7 +212,8 @@ class LocalAdapter:
         with self.staging_directory(relative) as path:
             if self.step.adapter == 'rsync':
                 subprocess.run(['rsync', '-r', '--delete', '--exclude=/.ready', '--exclude=/' + LABEL, '--exclude=/.landing_zones/', '--',
-                                str(source) + '/', str(path) + '/'], check=True, timeout=3600)
+                                str(source) + '/', str(path) + '/'], check=True, timeout=3600,
+                               pass_fds=self.execution_lock.pass_fds if getattr(self, 'execution_lock', None) else ())
             else:
                 # A retry replaces only the UUID-owned staging directory.
                 for key, item in accepted.items():
@@ -222,6 +224,8 @@ class LocalAdapter:
                     else:
                         destination.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copyfile(Path(source) / key, destination)
+                        if getattr(self, 'progress', None):
+                            self.progress.advance(item['size'])
 
     def _rename(self, source, destination):
         try:
@@ -568,15 +572,23 @@ class RemoteRsyncAdapter(SFTPAdapter):
                 '--temp-dir=' + scratch, '--protect-args', '--timeout=300',
                 '-e', shlex.join(self.pinned_ssh_command()), '--', source, destination]
         # Retain the worker's lock while a surviving rsync can write private staging.
-        subprocess.run(argv, input=entries, check=True, capture_output=True,
-                       pass_fds=(execution_lock.fileno(),))
+        reporter = getattr(self, 'progress', None)
+        if reporter is None:
+            subprocess.run(argv, input=entries, check=True, capture_output=True,
+                           pass_fds=execution_lock.pass_fds)
+            return
+        argv[1:1] = ['--info=progress2,name0', '--outbuf=L', '--no-human-readable']
+        with rsync_progress(reporter.observe) as output:
+            subprocess.run(argv, input=entries, check=True, stdout=output, stderr=subprocess.PIPE,
+                           env=dict(os.environ, LC_ALL='C'), pass_fds=execution_lock.pass_fds)
 
     def copy(self, source, relative, accepted):
         self.prepare_stage(relative)
         remote = self.remote_directory(relative)
         subprocess.run(['rsync', '-r', '--delete', '--protect-args', '--exclude=/.ready', '--exclude=/' + LABEL, '--exclude=/.landing_zones/',
                         '-e', shlex.join(self.ssh_command()), '--', str(source) + '/', remote],
-                       check=True, capture_output=True, text=True, timeout=3600)
+                       check=True, capture_output=True, text=True, timeout=3600,
+                       pass_fds=self.execution_lock.pass_fds if getattr(self, 'execution_lock', None) else ())
 
 
 def adapter(step, settings):

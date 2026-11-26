@@ -1,8 +1,11 @@
 """Independent connection execution with portable labels and local receipts."""
+from contextlib import contextmanager
 import copy
 from dataclasses import replace
 from datetime import datetime, timezone
+import fcntl
 import hashlib
+import os
 import json
 from pathlib import Path
 import warnings
@@ -12,6 +15,7 @@ from .adapters import adapter, manifest, matches
 from .model import Step, load_settings, load_steps, local_root, name, resolve_local_endpoint
 from .package import LABEL, admit
 from .source import Source
+from .progress import Progress, phase_heartbeat
 from .storage import StateStore
 
 
@@ -43,26 +47,54 @@ def _matches_receipt(existing, plan):
 class Executor:
     def __init__(self, config_file):
         self.settings = load_settings(config_file)
-        self.store = StateStore(self.settings['state_dir'])
+        self.store = StateStore(self.settings['state_dir'], self.settings['max_concurrent_transfers'])
         if self.store.root.exists():
             for path in self.store.root.glob('*.json'):
                 if json.loads(path.read_text()).get('schema_version') != 2:
                     raise ValueError('Legacy request state needs explicit migration; use a separate state directory')
 
+    @staticmethod
+    def _connection(request):
+        group = request.get('connection')
+        if 'deliveries' in request:
+            if group or not isinstance(request['deliveries'], list) or len(request['deliveries']) != 1 or set(request['deliveries'][0]) != {'flow_group'}:
+                raise ValueError('Select exactly one connection; coordinated recipients are deferred')
+            group = request['deliveries'][0]['flow_group']
+        if not isinstance(group, str) or not group:
+            raise ValueError('Unknown configured connection')
+        return group
+
+    @contextmanager
+    def _route(self, connection, *, step=None, intake_source=None):
+        # The route lock stabilizes its outstanding receipts while we also guard
+        # their recorded endpoints; a prior configuration or intake can differ.
+        with self.store.locked(connection):
+            pending = []
+            endpoints = {step.source, step.destination} if step is not None else set()
+            if intake_source is not None:
+                endpoints.add(str(Path(local_root(intake_source)).parent))
+            for path in sorted(self.store.root.glob('*.json')):
+                state = json.loads(path.read_text())
+                if state['status'] != 'completed' and state['deliveries'][0]['flow_group'] == connection:
+                    pending.append(state)
+                    for work in self._work(state):
+                        endpoints.update((work['definition']['source'], work['definition']['destination']))
+            with self.store.queues(endpoints):
+                yield pending
+
     def preflight(self, request):
+        return self._preflight(request)
+
+    def _preflight(self, request, observed=None):
         if not isinstance(request, dict) or set(request) - {'idempotency_key', 'payload_name', 'connection', 'deliveries', 'intake', 'itinerary', 'adapter_options'}:
             raise ValueError('Unsupported request fields')
         key = request.get('idempotency_key')
         if not isinstance(key, str) or not key:
             raise ValueError('idempotency_key is required')
         payload = name(request['payload_name'])
-        group = request.get('connection')
-        if 'deliveries' in request:
-            if group or not isinstance(request['deliveries'], list) or len(request['deliveries']) != 1 or set(request['deliveries'][0]) != {'flow_group'}:
-                raise ValueError('Select exactly one connection; coordinated recipients are deferred')
-            group = request['deliveries'][0]['flow_group']
+        group = self._connection(request)
         groups = load_steps(self.settings)
-        if not isinstance(group, str) or group not in groups:
+        if group not in groups:
             raise ValueError('Unknown configured connection')
         step = groups[group][0]
         remote_destination = step.destination.startswith(('ssh://', 'sftp://', 'ena://'))
@@ -104,13 +136,17 @@ class Executor:
         transport = adapter(step, self.settings)  # Construction never opens a connection.
         if options and not hasattr(transport, 'prepare_request'):
             raise ValueError('This adapter does not support request options')
-        with Source(admission_step, self.settings) as source:
-            if not source.ready(payload):
-                raise ValueError('Producer completion marker .ready is required')
-            contents = source.inspect(payload)
-            previous = source.label(payload)
-            label = admit(contents, previous, step.admission_policy, request.get('itinerary'),
-                          verification=step.verification)
+        if observed is None:
+            with Source(admission_step, self.settings) as source:
+                if not source.ready(payload):
+                    raise ValueError('Producer completion marker .ready is required')
+                contents, previous = source.inspect(payload), source.label(payload)
+        else:
+            # Discovery already read this inventory and label while holding the
+            # route guards. Transfer checks the source again before sending bytes.
+            contents, previous = observed
+        label = admit(contents, previous, step.admission_policy, request.get('itinerary'),
+                      verification=step.verification)
         adapter_request = transport.prepare_request(options, contents) if hasattr(transport, 'prepare_request') else {}
         # An unlabelled package has a stable local admission key until it receives a label.
         identity = previous.get('package_id') if isinstance(previous, dict) and previous.get('package_id') == label['package_id'] else None
@@ -133,39 +169,53 @@ class Executor:
                 'intake': intake_step.record() if intake_step else None}
 
     def submit(self, request):
+        if self.store.limit == 1:
+            with self.store.locked():
+                return self._submit(request)
+        group = self._connection(request)
+        step = load_steps(self.settings).get(group, [None])[0]
+        intake = request.get('intake') or {}
+        if not isinstance(intake, dict):
+            raise ValueError('Invalid intake')
+        with self._route(group, step=step, intake_source=intake.get('source_path')):
+            return self._submit(request)
+
+    def _submit(self, request, observed=None):
         serialized = json.dumps(request, sort_keys=True)
         key = request.get('idempotency_key')
         if not isinstance(key, str) or not key:
             raise ValueError('idempotency_key is required')
         request_id = hashlib.sha256(key.encode()).hexdigest()
-        with self.store.locked():
-            if self.store.path(request_id).exists():
-                state = self.store.read(request_id)
-                self._validate_state(state)
-                if state['request_content'] != serialized:
-                    raise ValueError('Idempotency key was already used for different content')
-            else:
-                plan = self.preflight(request)
-                for path in self.store.root.glob('*.json'):
-                    existing = json.loads(path.read_text())
-                    if _matches_receipt(existing, plan):
-                        self._validate_state(existing)
-                        return self._execute(existing)
-                def work(definition):
-                    return {'definition': definition, 'step_id': new_identifier(), 'status': 'pending', 'attempts': [],
-                            'attempt_limit': {phase: definition['max_attempts'] for phase in ('transfer', 'cleanup', 'promotion', 'submission')}}
-                state = {'schema_version': 2, 'request_id': request_id, 'request_content': serialized,
-                         'receipt_key': plan['receipt_key'], 'run_id': plan['label']['transfer_run_id'],
-                         'payload_id': plan['label']['package_id'], 'payload_version': plan['label']['content_version'],
-                         'payload_name': plan['payload_name'], 'manifest': plan['manifest'], 'label': plan['label'],
-                         'adapter_request': plan['adapter_request'],
-                         'total_bytes': sum(v.get('size', 0) for v in plan['manifest'].values()),
-                         'context': self.settings['execution_context'], 'status': 'accepted', 'accepted_at': now(),
-                         'intake': work(plan['intake']) if plan['intake'] else None,
-                         'deliveries': [{'flow_group': plan['connection']['flow_group'], 'status': 'pending',
-                                         'steps': [work(plan['connection'])]}]}
-                self.store.save(state)
-            return self._execute(state)
+        if self.store.path(request_id).exists():
+            state = self.store.read(request_id)
+            self._validate_state(state)
+            if state['request_content'] != serialized:
+                raise ValueError('Idempotency key was already used for different content')
+        else:
+            plan = self._preflight(request, observed)
+            for path in self.store.root.glob('*.json'):
+                existing = json.loads(path.read_text())
+                if _matches_receipt(existing, plan):
+                    self._validate_state(existing)
+                    return self._execute(existing)
+            def work(definition):
+                return {'definition': definition, 'step_id': new_identifier(), 'status': 'pending', 'attempts': [],
+                        'attempt_limit': {phase: definition['max_attempts'] for phase in ('transfer', 'cleanup', 'promotion', 'submission')}}
+            state = {'schema_version': 2, 'request_id': request_id, 'request_content': serialized,
+                     'receipt_key': plan['receipt_key'], 'run_id': plan['label']['transfer_run_id'],
+                     'payload_id': plan['label']['package_id'], 'payload_version': plan['label']['content_version'],
+                     'payload_name': plan['payload_name'], 'manifest': plan['manifest'], 'label': plan['label'],
+                     'adapter_request': plan['adapter_request'],
+                     'total_bytes': sum(v.get('size', 0) for v in plan['manifest'].values()),
+                     'context': self.settings['execution_context'], 'status': 'accepted', 'accepted_at': now(),
+                     'intake': work(plan['intake']) if plan['intake'] else None,
+                     'deliveries': [{'flow_group': plan['connection']['flow_group'], 'status': 'pending',
+                                     'steps': [work(plan['connection'])]}]}
+            try:
+                self.store.create(state)
+            except FileExistsError as exc:
+                raise ValueError('Idempotency key was already used for different content') from exc
+        return self._execute(state)
 
     def _validate_state(self, state):
         if state.get('schema_version') != 2:
@@ -181,30 +231,40 @@ class Executor:
         return state
 
     def resume(self, request_id, retry_parked=False):
-        with self.store.locked():
+        recorded = self.store.read(request_id)
+        self._validate_state(recorded)
+        connection = recorded['deliveries'][0]['flow_group']
+        with self.store.locked(connection):
             state = self.store.read(request_id)
-            self._validate_state(state)
-            if retry_parked:
-                for work in self._work(state):
-                    if work['status'] == 'parked':
-                        work['status'] = 'pending'
-                        for phase in work['attempt_limit']:
-                            work['attempt_limit'][phase] = sum(a['phase'] == phase for a in work['attempts']) + work['definition']['max_attempts']
-                self.store.save(state)
-            return self._execute(state)
+            if state['deliveries'][0]['flow_group'] != connection:
+                raise ValueError('Recorded route changed before resume')
+            endpoints = [work['definition'][side] for work in self._work(state)
+                         for side in ('source', 'destination')]
+            with self.store.queues(endpoints):
+                return self._resume(state, retry_parked)
+
+    def _resume(self, state, retry_parked=False):
+        self._validate_state(state)
+        if retry_parked:
+            for work in self._work(state):
+                if work['status'] == 'parked':
+                    work['status'] = 'pending'
+                    for phase in work['attempt_limit']:
+                        work['attempt_limit'][phase] = sum(a['phase'] == phase for a in work['attempts']) + work['definition']['max_attempts']
+            self.store.save(state)
+        return self._execute(state)
 
     def discover(self, connection):
         groups = load_steps(self.settings)
         if connection not in groups:
             raise ValueError('Unknown configured connection')
         step = groups[connection][0]
-        results = []
-        # Resume durable work even if a move has already removed its source.
-        if self.store.root.exists():
-            for path in sorted(self.store.root.glob('*.json')):
-                state = json.loads(path.read_text())
-                if state.get('schema_version') == 2 and state['deliveries'][0]['flow_group'] == connection and state['status'] != 'completed':
-                    results.append(self.resume(state['request_id']))
+        with self._route(connection, step=step) as pending:
+            return self._discover(step, pending)
+
+    def _discover(self, step, pending):
+        connection = step.flow_group
+        results = [self._resume(state) for state in pending]
         with Source(step, self.settings) as source:
             candidates = source.names()
             resumed = {r['payload_name'] for r in results}
@@ -215,14 +275,15 @@ class Executor:
                     results.append({'payload_name': payload, 'status': 'waiting', 'reason': 'producer readiness'})
                     continue
                 from .package import version
-                fingerprint = version(source.inspect(payload))
+                contents = source.inspect(payload)
+                fingerprint = version(contents)
                 label = source.label(payload)
                 identity = label.get('package_id', '') if isinstance(label, dict) else ''
                 token = json.dumps([step.record(), payload, fingerprint, identity], sort_keys=True)
                 request = {'idempotency_key': 'discovery:' + hashlib.sha256(token.encode()).hexdigest(),
                            'payload_name': payload, 'connection': connection}
                 try:
-                    results.append(self.submit(request))
+                    results.append(self._submit(request, (contents, label)))
                 except (ValueError, OSError) as exc:
                     results.append({'payload_name': payload, 'status': 'blocked', 'reason': str(exc)})
         return {'connection': connection, 'results': results,
@@ -262,18 +323,25 @@ class Executor:
     def _work(state):
         return ([state['intake']] if state['intake'] else []) + state['deliveries'][0]['steps']
 
-    def _event(self, state, work, attempt, status, phase, message=''):
+    def _event(self, state, work, attempt, status, phase, message='', progress=None, heartbeat=False):
         step = Step(**work['definition'])
+        details = {'request_id': state['request_id'], 'package_id': state['payload_id'],
+                   'content_version': state['payload_version'], 'detail': message}
+        if progress is not None:
+            details['progress'] = progress
+        if heartbeat:
+            details['heartbeat'] = True
         event = create_transfer_event(step.identifiers, step.system, step.runtime_id, step.users, status, phase,
+            event_time_utc=datetime.now(timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z'),
             run_id=state['run_id'], attempt_id=attempt['attempt_id'], run_name=state['payload_name'],
             flow_group=step.flow_group, source_path=step.source, destination_path=step.destination,
-            message=json.dumps({'request_id': state['request_id'], 'package_id': state['payload_id'],
-                                'content_version': state['payload_version'], 'detail': message}))
+            message=json.dumps(details))
         try:
             spool = Path(self.settings['event_spool'])
             spool.parent.mkdir(parents=True, exist_ok=True)
             with spool.open('a') as handle:
-                if handle.tell() == 0:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                if os.fstat(handle.fileno()).st_size == 0:
                     handle.write(EVENT_HEADER + '\n')
                 handle.write(event_to_tsv_row(event) + '\n')
         except OSError as exc:
@@ -288,9 +356,13 @@ class Executor:
         attempt = {'attempt_id': new_identifier(), 'phase': phase, 'status': 'started', 'started_at': now()}
         work['attempts'].append(attempt)
         self.store.save(state)
-        self._event(state, work, attempt, 'started', phase)
+        start = None
+        if phase == 'transfer':
+            start = Progress.totals(state)
+        self._event(state, work, attempt, 'started', phase, progress=start)
         try:
-            action()
+            with phase_heartbeat(lambda: self._event(state, work, attempt, 'started', phase, heartbeat=True)):
+                action()
             attempt.update(status='completed', finished_at=now())
             attempt['elapsed_seconds'] = (datetime.fromisoformat(attempt['finished_at']) - datetime.fromisoformat(attempt['started_at'])).total_seconds()
             self.store.save(state)
@@ -318,6 +390,13 @@ class Executor:
         # Each phase opens its own transport so connectivity failures are recorded.
         def transfer():
             with adapter(step, self.settings) as transport, Source(source_step, self.settings) as source:
+                transport.execution_lock = self.store.execution_lock
+                attempt = work['attempts'][-1]
+                progress = Progress(state, lambda sample: self._event(
+                    state, work, attempt, 'started', 'transfer', progress=sample))
+                transport.progress = progress
+                if step.rsync_source_pull:
+                    source.transport.progress = progress
                 stage = transport.stage_name(work['step_id'])
                 if getattr(transport, 'publication_mode', 'rename') == 'rename' and transport.exists(payload):
                     raise FileExistsError('Destination conflict')
@@ -350,6 +429,7 @@ class Executor:
                 if cache.exists():
                     import shutil
                     shutil.rmtree(cache)
+                progress.verified()
                 work['staged'] = True
                 work['status'] = 'staged'
                 self.store.save(state)
@@ -371,6 +451,7 @@ class Executor:
             return
         def publish():
             with adapter(step, self.settings) as transport:
+                transport.execution_lock = self.store.execution_lock
                 stage = transport.stage_name(work['step_id'])
                 rename_publication = getattr(transport, 'publication_mode', 'rename') == 'rename'
                 if transport.exists(stage):

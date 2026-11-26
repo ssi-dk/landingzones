@@ -46,11 +46,22 @@ support in private staging before removing the source.
 An execution configuration may list `exclusive_local_destinations` for storage
 that rejects atomic no-overwrite rename. For those destinations only, the
 executor can check that the final name is free and use a plain directory rename
-while holding its state-directory lock. All publishers must share that lock.
+while holding the destination queue lock (or the exclusive execution lock in serial mode). All publishers must use the same runtime lock directory.
 An independent writer can still race the check, including one on another host
 or in another runtime. An existing destination leaves the package staged for
 operator recovery. Retained requests use the current policy for their stored
 physical destination and can resume publication after cleanup.
+
+**Concurrent transfers.** Set the integer `max_concurrent_transfers` in the
+execution configuration to select 1–64 workers per runtime. An omitted value
+preserves serial execution. Parallel workers take a shared `state/execution.lock`,
+one available numbered `state/transfer-locks/slot-N.lock`, and locks on the
+route and its physical queues. Source and destination roots that coincide or
+nest serialize even across different connections. Sibling queues may overlap
+in time. The runtime keeps the lock files in place and releases the OS locks
+when their last owner exits. Maintenance takes `state/execution.lock`
+exclusively to drain all workers. A busy transfer CLI returns exit code 75
+without recording a failed attempt. Change the limit on a drained runtime.
 
 **Future database coordination.** A shared database could let participating
 publishers claim the destination and final package name with a unique constraint.

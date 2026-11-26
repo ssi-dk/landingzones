@@ -120,6 +120,9 @@ def load_settings(config_file, *, resolve_credentials=True, validate_context=Tru
         settings = yaml.safe_load(handle)
     if not isinstance(settings, dict) or settings.get('execution_schema_version') != 1:
         raise ValueError('Python execution requires execution_schema_version: 1')
+    limit = settings.setdefault('max_concurrent_transfers', 1)
+    if type(limit) is not int or not 1 <= limit <= 64:
+        raise ValueError('max_concurrent_transfers must be an integer from 1 to 64')
     if 'local_path_base' in settings:
         value = settings['local_path_base']
         if (not isinstance(value, str) or not value or '://' in value

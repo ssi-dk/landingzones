@@ -662,6 +662,7 @@ def handle_validate_credentials(args, extra_args):
 def handle_transfer(args, extra_args):
     import json
     from landingzones.execution.engine import Executor
+    from landingzones.execution.storage import TransferBusy
     if extra_args:
         raise SystemExit('unrecognized arguments: ' + ' '.join(extra_args))
     if effective_runtime_ids(args):
@@ -685,6 +686,9 @@ def handle_transfer(args, extra_args):
             result = executor.resume(args.request_id, args.retry_parked)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if args.transfer_action in ('preflight', 'status') or result['status'] == 'completed' else 1
+    except TransferBusy as exc:
+        print(str(exc), file=sys.stderr)
+        return 75
     except (ValueError, KeyError, OSError) as exc:
         print('Transfer rejected: ' + str(exc), file=sys.stderr)
         return 2
