@@ -3,7 +3,7 @@
 """Integration tests for database-backed Transfer Event monitoring."""
 
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import shutil
@@ -1311,3 +1311,102 @@ def test_http_service_polls_without_browser_requests_and_closes_socket(tmp_path,
     monkeypatch.setattr(monitoring_service, 'ThreadingHTTPServer', LocalServer)
     monitoring_service.serve_monitoring(database_url, spools=[str(spool)], ingest_interval=10)
     assert closed == [True]
+
+
+def test_monitoring_tracks_concurrent_attempts_heartbeats_and_history(tmp_path):
+    database = "sqlite:///{}".format(tmp_path / "report.sqlite")
+    spool = tmp_path / "events.tsv"
+    run = str(uuid.uuid4())
+    other_run = str(uuid.uuid4())
+    first, retry, publish, side = (str(uuid.uuid4()) for _ in range(4))
+    base = datetime.now(timezone.utc).replace(microsecond=0)
+    rows = []
+
+    def add(offset, attempt, *, phase="transfer", status="started", route="incoming",
+            run_id=run, request="req-a", **fields):
+        stamp = (base + timedelta(seconds=offset)).isoformat().replace("+00:00", "Z")
+        rows.append(create_transfer_event(route, "server1", "lab", "operator", status, phase,
+            event_time_utc=stamp, run_id=run_id, attempt_id=attempt, run_name="panel_A",
+            message=json.dumps(dict(request_id=request, **fields))))
+
+    def progress(done=None, rate=None, eta=None):
+        return dict(bytes_done=done, bytes_total=500000, files_total=40,
+                    rate_bytes_per_second=rate, eta_seconds=eta)
+
+    def ingest():
+        spool.write_text(EVENT_HEADER + "\n" + "".join(event_to_tsv_row(e) + "\n" for e in rows))
+        ingest_event_spool(database, str(spool))
+
+    add(-200, first, progress=progress())
+    add(-180, first, progress=progress(230000, 9999, 60))
+    add(-168, first, status="failed")
+    add(-160, retry, progress=progress())
+    add(-159, retry, progress=progress(120000, 8888, 70))
+    add(-3, retry, heartbeat=True)
+    add(-2, side, route="outgoing", request="req-b", progress=progress())
+    add(-1, side, route="outgoing", request="req-b", progress=progress(250000, 10000, 25))
+    add(-10, str(uuid.uuid4()), run_id=other_run, request="req-c")   # Older producer.
+    ingest()
+
+    app = MonitoringApplication(database)
+    summary = json.loads(app.respond("/api/runs")[2])["runs"]
+    assert len(summary) == 2
+    current = next(r for r in summary if r["run_id"] == run)
+    assert current["attempt_count"] == 3
+    attempts = {a["attempt_id"]: a for a in current["activity"]}
+    assert set(attempts) == {retry, side}
+    stale = attempts[retry]
+    assert stale["started_at_utc"] == rows[3].event_time_utc
+    assert stale["elapsed_seconds"] >= 160
+    assert stale["observation"] == "recent" and stale["measurement"] == "stale"
+    assert stale["last_heartbeat_at_utc"] == rows[5].event_time_utc
+    assert stale["progress"] == progress(120000)
+    assert attempts[side]["progress"] == progress(250000, 10000, 25)
+    scoped = json.loads(app.respond("/api/runs", "transfer_identifier=incoming")[2])["runs"]
+    assert {a["transfer_identifier"] for r in scoped for a in r["activity"]} == {"incoming"}
+    assert {r["run_id"] for r in scoped} == {run, other_run}
+    legacy = next(r for r in summary if r["run_id"] == other_run)["activity"][0]
+    assert legacy["measurement"] == "unmeasured" and legacy["observation"] == "last reported"
+    html = app.respond("/")[2]
+    assert "panel_A" in html and "incoming" in html and "outgoing" in html
+    assert "10 kB/s" in html and "8.9 kB/s" not in html
+
+    # Ingest a whole-second event after a later microsecond event in the same second.
+    add(-0.7, publish, phase="promotion", heartbeat=True)
+    add(-1, retry, progress=progress(500000))
+    ingest()
+    detail = json.loads(app.respond("/api/runs/" + run)[2])
+    assert detail["timeline"][-1]["attempt_id"] == publish
+    assert len(detail["timeline"]) == 10
+    phases = {a["attempt_id"]: a for a in detail["attempts"]}
+    assert phases[first]["progress"] == progress(230000)
+    assert phases[first]["status"] == "failed"
+    assert phases[retry]["measurement"] == "historical" and phases[retry]["elapsed_seconds"] == 159
+    assert phases[publish]["previous_payload"]["progress"] == progress(500000)
+    assert phases[publish]["progress"] is None
+    assert phases[side]["is_current"]
+    assert "9999" not in app.respond("/runs/" + run)[2]
+
+
+def test_monitoring_does_not_borrow_measurements_from_prior_attempt_or_request(tmp_path):
+    database = "sqlite:///{}".format(tmp_path / "report.sqlite")
+    run = str(uuid.uuid4())
+    base = datetime(2026, 1, 5, 12, tzinfo=timezone.utc)
+    rows = []
+    for offset, request, sample in ((0, "a", {"bytes_done":40, "bytes_total":50}),
+                                     (10, "a", {"bytes_total":50}),
+                                     (20, "b", {"bytes_done":100, "bytes_total":1})):
+        event = create_transfer_event("move", "host", "prod", "worker", "started", "transfer",
+            event_time_utc=(base + timedelta(seconds=offset)).isoformat().replace("+00:00", "Z"),
+            run_id=run, attempt_id=str(uuid.uuid4()),
+            message=json.dumps(dict(request_id=request, progress=sample)))
+        rows.append(event)
+    spool = tmp_path / "events.tsv"
+    spool.write_text(EVENT_HEADER + "\n" + "".join(event_to_tsv_row(e) + "\n" for e in rows))
+    ingest_event_spool(database, str(spool))
+    attempts = query_run_summaries(database, now=base + timedelta(minutes=3))[0]["activity"]
+    assert len(attempts) == 2
+    reset, malformed = attempts
+    assert reset["attempt_id"] == rows[1].attempt_id
+    assert reset["progress"]["bytes_done"] is None and reset["measurement"] == "unmeasured"
+    assert malformed["progress"] is None and malformed["observation"] == "stale"

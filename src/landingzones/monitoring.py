@@ -5,6 +5,8 @@
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import csv
+import json
+import math
 import os
 
 from sqlalchemy import (
@@ -16,6 +18,9 @@ from sqlalchemy import (
     Table,
     Text,
     create_engine,
+    case,
+    func,
+    or_,
     delete,
     select,
 )
@@ -320,17 +325,176 @@ def ingest_event_spool(database_url, spool_path, spool_id=None):
     )
 
 
-def query_run_detail(database_url, run_id):
+# Two missed 60-second report refreshes leave a measurement visible as historical.
+FRESHNESS_SECONDS = 120
+
+
+def _event_order():
+    # UTC text without its final Z sorts whole seconds before fractional seconds.
+    # Normalize trailing decimal zeros so ties retain the spool's insertion order.
+    ts = transfer_events.c.event_time_utc
+    return (
+        func.substr(ts, 1, 19),
+        func.rtrim(func.substr(ts, 21, 6), "0Z"),
+        transfer_events.c.ingestion_order,
+    )
+
+
+def _activity_events(route_filters):
+    """Load first/last telemetry per attempt for the index; retain all lifecycle events."""
+    table = transfer_events.c
+    # These keys are serialized by the native executor. Other producers' diagnostics
+    # and unrecognized encodings still follow the ordinary, lossless event path.
+    telemetry = case(
+        (table.message.contains('"heartbeat":'), "heartbeat"),
+        (table.message.contains('"progress":'), "progress"),
+        else_="event",
+    )
+    sampled = (table.status == "started") & (telemetry != "event")
+    partition = [table.run_id, table.runtime_id, table.transfer_identifier,
+                 table.attempt_id, table.phase, telemetry]
+    window = dict(partition_by=partition, order_by=_event_order(), rows=(None, None))
+    bounds = select(
+        func.first_value(table.ingestion_order).over(**window).label("first_id"),
+        func.last_value(table.ingestion_order).over(**window).label("last_id"),
+    ).where(sampled, *route_filters).cte("attempt_samples")
+    selected = select(bounds.c.first_id).union(select(bounds.c.last_id))
+    return select(*[table[column] for column in EVENT_COLUMNS]).where(
+        or_(~sampled, table.ingestion_order.in_(selected)), *route_filters
+    ).order_by(*_event_order())
+
+
+def _message_fields(event):
+    message = event["message"]
+    if not message or not message.startswith("{"):
+        return {}
+    try:
+        fields = json.loads(message)
+    except (ValueError, RecursionError):
+        return {}
+    return fields if isinstance(fields, dict) else {}
+
+
+def _progress_values(value):
+    if not isinstance(value, dict):
+        return None
+    counts = {}
+    for key in ("bytes_done", "bytes_total", "files_total"):
+        number = value.get(key)
+        if number is not None and (type(number) is not int or not 0 <= number <= 2**63 - 1):
+            return None
+        counts[key] = number
+    if (counts["bytes_done"] is not None and counts["bytes_total"] is not None
+            and counts["bytes_done"] > counts["bytes_total"]):
+        return None
+    for key in ("rate_bytes_per_second", "eta_seconds"):
+        number = value.get(key)
+        counts[key] = (number if type(number) in (float, int) and 0 <= number <= 2**63 - 1
+                       and math.isfinite(number) else None)
+    return counts
+
+
+def _seconds_between(start, end):
+    if not start:
+        return None
+    return max(0, int((end - _parse_event_time(start)).total_seconds()))
+
+
+def _attempt_activity(events, now):
+    """Project latest phase per route/request plus the ordered phase-attempt history."""
+    routes = {}
+    attempts = {}
+    for event in events:
+        fields = _message_fields(event)
+        request = fields.get("request_id")
+        route = (event["runtime_id"], event["transfer_identifier"],
+                 request if isinstance(request, str) else None)
+        key = (*route, event["attempt_id"], event["phase"])
+        stamp = event["event_time_utc"]
+        previous = routes.get(route)
+        if previous and previous != key:
+            prior = attempts[previous]
+            prior["is_current"] = False
+            if prior["ended_at_utc"] is None:
+                prior["ended_at_utc"] = stamp
+        if not event["attempt_id"]:
+            routes.pop(route, None)
+            continue
+        routes[route] = key
+        if key not in attempts:
+            attempts[key] = dict(
+                run_id=event["run_id"], runtime_id=route[0], transfer_identifier=route[1],
+                request_id=route[2], attempt_id=event["attempt_id"], phase=event["phase"],
+                started_at_utc=stamp if event["status"] == "started" else None,
+                ended_at_utc=None, last_heartbeat_at_utc=None,
+                sampled_at_utc=None, progress=None,
+            )
+        item = attempts[key]
+        item.update(is_current=True, status=event["status"], last_event_time_utc=stamp)
+        if event["status"] != "started":
+            item["ended_at_utc"] = stamp
+            continue
+        if fields.get("heartbeat") is True:
+            item["last_heartbeat_at_utc"] = stamp
+        if event["phase"] == "transfer":
+            values = _progress_values(fields.get("progress"))
+            if values is not None:
+                item["progress"] = values
+                if values["bytes_done"] is not None:
+                    item["sampled_at_utc"] = stamp
+
+    for item in attempts.values():
+        age = _seconds_between(item["last_event_time_utc"], now)
+        sample_time = item["sampled_at_utc"]
+        active = item["ended_at_utc"] is None and item["is_current"]
+        if not active:
+            observation = "ended"
+        elif age >= FRESHNESS_SECONDS:
+            observation = "stale"
+        elif item["last_heartbeat_at_utc"] or sample_time:
+            observation = "recent"
+        else:
+            observation = "last reported"
+        item["observation"] = observation
+        end = item["ended_at_utc"] or item["last_event_time_utc"]
+        item["elapsed_seconds"] = _seconds_between(
+            item["started_at_utc"], now if observation == "recent" else _parse_event_time(end)
+        )
+        if not sample_time:
+            measurement = "unmeasured"
+        elif not active:
+            measurement = "historical"
+        elif _seconds_between(sample_time, now) >= FRESHNESS_SECONDS:
+            measurement = "stale"
+        else:
+            measurement = "recent"
+        item["measurement"] = measurement
+        if measurement != "recent" and item["progress"] is not None:
+            item["progress"].update(rate_bytes_per_second=None, eta_seconds=None)
+    transfers = {}
+    for key, item in attempts.items():
+        if item["phase"] == "transfer":
+            transfers[key[:3]] = item
+    for route, key in routes.items():
+        item = attempts[key]
+        transfer = transfers.get(route)
+        if transfer and item is not transfer:
+            item["previous_payload"] = {
+                "attempt_id": transfer["attempt_id"],
+                "sampled_at_utc": transfer["sampled_at_utc"],
+                "progress": transfer["progress"],
+            }
+    return list(attempts.values())
+
+
+def query_run_detail(database_url, run_id, now=None):
     """Return one Transfer Run timeline ordered by event time."""
     engine = create_monitoring_schema(database_url)
     columns = [transfer_events.c[column] for column in EVENT_COLUMNS]
     statement = (
         select(*columns)
         .where(transfer_events.c.run_id == run_id)
-        .order_by(
-            transfer_events.c.event_time_utc,
-            transfer_events.c.ingestion_order,
-        )
+        .order_by(*_event_order())
     )
     with engine.connect() as connection:
         timeline = [dict(row) for row in connection.execute(statement).mappings()]
@@ -339,6 +503,7 @@ def query_run_detail(database_url, run_id):
     return {
         "run_id": run_id,
         "timeline": timeline,
+        "attempts": _attempt_activity(timeline, now or datetime.now(timezone.utc)),
     }
 
 
@@ -530,6 +695,7 @@ def _event_summary(events, definitions_by_key, definitions, now):
     if not tags_value and definition is not None:
         tags_value = definition["tags"]
     return {
+        "activity": [row for row in _attempt_activity(events, now) if row["is_current"]],
         "run_id": latest["run_id"],
         "run_name": latest["run_name"],
         "runtime_id": latest["runtime_id"],
@@ -564,6 +730,7 @@ def _event_summary(events, definitions_by_key, definitions, now):
 
 def _never_observed_summary(definition):
     return {
+        "activity": [],
         "run_id": None,
         "run_name": None,
         "runtime_id": definition["runtime_id"],
@@ -628,6 +795,13 @@ def query_run_summaries(
     """Query current Transfer Run state plus configured routes never observed."""
     engine = create_monitoring_schema(database_url)
     now_value = now or datetime.now(timezone.utc)
+    table = transfer_events.c
+    route_filters = [
+        field.in_(values) for field, values in (
+            (table.runtime_id, runtime_ids), (table.system, systems),
+            (table.execution_user, execution_users), (table.transfer_identifier, transfer_identifiers),
+        ) if values
+    ]
     with engine.connect() as connection:
         definitions = [
             dict(row)
@@ -635,15 +809,7 @@ def query_run_summaries(
         ]
         events = [
             dict(row)
-            for row in connection.execute(
-                select(
-                    *[transfer_events.c[column] for column in EVENT_COLUMNS],
-                    transfer_events.c.ingestion_order,
-                ).order_by(
-                    transfer_events.c.event_time_utc,
-                    transfer_events.c.ingestion_order,
-                )
-            ).mappings()
+            for row in connection.execute(_activity_events(route_filters)).mappings()
         ]
 
     definitions_by_key = {
@@ -694,7 +860,7 @@ def query_run_summaries(
     ]
     summaries.sort(
         key=lambda summary: (
-            summary["last_event_time_utc"] or "",
+            _parse_event_time(summary["last_event_time_utc"]) or datetime.min.replace(tzinfo=timezone.utc),
             summary["runtime_id"],
             summary["transfer_identifier"],
         ),

@@ -23,3 +23,18 @@ schema-v1 spools. This keeps one service responsible for ingestion and reporting
 without moving database access into transfer execution. Separate `monitor ingest`
 invocations remain supported; reader-only serving remains the default when no
 spools are configured.
+
+Native executors report logical payload bytes in the existing JSON message of a
+`started` transfer event. A measurement can include accepted bytes and file
+count, observed bytes, bytes per second, and an estimated number of seconds left
+in the payload transfer. Any value may be unknown. A separate phase heartbeat
+records the worker's last observation. The index suppresses rates and estimates
+after two minutes without a byte sample, even when heartbeats continue. Elapsed
+time for an unconfirmed or stale attempt ends at its last observation.
+
+The JSON run index exposes current phase attempts in `runs[].activity`. Run
+detail exposes all phase attempts in `attempts` and the original events in
+`timeline`. Measurements belong to their runtime, route, run, request, and
+attempt. A retry starts its own counters. A subsequent publication or cleanup
+phase may report the previous payload's measured bytes and sample time. Those
+phases have their own elapsed time and receive no payload rate or ETA.
