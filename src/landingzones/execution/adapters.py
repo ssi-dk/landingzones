@@ -5,6 +5,7 @@ import ctypes
 import grp
 import sys
 import hashlib
+import json
 import os
 import posixpath
 from pathlib import Path
@@ -494,6 +495,47 @@ class RemoteRsyncAdapter(SFTPAdapter):
     def pinned_ssh_command(self):
         return self.ssh_command() + ['-F', '/dev/null', '-o', 'IdentityAgent=none',
                                      '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'UpdateHostKeys=no']
+
+    def receiver_publication(self, action, **evidence):
+        if action not in ('probe', 'prepare'):
+            raise ValueError('Unknown receiver publication action')
+        # Only shipped code and this fixed verb go through the remote shell.
+        # Names, receipt data, and all paths travel as JSON on stdin.
+        helper = Path(__file__).with_name('receiver_publication.py').read_text()
+        command = 'python3 -I -S -c ' + shlex.quote(helper) + ' ' + action
+        ssh = self.pinned_ssh_command() + ['-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3',
+                                        '--', self.target.username + '@' + self.target.hostname, command]
+        root = '/' + posixpath.normpath(self.root).lstrip('/')
+        request = dict(root=root, group=self.step.publication_group, **evidence)
+        lock = getattr(self, 'execution_lock', None)
+        try:
+            result = subprocess.run(ssh, input=json.dumps(request), text=True, capture_output=True,
+                                    check=True, timeout=30 if action == 'probe' else None,
+                                    pass_fds=lock.pass_fds if lock is not None else ())
+        except subprocess.CalledProcessError as exc:
+            raise OSError(f'Receiver Python publication helper exited with status {exc.returncode}') from exc
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError('Receiver publication capability probe timed out') from exc
+        try:
+            reply = json.loads(result.stdout)
+            if reply['protocol'] != 1 or reply['operation'] != action:
+                raise ValueError
+            status = reply['status']
+        except (KeyError, TypeError, ValueError) as exc:
+            raise OSError('Receiver did not acknowledge the publication helper protocol') from exc
+        if status == 'refused':
+            raise ValueError('Receiver refused publication: ' + reply['error'])
+        if status != 'passed':
+            raise OSError('Receiver publication failed: ' + reply.get('error', 'unexpected status'))
+
+    def prepare_verified_publication(self, stage, accepted, label):
+        token = stage.rsplit('/', 1)[-1]
+        if self.stage_name(token) != stage:
+            raise ValueError('Expected the private stage for this connection')
+        label_hash = hashlib.sha256(json.dumps(label, sort_keys=True).encode('utf-8')).hexdigest()
+        self.receiver_publication('prepare', token=token, manifest=accepted, label_sha256=label_hash,
+                                  verification=self.step.verification,
+                                  directory_mode=self.step.publication_mode_for(True))
 
     def pull_directory(self, payload, path, accepted, execution_lock):
         # Interrupted receiver temporary files must not become inventory entries.

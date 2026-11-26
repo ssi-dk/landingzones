@@ -149,7 +149,13 @@ An existing receipt resumes with its recorded adapter.
 
 An rsync connection with a local source and an `sftp://` destination sends
 the accepted paths over one pinned rsync-over-SSH connection directly into
-the receiver's private stage. SFTP owns inventory, publication groups, flushes
-and non-overwriting rename. A move confirms durable publication and records
+the receiver's private stage. SFTP owns initial inventory and the non-overwriting rename.
+For grouped rsync pushes and remote moves, one pinned SSH invocation runs
+the bundled, standard-library Python receiver helper. It checks the private
+stage owner, receipt label, manifest, file kinds and sizes, applies the
+configured group and modes, and flushes all files and directories bottom-up.
+Checksum routes also verify payload digests. Recovery retains a failed stage
+for retry. The receiver's `python3` must be available to that account; its
+read-only helper probe is part of credential validation. A move confirms durable publication and records
 the receipt before cleaning its source. Existing `ssh://` destination copies
 continue to use their recorded adapter behavior.

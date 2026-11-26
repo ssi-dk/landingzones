@@ -85,6 +85,8 @@ def remote(monkeypatch):
 
     def run(argv, **options):
         processes.append((argv, options))
+        if argv[0] == 'ssh' and argv[-1].endswith(' probe'):
+            return SimpleNamespace(stdout=json.dumps(dict(protocol=1, operation='probe', status='passed')))
         return SimpleNamespace(stdout='rsync  version 3.2.7  protocol version 31\n')
 
     monkeypatch.setattr(validation, 'SFTPAdapter', SFTP)
@@ -170,7 +172,7 @@ def test_rsync_checks_product_openssh_options_remote_capability_and_local_binary
     if scheme == 'sftp':
         row['publication_group'] = 'receivers'
     report = validation.validate_credentials(config.write([row], credentials('one')))
-    assert report['status'] == 'passed' and len(remote.processes) == 2
+    assert report['status'] == 'passed' and len(remote.processes) == (3 if scheme == 'sftp' else 2)
     command, options = remote.processes[0]
     if scheme == 'ssh' and direction == 'destination':
         ssh = command
@@ -187,7 +189,13 @@ def test_rsync_checks_product_openssh_options_remote_capability_and_local_binary
     assert 'IdentitiesOnly=yes' in ssh and 'StrictHostKeyChecking=yes' in ssh
     assert 'UserKnownHostsFile=' + str(config.root / 'one.hosts') in ssh
     assert options['check'] and options['capture_output'] and options['timeout'] == 30
-    assert remote.processes[1][0] == ['rsync', '--version']
+    if scheme == 'sftp':
+        helper, kwargs = remote.processes[1]
+        assert helper[-1].startswith('python3 -I -S -c ') and helper[-1].endswith(' probe')
+        assert json.loads(kwargs['input']) == {'root': '/root', 'group': 'receivers'}
+        assert any(item['phase'] == 'batched_publication_capability' and item['status'] == 'passed'
+                   for item in report['connections'][0]['checks'])
+    assert remote.processes[-1][0] == ['rsync', '--version']
     assert len([item for item in remote.calls if item[0] == 'enter']) == 1
     assert (('group', 'receivers') in remote.calls) == (scheme == 'sftp')
 

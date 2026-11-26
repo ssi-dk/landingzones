@@ -374,12 +374,15 @@ class Executor:
                 stage = transport.stage_name(work['step_id'])
                 rename_publication = getattr(transport, 'publication_mode', 'rename') == 'rename'
                 if transport.exists(stage):
-                    if not matches(transport.inspect(stage), state['manifest'], step.verification):
-                        raise ValueError('Staging changed; publication refused')
                     if rename_publication and transport.exists(payload):
                         raise FileExistsError('Destination conflict')
-                    if step.publication_group or remote_move:
-                        transport.prepare_publication(stage, state['manifest'])
+                    if step.batched_publication:
+                        transport.prepare_verified_publication(stage, state['manifest'], work['output_label'])
+                    else:
+                        if not matches(transport.inspect(stage), state['manifest'], step.verification):
+                            raise ValueError('Staging changed; publication refused')
+                        if step.publication_group or remote_move:
+                            transport.prepare_publication(stage, state['manifest'])
                     work['promotion_intent'] = True
                     self.store.save(state)
                     receipt = transport.promote(stage, payload)

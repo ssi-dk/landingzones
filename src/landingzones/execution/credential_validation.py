@@ -163,6 +163,9 @@ def _endpoint(checks, step, settings, config_dir, direction):
         if step.adapter == 'rsync' and (direction == 'destination' or step.rsync_source_pull):
             _check(checks, direction, 'ssh_authentication_and_rsync_capability', 'rsync_ssh',
                    step.credential_ref, lambda: _remote_rsync(step, resolved, endpoint))
+        if step.batched_publication and direction == 'destination':
+            _check(checks, direction, 'batched_publication_capability', 'rsync_ssh', step.credential_ref,
+                   lambda: RemoteRsyncAdapter(step, resolved).receiver_publication('probe'))
 
 
 def validate_credentials(config_path, connection=None):

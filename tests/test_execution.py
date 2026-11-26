@@ -466,7 +466,9 @@ def local_rsync_shell(root, monkeypatch):
     bin_dir = root / 'bin'
     bin_dir.mkdir()
     ssh = bin_dir / 'ssh'
-    ssh.write_text('#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != rsync ]; do shift; done\n'
+    ssh.write_text('#!/bin/sh\nfor arg do last=$arg; done\n'
+                   'case "$last" in "python3 -I -S -c "*) exec sh -c "$last";; esac\n'
+                   'while [ "$#" -gt 0 ] && [ "$1" != rsync ]; do shift; done\n'
                    '[ "$1" = rsync ] && [ "$2" = --server ] || exit 2\n'
                    'exec "$@"\n')
     ssh.chmod(0o700)
@@ -730,6 +732,34 @@ def test_remote_move_receipt_precedes_source_cleanup(setup, openssh_pipe, monkey
     assert all(p.stat().st_gid == gid and stat.S_IMODE(p.stat().st_mode) == (0o2770 if p.is_dir() else 0o660)
                for p in (published, *published.rglob('*')))
     assert step(result)['published'] and step(result)['cleaned']
+
+def test_ungrouped_rsync_move_retries_after_helper_acknowledgement_is_lost(setup, openssh_pipe, monkeypatch):
+    root, payload, rows, write, config, request = setup
+    local_rsync_shell(root, monkeypatch)
+    rows[0].update(destination='sftp://receiver@example.invalid' + str(root / 'a'),
+                   adapter='rsync', operation='move', verification='size', credential_ref='test')
+    write()
+    credentials(config)
+    executor = Executor(config)
+    calls = []
+    helper = adapters.RemoteRsyncAdapter.receiver_publication
+
+    def response_lost(transport, action, **kwargs):
+        calls.append(action)
+        helper(transport, action, **kwargs)
+        if len(calls) == 1:
+            raise OSError('connection lost after receiver flush')
+
+    monkeypatch.setattr(adapters.RemoteRsyncAdapter, 'receiver_publication', response_lost)
+    state = executor.submit(request)
+    assert state['status'] == 'blocked' and payload.exists() and not (root / 'a' / payload.name).exists()
+    def no_upload(*args, **kwargs):
+        pytest.fail('A publication retry must use its existing staged package')
+    monkeypatch.setattr(adapters.RemoteRsyncAdapter, 'push_directory', no_upload)
+    completed = executor.resume(state['request_id'])
+    assert completed['status'] == 'completed' and calls == ['prepare', 'prepare']
+    assert not payload.exists() and (root / 'a' / payload.name / 'data.txt').read_text() == 'accepted data'
+
 
 @pytest.mark.parametrize('fault', ['partial', 'wrong_size'])
 def test_rsync_push_keeps_source_private_until_stage_is_verified(setup, filesystem_sftp, monkeypatch, fault):

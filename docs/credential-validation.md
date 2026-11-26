@@ -31,7 +31,7 @@ landingzones --config /path/to/runtime/config/execution.yaml transfer validate-c
 | Configured access | Checks |
 | --- | --- |
 | SFTP destination or remote source (`sftp://` or `ssh://`) | Selected credential files, pinned host verification, authentication, SFTP subsystem, configured root and directory listing. |
-| Rsync pull from an `ssh://` source or push to an `sftp://` destination | Pinned SFTP access, the local rsync binary and an empty-manifest rsync dry run on the configured queue in the transfer direction. Grouped pushes also verify the queue's receiving group. |
+| Rsync pull from an `ssh://` source or push to an `sftp://` destination | Pinned SFTP access, the local rsync binary and an empty-manifest rsync dry run on the configured queue in the transfer direction. Grouped pushes also verify the queue's receiving group. Grouped pushes and remote moves exercise the read-only receiver helper through the pinned SSH identity, requiring Unix `python3` with its standard library and directory fsync support. |
 | Legacy rsync over SSH destination (`ssh://`) | Required SFTP access plus the local rsync executable and a bounded `rsync --version` command through OpenSSH using the transfer's key/host options. |
 | ENA | Selected Webin credentials, TLS-protected FTP login and upload-root listing. |
 | Local source/destination | Directory availability and read/traverse access; local rsync connections also require a working rsync executable. There is no remote credential to authenticate. |

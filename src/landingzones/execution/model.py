@@ -41,6 +41,10 @@ class Step:
         return self.adapter == 'rsync' and self.destination.startswith('sftp://')
 
     @property
+    def batched_publication(self):
+        return self.rsync_destination_push and bool(self.publication_group or self.operation == 'move')
+
+    @property
     def sftp_publication(self):
         return self.adapter == 'sftp' or self.rsync_destination_push
 
