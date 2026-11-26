@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlsplit
 
-from landingzones.monitoring import ingest_event_spool, query_run_detail, query_run_summaries
+from landingzones.monitoring import _message_fields, ingest_event_spool, query_run_detail, query_run_summaries
 
 
 FILTER_ARGUMENTS = {
@@ -85,34 +85,70 @@ def _format_age(age_seconds):
     return "{0}d".format(age_seconds // 86400)
 
 
+REPORT_CSS = """
+:root { color-scheme:light; --ink:#182d31; --sub:#4e666b; --line:#cedad8;
+ --paper:#fbfcfa; --panel:#fff; --teal:#09634e; --pale:#dff3e9; --amber:#825917; --red:#993c30; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.45 Inter,system-ui,sans-serif; }
+a { color:#075e50; text-underline-offset:3px; }
+a:hover { color:#023e35; }
+a:focus-visible,button:focus-visible,input:focus-visible { outline:3px solid #c08816; outline-offset:3px; }
+header { background:#163b39; color:#f3faf5; }
+.topbar,main { max-width:1480px; margin:auto; padding:0 clamp(14px,3.3vw,58px); }
+.topbar { min-height:50px; display:flex; align-items:center; justify-content:space-between; gap:1rem; }
+.brand { color:inherit; font-weight:740; text-decoration:none; letter-spacing:.015em; }
+.topbar nav { display:flex; gap:1.1rem; } .topbar nav a { color:#e9f5ee; font-size:.87rem; }
+main { padding-bottom:3rem; }
+.page-heading { display:flex; align-items:end; justify-content:space-between; gap:1rem; margin:2rem 0 1.4rem; }
+h1,h2,h3,p { margin:0; } h1 { font-size:clamp(1.7rem,3vw,2.65rem); letter-spacing:-.045em; line-height:1.1; overflow-wrap:anywhere; }
+h2 { font-size:1.3rem; letter-spacing:-.025em; margin:1.65rem 0 .7rem; } h3 { font-size:1rem; overflow-wrap:anywhere; }
+.stamp,.observation,.muted,small { color:var(--sub); } .stamp { font-size:.8rem; text-align:right; }
+.observation,small { display:block; font-size:.8rem; }
+.metrics { display:grid; grid-template-columns:repeat(3,1fr); border:1px solid var(--line); border-radius:9px; background:var(--panel); }
+.metric { padding:.9rem 1.3rem; } .metric+.metric { border-left:1px solid var(--line); }
+.metric span,.eyelabel { color:var(--sub); font-size:.78rem; font-weight:600; }
+.metric strong { font-variant-numeric:tabular-nums; display:block; font-size:1.7rem; letter-spacing:-.04em; }
+.toolbar { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; margin:1rem 0; }
+input,button { font:inherit; border-radius:5px; border:1px solid #9aaca8; padding:.36rem .65rem; }
+input { background:white; width:min(26rem,100%); } button { background:#eaf0ec; cursor:pointer; color:var(--ink); }
+.run-list { display:grid; gap:.6rem; }
+.run { background:var(--panel); border:1px solid var(--line); border-left:4px solid #3f8974; border-radius:6px;
+ display:grid; grid-template-columns:minmax(170px,1.65fr) minmax(145px,1.2fr) minmax(96px,.75fr) minmax(110px,.9fr) minmax(110px,.9fr);
+ align-items:center; gap:1rem; padding:.9rem 1.05rem; }
+.run h3 a { text-decoration:none; } .run h3 a:hover { text-decoration:underline; }
+.run.stale { border-left-color:#b48435; } .run .route { overflow-wrap:anywhere; }
+.value { font-weight:620; font-variant-numeric:tabular-nums; } .badge { display:inline-block; border-radius:4px; background:var(--pale); color:#115b48; padding:.1rem .45rem; font-size:.78rem; font-weight:680; }
+.stale .badge { background:#fbefce; color:#78531a; }
+progress { width:100%; height:.44rem; display:block; accent-color:var(--teal); margin:.3rem 0; }
+.empty { background:#f0f4f0; color:var(--sub); padding:.9rem 1rem; border:1px dashed var(--line); border-radius:6px; }
+.table-scroll { overflow-x:auto; } table { border-collapse:collapse; width:100%; background:var(--panel); font-size:.85rem; }
+th,td { border-bottom:1px solid var(--line); padding:.55rem .65rem; vertical-align:top; text-align:left; }
+th { font-weight:650; background:#eef3f0; white-space:nowrap; } .nowrap { white-space:nowrap; font-variant-numeric:tabular-nums; }
+td { overflow-wrap:anywhere; } td progress { min-width:5rem; }
+.progress-complete {color:var(--teal);} .progress-active {color:var(--amber);} .progress-failed {color:var(--red);}
+.trace { margin:.65rem 0; font-size:.84rem; } .alerts { padding:0; margin:0; list-style:none; }
+.alerts li { background:#fff; border-left:3px solid #b07938; border-bottom:1px solid var(--line); padding:.55rem .85rem; }
+@media(max-width:900px) { .run {grid-template-columns:2fr 1.6fr 1fr;} .run .timing,.run .seen {align-self:start;} }
+@media(max-width:600px) { .run {grid-template-columns:1fr 1fr;gap:.65rem;} .run .identity {grid-column:1/-1;}
+ .metric {padding:.65rem;} .metric strong {font-size:1.25rem;} .page-heading {align-items:start;flex-direction:column;} .stamp{text-align:left;}
+ .topbar nav {gap:.55rem;} .topbar nav a {font-size:.75rem;} }
+"""
+
+
 def _page(title, content, queried_at_utc=None):
-    queried_at_utc = queried_at_utc or _queried_at_utc()
-    return """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="{1}">
-<title>{0}</title>
-<style>
-body {{ font-family: system-ui, sans-serif; margin: 2rem; color: #1f2937; }}
-table {{ border-collapse: collapse; width: 100%; }}
-th, td {{ border-bottom: 1px solid #d1d5db; padding: .55rem; text-align: left; vertical-align: top; }}
-th {{ background: #f3f4f6; }}
-code {{ white-space: nowrap; }}
-.muted {{ color: #6b7280; }}
-.progress-complete {{ color: #166534; }}
-.progress-failed {{ color: #b91c1c; }}
-.progress-active {{ color: #92400e; }}
-</style>
-</head>
-<body><h1>{0}</h1><p class="muted">Last queried: {2} · Auto-refreshes every {1} seconds.</p>{3}</body>
-</html>""".format(
-        escape(title),
-        AUTO_REFRESH_SECONDS,
-        escape(queried_at_utc),
-        content,
-    )
+    stamp = escape(queried_at_utc or _queried_at_utc())
+    overview = title == "Landing Zones Transfer Runs"
+    nav = ('<nav aria-label="Run views"><a href="#current">Current runs</a>'
+           '<a href="#attention">Needs attention</a><a href="#history">History</a></nav>'
+           if overview else '<nav><a href="/">All runs</a></nav>')
+    heading = 'Transfer runs' if overview else escape(title)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="{AUTO_REFRESH_SECONDS}">
+<title>{escape(title)}</title><style>{REPORT_CSS}</style></head><body>
+<header><div class="topbar"><a class="brand" href="/">Landing Zones</a>{nav}</div></header>
+<main><div class="page-heading"><h1>{heading}</h1><p class="stamp">Last queried: {stamp}<br>
+Auto-refreshes every {AUTO_REFRESH_SECONDS} seconds. <a href="">Refresh now</a></p></div>{content}</main></body></html>"""
 
 
 def _progress_text(run):
@@ -143,21 +179,135 @@ def _progress_class(state):
     return ""
 
 
+def _format_bytes(number):
+    if number is None:
+        return "—"
+    for unit in ("B", "kB", "MB", "GB", "TB", "PB", "EB"):
+        if number < 1000 or unit == "EB":
+            return "{:g} {}".format(round(number, 1), unit)
+        number /= 1000
+
+
+def _payload_cell(progress):
+    if not progress:
+        return "No byte measurements"
+    done, total = progress["bytes_done"], progress["bytes_total"]
+    label = "{} / {}".format(_format_bytes(done), _format_bytes(total))
+    if progress["files_total"] is not None:
+        count = progress["files_total"]
+        label += '<small class="muted observation">{:,} file{}</small>'.format(count, "" if count == 1 else "s")
+    if done is not None and total:
+        label += '<progress aria-label="Payload bytes transferred" value="{}" max="{}"></progress>'.format(done, total)
+    return label
+
+
+def _activity_table(rows, include_package):
+    heading = "<th>Package</th>" if include_package else ""
+    body = []
+    for name, item in rows:
+        package = ""
+        if include_package:
+            package = '<td><a href="/runs/{}">{}</a></td>'.format(escape(item["run_id"]), escape(name))
+        phase = escape(item["phase"])
+        if item["phase"] == "promotion":
+            phase = "publication (promotion)"
+        sample = item.get("progress") or {}
+        previous = item.get("previous_payload", {})
+        payload = _payload_cell(sample or previous.get("progress"))
+        if previous.get("progress"):
+            payload += '<small class="observation muted">Last transfer attempt</small>'
+        if item["measurement"] == "stale":
+            payload += '<small class="observation progress-active">Stale byte sample</small>'
+        stamp = item["sampled_at_utc"] or previous.get("sampled_at_utc")
+        if stamp:
+            payload += '<small class="observation muted">Sampled {}</small>'.format(escape(stamp))
+        observation = {"last reported":"Last reported", "recent":"Recently observed",
+                       "stale":"Stale observation", "ended":"Ended"}[item["observation"]]
+        rate = sample.get("rate_bytes_per_second")
+        eta = sample.get("eta_seconds")
+        body.append(
+            '<tr>{}<td>{}<small class="muted observation">{}</small></td>'
+            '<td>{}<small class="muted observation">{}</small></td><td>{}</td>'
+            '<td>{}</td><td class="nowrap">{}</td><td>{}</td><td>{}'
+            '<small class="muted observation">{}</small></td></tr>'.format(
+                package, escape(item["transfer_identifier"]), escape(item["runtime_id"]),
+                phase, escape(item["status"]), _format_age(item["elapsed_seconds"]), payload,
+                _format_bytes(rate) + "/s" if rate is not None else "—",
+                _format_age(int(eta)) if eta is not None else "—", observation,
+                escape(item["last_event_time_utc"])))
+    return ('<div class="table-scroll"><table><thead><tr>' + heading +
+            '<th>Route</th><th>Phase</th><th>Elapsed</th><th>Payload bytes</th>'
+            '<th>Rate</th><th>Payload ETA</th><th>Last observation</th>'
+            '</tr></thead><tbody>' + "".join(body) + '</tbody></table></div>')
+
+
+def _run_card(name, item, now):
+    live = item["observation"]
+    phase = {"transfer": "Transfer", "promotion": "Publication", "cleanup": "Source cleanup"}.get(
+        item["phase"], item["phase"].title())
+    sample = item.get("progress") or {}
+    previous = item.get("previous_payload", {}).get("progress") or {}
+    counts = sample or previous
+    done, total = counts.get("bytes_done"), counts.get("bytes_total")
+    pct = f"{100 * done / total:.0f}%" if done is not None and total else "—"
+    rate, eta = sample.get("rate_bytes_per_second"), sample.get("eta_seconds")
+    rate_text = _format_bytes(rate) + "/s" if rate is not None else "—"
+    eta_text = _format_age(int(eta)) if eta is not None else "—"
+    stamp = item["last_event_time_utc"]
+    last = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    age = max(0, int((now - last).total_seconds()))
+    observed = {"recent":"Reporting", "stale":"Stale observation",
+                "last reported":"Last reported", "ended":"Ended"}[live]
+    payload = _payload_cell(counts)
+    if item["measurement"] == "stale":
+        payload += '<small>Stale byte sample</small>'
+    return (f'<article class="run {escape(live)}"><div class="identity"><h3><a href="/runs/{escape(item["run_id"])}">'
+            f'{escape(name)}</a></h3><small class="route">{escape(item["transfer_identifier"])}</small>'
+            f'<span class="badge">{escape(phase)}</span></div>'
+            f'<div><span class="eyelabel">Payload · {pct}</span><div>{payload}</div></div>'
+            f'<div><span class="eyelabel">Payload rate</span><div class="value">{rate_text}</div>'
+            f'<small>Copy ETA {eta_text}</small></div><div class="timing"><span class="eyelabel">Phase elapsed</span>'
+            f'<div class="value">{_format_age(item["elapsed_seconds"])}</div></div>'
+            f'<div class="seen"><span class="eyelabel">{observed}</span><div title="{escape(stamp)}">{_format_age(age)} ago</div>'
+            f'<small>{escape(item["system"])}</small></div></article>')
+
+
+def _search_form(query_string):
+    pairs = parse_qsl(query_string, keep_blank_values=False)
+    current = dict(pairs).get('q', '')
+    keep = ''.join(f'<input type="hidden" name="{escape(k)}" value="{escape(v)}">'
+                   for k, v in pairs if k != 'q')
+    clear_url = '/?' + urlencode([(k, v) for k, v in pairs if k != 'q'])
+    clear = f'<a href="{escape(clear_url)}">Clear search</a>' if current else ''
+    return (f'<form class="toolbar" action="/" method="get">{keep}<label for="run-search">Find a run</label>'
+            f'<input id="run-search" name="q" type="search" placeholder="Package, route or host" '
+            f'value="{escape(current)}"><button>Search</button>{clear}</form>')
+
+
 def _render_runs(
     runs,
     query_string="",
     show_without_directory=False,
     queried_at_utc=None,
 ):
-    hidden_runs = [run for run in runs if not run["directory"]]
+    now = datetime.fromisoformat((queried_at_utc or _queried_at_utc()).replace("Z", "+00:00"))
+    search = parse_qs(query_string).get('q', [''])[-1].strip().casefold()
+    if search:
+        runs = [run for run in runs if any(search in (str(value or '').casefold()) for value in
+                [run['directory'], run['run_name'], run['system'], run['runtime_id'], run['transfer_identifier'],
+                 *(item[key] for item in run['activity'] for key in ('transfer_identifier', 'system'))])]
+    hidden_runs = [run for run in runs if not (run["directory"] or run["run_name"])]
     visible_runs = runs if show_without_directory else [
-        run for run in runs if run["directory"]
+        run for run in runs if run["directory"] or run["run_name"]
     ]
     hidden_errors = [run for run in hidden_runs if "failed" in run["state"]]
+    active = []
+    stale = []
+    failed = []
     rows = []
     for run in visible_runs:
         run_id = run["run_id"]
-        directory_value = escape(run["directory"] or "—")
+        directory_value = escape(run["directory"] or run["run_name"] or "—")
         if run_id:
             directory_value = '<a href="/runs/{0}">{1}</a>'.format(
                 escape(run_id),
@@ -180,11 +330,22 @@ def _render_runs(
                 failure or "failure",
                 run["message"],
             )
+        activity = run["activity"]
+        for item in activity:
+            if item["ended_at_utc"] is None:
+                group = stale if item["observation"] == "stale" else active
+                group.append((run["run_name"] or run["directory"] or run_id, item))
+        if "failed" in run["state"]:
+            failed.append((directory_value, escape(run["transfer_identifier"]),
+                           escape(_progress_text(run)), escape(failure)))
+        current = next((a for a in reversed(activity) if a["runtime_id"] == run["runtime_id"]
+                        and a["transfer_identifier"] == run["transfer_identifier"]), {})
+        payload = current.get("progress") or current.get("previous_payload", {}).get("progress")
         rows.append(
             "<tr>"
             "<td>{0}</td><td>{1}</td><td>{2}</td><td>{3}</td>"
             "<td>{4}</td><td>{5}</td><td>{6}</td><td>{7}</td>"
-            "<td>{8}</td><td>{9}</td><td>{10}</td>"
+            "<td>{8}</td><td>{9}</td><td>{10}</td><td>{11}</td>"
             "</tr>".format(
                 directory_value,
                 escape(run["runtime_id"]),
@@ -204,14 +365,15 @@ def _render_runs(
                     else "unknown"
                 ),
                 escape(failure),
+                _payload_cell(payload) if payload else "—",
             )
         )
     if not rows:
-        rows.append('<tr><td colspan="11" class="muted">No matching runs.</td></tr>')
+        rows.append('<tr><td colspan="12" class="muted">No matching runs.</td></tr>')
     table = (
         "<table><thead><tr><th>Directory</th><th>Runtime ID</th><th>System</th>"
         "<th>Execution user</th><th>Route</th><th>Enabled</th><th>Progress / step</th>"
-        "<th>Last event</th><th>Age</th><th>Attempts</th><th>Latest failure</th>"
+        "<th>Last event</th><th>Age</th><th>Attempts</th><th>Latest failure</th><th>Last payload</th>"
         "</tr></thead><tbody>{0}</tbody></table>"
     ).format("".join(rows))
     if show_without_directory:
@@ -234,23 +396,48 @@ def _render_runs(
         )
         visibility = "{0}. {1}.".format(hidden_description, toggle)
     else:
-        visibility = "Showing transfers with directories."
+        visibility = "Showing runs with a package name or directory."
     controls = '<p class="muted">{0}</p>'.format(visibility)
+    measured = [a['progress']['rate_bytes_per_second'] for _, a in active if
+                a['phase'] == 'transfer' and a['measurement'] == 'recent' and
+                (a.get('progress') or {}).get('rate_bytes_per_second') is not None]
+    speed = _format_bytes(sum(measured)) + '/s' if measured else '—'
+    metrics = (f'<div class="metrics"><div class="metric"><span>Current attempts</span><strong>{len(active)}</strong></div>'
+               f'<div class="metric"><span>Failed runs / stale attempts</span><strong>{len(failed)} / {len(stale)}</strong></div>'
+               f'<div class="metric" title="Sum of recent measured payload rates across {len(measured)} attempts">'
+               f'<span>Measured payload rate</span><strong>{speed}</strong></div></div>')
+    current = ''.join(_run_card(name, item, now) for name, item in active)
+    attention = ''.join(_run_card(name, item, now) for name, item in stale)
+    if failed:
+        attention += '<ul class="alerts">' + ''.join(
+            f'<li>{name} · {route} <strong class="progress-failed">{state}</strong><small>{diagnostic}</small></li>'
+            for name, route, state, diagnostic in failed[:8]) + '</ul>'
+        if len(failed) > 8:
+            attention += '<a href="#history">See remaining failed runs in history</a>'
     return _page(
-        "Landing Zones Transfer Runs",
-        controls + table,
-        queried_at_utc=queried_at_utc,
-    )
+        "Landing Zones Transfer Runs", _search_form(query_string) + metrics +
+        '<section id="current"><h2>Current runs</h2><div class="run-list">' +
+        (current or '<p class="empty">No current attempts reported.</p>') + '</div></section>' +
+        '<section id="attention"><h2>Needs attention</h2><div class="run-list">' +
+        (attention or '<p class="empty">No failed runs or stale attempts in this view.</p>') + '</div></section>' +
+        '<section id="history"><h2>Run history</h2>' + controls +
+        '<div class="table-scroll">' + table + '</div></section>', queried_at_utc=queried_at_utc)
+
 
 
 def _render_detail(detail, queried_at_utc=None):
     rows = []
     for event in detail["timeline"]:
+        fields = _message_fields(event)
+        if event["status"] == "started" and (fields.get("heartbeat") is True
+                or isinstance(fields.get("progress"), dict) and fields["progress"].get("bytes_done") is not None):
+            continue
         diagnostic = event["reason_code"] or ""
         if event["exit_code"] is not None:
             diagnostic = "{0} exit={1}".format(diagnostic, event["exit_code"]).strip()
-        if event["message"]:
-            diagnostic = "{0} {1}".format(diagnostic, event["message"]).strip()
+        message = fields.get("detail", event["message"])
+        if isinstance(message, str) and message:
+            diagnostic = "{0} {1}".format(diagnostic, message).strip()
         rows.append(
             "<tr><td>{0}</td><td>{1}</td><td>{2}</td><td>{3}</td>"
             "<td>{4}</td><td>{5}</td></tr>".format(
@@ -263,14 +450,15 @@ def _render_detail(detail, queried_at_utc=None):
             )
         )
     table = (
-        '<p><a href="/">All runs</a></p>'
         "<table><thead><tr><th>Event time</th><th>Route</th><th>Status</th>"
         "<th>Phase</th><th>Attempt ID</th><th>Diagnostic</th></tr></thead>"
         "<tbody>{0}</tbody></table>"
     ).format("".join(rows))
     return _page(
         "Transfer Run {0}".format(detail["run_id"]),
-        table,
+        '<p><a href="/">All runs</a></p><h2>Phase attempts</h2>' +
+        _activity_table([(None, item) for item in reversed(detail["attempts"])], False) +
+        '<h2>Lifecycle events</h2><div class="table-scroll">' + table + '</div>',
         queried_at_utc=queried_at_utc,
     )
 

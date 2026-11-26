@@ -424,6 +424,7 @@ def _attempt_activity(events, now):
         if key not in attempts:
             attempts[key] = dict(
                 run_id=event["run_id"], runtime_id=route[0], transfer_identifier=route[1],
+                system=event["system"], execution_user=event["execution_user"],
                 request_id=route[2], attempt_id=event["attempt_id"], phase=event["phase"],
                 started_at_utc=stamp if event["status"] == "started" else None,
                 ended_at_utc=None, last_heartbeat_at_utc=None,
